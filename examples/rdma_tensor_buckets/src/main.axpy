@@ -1,0 +1,253 @@
+# Bucketed gradients over std.rdma with RegBuf-backed tensors (#2049).
+#
+# Every step each rank computes two gradient buckets with the in-place tensor
+# paths (`g.matmul_into(x, w)`, #1768), writes each into a RegBuf
+# (`T.write_slice(buf.as_mut_slice(), 0, g)`) and posts a non-blocking
+# allreduce on it (`iallreduce`), then computes the next bucket while the
+# progress thread (opt-in, #2217) moves the first one. The collective works on
+# the RegBuf's registered storage itself: the checks below assert that the
+# storage address is unchanged from the write to the result (no copy), and
+# that after the first step `register` is served from the context's
+# registration cache: no new registrations, one cache hit per bucket.
+#
+# Each rank writes its UCX address to RDMA_DIR/addr.<rank> and reads every
+# other rank's:
+#   RDMA_RANK=r RDMA_SIZE=n RDMA_DIR=/shared/dir ./rdma_tensor_buckets   (one per rank)
+# RDMA_TIMEOUT_MS bounds every call (default 30000). Every rank prints
+# `RESULT rank <r> ok` when all checks pass, or `RESULT error <code>` /
+# `RESULT check <name> failed`.
+#
+# On one host, select a transport with e.g. UCX_TLS=self,tcp or self,posix,tcp.
+# Without UCX (e.g. macOS) the native TCP fallback runs instead (#2818); see
+# scripts/ci/rdma-native-local.sh and docs/src/reference/runtime-rdma.md.
+
+import std.tensor as T
+from std.rdma import (
+    RdmaContext, Endpoint, Address, RegBuf, Pending, Comm,
+    RdmaError, ReduceOp, CollMode, register, iallreduce,
+)
+from std.alloc import Vec, String
+from std.core import usize, u8, u32, u64, i32, i64, f32, bool, unit, Result, Ok, Err
+from std.env import var, VarStatus
+from std.fs import read, write
+from std.time import Instant
+
+const DEFAULT_TIMEOUT_MS: i64 = 30000
+const STEPS: i64 = 4
+# Elements per bucket: one (16, 16) gradient.
+const BUCKET: usize = 256
+
+def env_string(name: Slice[u8]) -> String:
+    let mut out: Vec[u8] = Vec.new()
+    let status: VarStatus = var(name, &mut out)
+    let mut text: String = String.new()
+    if status == VarStatus.Ok:
+        let mut i: usize = 0
+        while i < out.len():
+            text.push(out.get(i))
+            i = i + 1
+    return text
+
+def env_i64(name: Slice[u8], default: i64) -> i64:
+    let text: String = env_string(name)
+    if text.len() == 0:
+        return default
+    let mut value: i64 = 0
+    let bytes: Slice[u8] = text.as_bytes()
+    let mut i: usize = 0
+    while i < bytes.len():
+        value = value * 10 + ((bytes[i] as i64) - 48)
+        i = i + 1
+    return value
+
+def hex_digit(n: u8) -> u8:
+    if n < 10:
+        return 48 + n
+    return 87 + n
+
+def hex_value(c: u8) -> u8:
+    if c >= 97:
+        return c - 87
+    return c - 48
+
+def append(out: ref_mut[String], bytes: Slice[u8]) -> unit:
+    let mut i: usize = 0
+    while i < bytes.len():
+        out.push(bytes[i])
+        i = i + 1
+
+def addr_path(dir: ref[String], rank: i64) -> String:
+    let mut p: String = String.new()
+    let d: Slice[u8] = dir.as_bytes()
+    let mut i: usize = 0
+    while i < d.len():
+        p.push(d[i])
+        i = i + 1
+    append(&mut p, "/addr.".as_bytes())
+    # Rank in decimal (ranks are small).
+    if rank >= 100:
+        p.push((48 + (rank / 100) % 10) as u8)
+    if rank >= 10:
+        p.push((48 + (rank / 10) % 10) as u8)
+    p.push((48 + rank % 10) as u8)
+    return p
+
+def write_address(path: String, addr: ref[Address]) -> bool:
+    let mut text: String = String.new()
+    let bytes: Vec[u8] = addr.to_bytes()
+    let mut i: usize = 0
+    while i < bytes.len():
+        let b: u8 = bytes.get(i)
+        text.push(hex_digit(b / 16))
+        text.push(hex_digit(b % 16))
+        i = i + 1
+    return write(path.as_bytes(), text.as_bytes()).is_ok()
+
+def sleep_ms(ms: i64) -> unit:
+    let start: Instant = Instant.now()
+    while start.elapsed().as_nanos() < ms * 1000000:
+        pass
+
+# Poll for a peer's address file (the peer writes complete hex text).
+def read_address(path: ref[String], tries: i64) -> Address:
+    if tries > 30000:
+        panic("rdma_tensor_buckets: timed out waiting for a peer's address file")
+    match read(path.as_bytes()):
+        Ok(bytes) =>
+            if bytes.len() > 0 and bytes.len() % 2 == 0:
+                let mut out: Vec[u8] = Vec.new()
+                let mut i: usize = 0
+                while i < bytes.len():
+                    let hi: u8 = hex_value(bytes.get(i))
+                    let lo: u8 = hex_value(bytes.get(i + 1))
+                    out.push(hi * 16 + lo)
+                    i = i + 2
+                # SAFETY: `out` is a peer's address, written by `write_address`.
+                unsafe:
+                    return Address.from_bytes_unchecked(out)
+        Err(e) =>
+            pass
+    sleep_ms(1)
+    return read_address(path, tries + 1)
+
+# Connect to every other rank. Recursion instead of a loop: `?` is not yet
+# supported inside loop bodies. The Comm keeps each endpoint alive.
+def wire(ctx: ref[RdmaContext], comm: ref[Comm], dir: ref[String], rank: i64, size: i64, q: i64) -> Result[i64, RdmaError]:
+    if q == size:
+        return Result.Ok(0)
+    if q == rank:
+        return wire(ctx, comm, dir, rank, size, q + 1)
+    let path: String = addr_path(dir, q)
+    let addr: Address = read_address(&path, 0)
+    let ep: Endpoint = ctx.connect(&addr)?
+    comm.set_peer(q as u32, &ep)?
+    return wire(ctx, comm, dir, rank, size, q + 1)
+
+# Rank r's input element i: mixed magnitudes, so the order of a float sum
+
+# Report a failed check; returns 1 (the count of failures it adds).
+def fail(name: Slice[u8]) -> i64:
+    let mut text: String = String.new()
+    let mut i: usize = 0
+    while i < name.len():
+        text.push(name[i])
+        i = i + 1
+    println!("RESULT check {text} failed")
+    return 1
+
+# The sum over ranks of bucket `b`'s gradient elements: rank `r`'s are
+# 16 * 0.5 * (r + 1 + b) = 8 (r + 1 + b).
+def expected(size: i64, b: i64) -> f32:
+    return (8 * (size * (size + 1) / 2 + size * b)) as f32
+
+# Register a bucket and write gradient `g` into its registered storage.
+def bucket_of(ctx: ref[RdmaContext], g: ref[Tensor[f32, (16, 16)]]) -> Result[RegBuf[f32], RdmaError]:
+    let zeros: Vec[f32] = Vec.zeroed[f32](BUCKET)
+    let mut buf: RegBuf[f32] = register(ctx, zeros)?
+    T.write_slice(buf.as_mut_slice(), 0, *g)
+    return Result.Ok(buf)
+
+def address_of(buf: ref[RegBuf[f32]]) -> u64:
+    return buf.as_slice().as_ptr() as u64
+
+# Read the reduced bucket back as a tensor and check it.
+def check_bucket(buf: ref[RegBuf[f32]], want: f32) -> bool:
+    let t: Tensor[f32, (16, 16)] = T.from_slice(buf.as_slice(), 0, [16, 16])
+    let flat: Tensor[f32, (256,)] = T.flatten(t)
+    return flat[0] == want and flat[255] == want and buf.at(17 as usize) == want
+
+# One training step: two buckets, the second computed while the first is
+# reduced. Returns the number of failed checks.
+def step(ctx: ref[RdmaContext], comm: ref[Comm], rank: i64, size: i64, ms: i64) -> Result[i64, RdmaError]:
+    let w: Tensor[f32, (16, 16)] = T.full([16, 16], 0.5)
+    let x0: Tensor[f32, (16, 16)] = T.full([16, 16], (rank + 1) as f32)
+    let mut g: Tensor[f32, (16, 16)] = T.zeros([16, 16])
+    g.matmul_into(x0, w)
+    let b0: RegBuf[f32] = bucket_of(ctx, &g)?
+    let a0: u64 = address_of(&b0)
+    let p0: Pending[f32] = iallreduce(b0, comm, ReduceOp.Sum, CollMode.Deterministic, ms)?
+    # The next bucket's backward overlaps the first bucket's allreduce.
+    let x1: Tensor[f32, (16, 16)] = T.full([16, 16], (rank + 2) as f32)
+    g.matmul_into(x1, w)
+    let b1: RegBuf[f32] = bucket_of(ctx, &g)?
+    let a1: u64 = address_of(&b1)
+    let p1: Pending[f32] = iallreduce(b1, comm, ReduceOp.Sum, CollMode.Deterministic, ms)?
+    let r0: RegBuf[f32] = p0.wait()?
+    let r1: RegBuf[f32] = p1.wait()?
+    let mut bad: i64 = 0
+    if address_of(&r0) != a0 or address_of(&r1) != a1:
+        bad = bad + fail("collective_on_the_registered_storage".as_bytes())
+    if not check_bucket(&r0, expected(size, 0)) or not check_bucket(&r1, expected(size, 1)):
+        bad = bad + fail("reduced_gradients".as_bytes())
+    return Result.Ok(bad)
+
+# Steps `s..STEPS` (recursion: `?` is not yet supported inside loop bodies).
+def train(ctx: ref[RdmaContext], comm: ref[Comm], rank: i64, size: i64, ms: i64, s: i64) -> Result[i64, RdmaError]:
+    if s == STEPS:
+        return Result.Ok(0)
+    let bad: i64 = step(ctx, comm, rank, size, ms)?
+    return Result.Ok(bad + train(ctx, comm, rank, size, ms, s + 1)?)
+
+def run(rank: i64, size: i64) -> Result[i64, RdmaError]:
+    let ms: i64 = env_i64("RDMA_TIMEOUT_MS".as_bytes(), DEFAULT_TIMEOUT_MS)
+    let dir: String = env_string("RDMA_DIR".as_bytes())
+    let ctx: RdmaContext = RdmaContext.new()?
+    let mine: Address = ctx.address()?
+    let wrote: bool = write_address(addr_path(&dir, rank), &mine)
+    if not wrote:
+        return Result.Ok(fail("write_address".as_bytes()))
+    let comm: Comm = Comm.new(&ctx, rank as u32, size as u32)?
+    wire(&ctx, &comm, &dir, rank, size, 0)?
+    comm.barrier(ms)?
+    ctx.set_progress_thread(true)?
+    let mut bad: i64 = step(&ctx, &comm, rank, size, ms)?
+    # From here on every bucket comes from the registration cache.
+    let regs: i64 = ctx.registrations()
+    let hits: i64 = ctx.registration_cache_hits()
+    bad = bad + train(&ctx, &comm, rank, size, ms, 1)?
+    if ctx.registrations() != regs:
+        bad = bad + fail("no_registration_after_the_first_step".as_bytes())
+    if ctx.registration_cache_hits() - hits != 2 * (STEPS - 1):
+        bad = bad + fail("one_cache_hit_per_bucket_and_step".as_bytes())
+    ctx.set_progress_thread(false)?
+    comm.barrier(ms)?
+    return Result.Ok(bad)
+
+def main() -> i32:
+    # Without the bootstrap environment there is nothing to run: example
+    # sweeps build and run every example with no arguments.
+    if env_string("RDMA_DIR".as_bytes()).len() == 0:
+        println!("rdma_tensor_buckets: set RDMA_RANK, RDMA_SIZE and RDMA_DIR (see the header)")
+        return 0
+    let rank: i64 = env_i64("RDMA_RANK".as_bytes(), 0)
+    let size: i64 = env_i64("RDMA_SIZE".as_bytes(), 1)
+    match run(rank, size):
+        Ok(bad) =>
+            if bad != 0:
+                return 1
+            println!("RESULT rank {rank} ok")
+            return 0
+        Err(e) =>
+            let code: i64 = e.code
+            println!("RESULT error {code}")
+            return 2

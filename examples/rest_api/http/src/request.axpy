@@ -1,0 +1,302 @@
+# HTTP/1.1 request parsing: the request line, header fields and a
+# `Content-Length` body (RFC 9112). Chunked transfer coding, keep-alive and
+# obsolete line folding are out of scope and rejected.
+#
+# The parser works on byte slices so the server can call it on a growing
+# buffer: `find_head_end` locates the blank line, `parse_head` validates the
+# request line and headers, and `parse_request` combines both for a buffer
+# that holds a whole request.
+
+from std.core import Result, Ok, Err, Option, Some, None_
+from std.strconv import parse_u64
+
+const SP: u8 = 32
+const HTAB: u8 = 9
+const CR: u8 = 13
+const LF: u8 = 10
+const COLON: u8 = 58
+const SLASH: u8 = 47
+const QUESTION: u8 = 63
+const DOT: u8 = 46
+
+# Size limits applied while reading a request.
+@public
+struct Limits:
+    # Request line plus headers, including the terminating blank line.
+    @public
+    max_head_bytes: usize
+    # The `Content-Length` body.
+    @public
+    max_body_bytes: usize
+
+# 8 KiB of head and 64 KiB of body.
+@public
+def default_limits() -> Limits:
+    return Limits { max_head_bytes: 8192, max_body_bytes: 65536 }
+
+# A header field; `name` keeps its spelling, lookups ignore ASCII case.
+# (Not `Header`: with a prebuilt sysroot that name clashes with a private
+# std.safetensors type, AX331, #3557.)
+@public
+struct HeaderField:
+    @public
+    name: String
+    @public
+    value: String
+
+# A parsed request. `path` excludes the query; `query` is the text after
+# `?` (empty when there is none), not decoded.
+@public
+struct Request:
+    @public
+    method: String
+    @public
+    path: String
+    @public
+    query: String
+    @public
+    headers: Vec[HeaderField]
+    @public
+    body: Vec[u8]
+
+# A request that cannot be served: the status to answer with and why.
+@public
+struct HttpError:
+    @public
+    status: u16
+    @public
+    message: String
+
+@public
+def http_error(status: u16, message: String) -> HttpError:
+    return HttpError { status: status, message: message }
+
+# A request with no method, path, headers or body.
+@public
+def empty_request() -> Request:
+    return Request { method: String.new(), path: String.new(), query: String.new(), headers: Vec.new(), body: Vec.new() }
+
+# The parsed head of a request and the body length it announces.
+@public
+struct Head:
+    @public
+    request: Request
+    @public
+    content_length: usize
+
+# Lower-case an ASCII letter.
+def lower(b: u8) -> u8:
+    if b >= 65 and b <= 90:
+        return b + 32
+    return b
+
+# ASCII case-insensitive comparison of `a` with `b`, which must already be
+# lower case.
+def eq_ignore_case(a: Slice[u8], b: Slice[u8]) -> bool:
+    if a.len() != b.len():
+        return False
+    for i: usize in range(0, a.len()):
+        if lower(a[i]) != b[i]:
+            return False
+    return True
+
+# The value of the first header named `name` (any case), cloned.
+@public
+def header_value(headers: &Vec[HeaderField], name: String) -> Option[String]:
+    for i: usize in range(0, headers.len()):
+        if eq_ignore_case(headers[i].name.as_bytes(), lower_string(name.as_bytes()).as_bytes()):
+            return Some(headers[i].value.clone())
+    # Workaround (#3533): bare imported `None_` is AX0381.
+    return Option.None_
+
+def lower_string(s: Slice[u8]) -> String:
+    let mut out: String = String.new()
+    for i: usize in range(0, s.len()):
+        out.push(lower(s[i]))
+    return out
+
+# Copy `s[start..end]` into a new `String`. Callers pass ASCII ranges they
+# validated, so the bytes are UTF-8.
+def string_of(s: Slice[u8], start: usize, end: usize) -> String:
+    let mut out: String = String.new()
+    for i: usize in range(start, end):
+        out.push(s[i])
+    return out
+
+# RFC 9110 `tchar`: the characters of a method or a header name.
+def is_tchar(b: u8) -> bool:
+    if (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122):
+        return True
+    # ! # $ % & ' * + - . ^ _ ` | ~
+    return b == 33 or b == 35 or b == 36 or b == 37 or b == 38 or b == 39 or b == 42 or b == 43 or b == 45 or b == 46 or b == 94 or b == 95 or b == 96 or b == 124 or b == 126
+
+def is_dec_digit(b: u8) -> bool:
+    return b >= 48 and b <= 57
+
+# Visible ASCII (no controls, no space, no DEL); request targets are limited
+# to it.
+def is_vchar(b: u8) -> bool:
+    return b > 32 and b < 127
+
+# A header value byte: visible ASCII, space, tab or obs-text (>= 0x80).
+def is_field_byte(b: u8) -> bool:
+    return b == SP or b == HTAB or (b > 32 and b != 127)
+
+# Index just past the `\r\n\r\n` that ends the head, if `buf` holds it.
+@public
+def find_head_end(buf: Slice[u8]) -> Option[usize]:
+    let n: usize = buf.len()
+    if n < 4:
+        return Option.None_
+    for i: usize in range(0, n - 3):
+        if buf[i] == CR and buf[i + 1] == LF and buf[i + 2] == CR and buf[i + 3] == LF:
+            return Some(i + 4)
+    return Option.None_
+
+# Index of the next `\r\n` at or after `from`, if any.
+def find_crlf(s: Slice[u8], start: usize) -> Option[usize]:
+    let mut i: usize = start
+    while i + 1 < s.len():
+        if s[i] == CR and s[i + 1] == LF:
+            return Some(i)
+        i = i + 1
+    return Option.None_
+
+# Parse `METHOD SP target SP HTTP/1.x` (the line without its CRLF).
+def parse_request_line(line: Slice[u8]) -> Result[Request, HttpError]:
+    let n: usize = line.len()
+    let mut i: usize = 0
+    while i < n and is_tchar(line[i]):
+        i = i + 1
+    if i == 0 or i >= n or line[i] != SP:
+        return Err(http_error(400, "malformed request line"))
+    let method: String = string_of(line, 0, i)
+    let target_start: usize = i + 1
+    let mut j: usize = target_start
+    while j < n and is_vchar(line[j]):
+        j = j + 1
+    if j == target_start or j >= n or line[j] != SP:
+        return Err(http_error(400, "malformed request line"))
+    if line[target_start] != SLASH:
+        return Err(http_error(400, "request target must be an absolute path"))
+    # The version is `HTTP/<digit>.<digit>`; only 1.0 and 1.1 are served.
+    let version: Slice[u8] = line.slice(j + 1, n)
+    let prefix: String = "http/"
+    if version.len() != 8 or not eq_ignore_case(version.slice(0, 5), prefix.as_bytes()):
+        return Err(http_error(400, "malformed request line"))
+    if not (is_dec_digit(version[5]) and version[6] == DOT and is_dec_digit(version[7])):
+        return Err(http_error(400, "malformed request line"))
+    if version[5] != 49 or (version[7] != 48 and version[7] != 49):
+        return Err(http_error(505, "HTTP version not supported"))
+    # Split the target at the first `?`.
+    let mut q: usize = j
+    for k: usize in range(target_start, j):
+        if line[k] == QUESTION and q == j:
+            q = k
+    let path: String = string_of(line, target_start, q)
+    let mut query: String = String.new()
+    if q < j:
+        query = string_of(line, q + 1, j)
+    return Ok(Request { method: method, path: path, query: query, headers: Vec.new(), body: Vec.new() })
+
+# Parse one `name: value` field line (without its CRLF).
+def parse_header_line(line: Slice[u8]) -> Result[HeaderField, HttpError]:
+    let n: usize = line.len()
+    if n > 0 and (line[0] == SP or line[0] == HTAB):
+        return Err(http_error(400, "obsolete line folding is not supported"))
+    let mut i: usize = 0
+    while i < n and is_tchar(line[i]):
+        i = i + 1
+    if i == 0 or i >= n or line[i] != COLON:
+        return Err(http_error(400, "malformed header field"))
+    let name: String = string_of(line, 0, i)
+    # Trim optional whitespace around the value.
+    let mut start: usize = i + 1
+    while start < n and (line[start] == SP or line[start] == HTAB):
+        start = start + 1
+    let mut end: usize = n
+    while end > start and (line[end - 1] == SP or line[end - 1] == HTAB):
+        end = end - 1
+    for k: usize in range(start, end):
+        if not is_field_byte(line[k]):
+            return Err(http_error(400, "invalid byte in header value"))
+    # Values may carry obs-text bytes; keep them only when the value is
+    # ASCII so `value` stays valid UTF-8.
+    for k: usize in range(start, end):
+        if line[k] >= 128:
+            return Err(http_error(400, "non-ASCII header value"))
+    let value: String = string_of(line, start, end)
+    return Ok(HeaderField { name: name, value: value })
+
+# Parse the head `buf[0..head_end]` (as found by `find_head_end`) and the
+# body length it announces, enforcing `limits.max_body_bytes`.
+@public
+def parse_head(buf: Slice[u8], head_end: usize, limits: &Limits) -> Result[Head, HttpError]:
+    let head: Slice[u8] = buf.slice(0, head_end)
+    let mut line_end: usize = 0
+    match find_crlf(head, 0):
+        Some(e) => line_end = e
+        None_ => return Err(http_error(400, "malformed request line"))
+    let mut request: Request = parse_request_line(head.slice(0, line_end))?
+    let mut content_length: usize = 0
+    let mut seen_length: bool = False
+    let mut pos: usize = line_end + 2
+    # The head ends with an empty line, so the loop stops at `head_end - 2`.
+    while pos < head_end - 2:
+        let mut end: usize = 0
+        match find_crlf(head, pos):
+            Some(e) => end = e
+            None_ => return Err(http_error(400, "malformed header field"))
+        # Workaround (#3547): no `?` inside a `while` body.
+        let mut header: HeaderField = HeaderField { name: String.new(), value: String.new() }
+        match parse_header_line(head.slice(pos, end)):
+            Ok(h) => header = h
+            Err(e) => return Err(e)
+        let te: String = "transfer-encoding"
+        let cl: String = "content-length"
+        if eq_ignore_case(header.name.as_bytes(), te.as_bytes()):
+            return Err(http_error(501, "transfer codings are not supported"))
+        if eq_ignore_case(header.name.as_bytes(), cl.as_bytes()):
+            let mut n: usize = 0
+            match parse_u64(header.value.as_bytes()):
+                Ok(v) => n = v as usize
+                Err(e) => return Err(http_error(400, "invalid Content-Length"))
+            # A leading sign is accepted by parse_u64; HTTP allows digits only.
+            if not is_dec_digit(header.value.as_bytes()[0]):
+                return Err(http_error(400, "invalid Content-Length"))
+            if seen_length and n != content_length:
+                return Err(http_error(400, "conflicting Content-Length headers"))
+            seen_length = True
+            content_length = n
+        request.headers.push(header)
+        pos = end + 2
+    if content_length > limits.max_body_bytes:
+        return Err(http_error(413, "request body too large"))
+    return Ok(Head { request: request, content_length: content_length })
+
+# Parse a buffer holding one whole request. A buffer that ends early is a
+# 400; bytes after the announced body are ignored (no pipelining).
+@public
+def parse_request(buf: Slice[u8], limits: &Limits) -> Result[Request, HttpError]:
+    let mut head_end: usize = 0
+    match find_head_end(buf):
+        Some(e) => head_end = e
+        None_ =>
+            if buf.len() > limits.max_head_bytes:
+                return Err(http_error(431, "request head too large"))
+            return Err(http_error(400, "incomplete request head"))
+    if head_end > limits.max_head_bytes:
+        return Err(http_error(431, "request head too large"))
+    # Workaround (#3535): `parse_head(...)?` followed by
+    # the partial move `head.request` fails MLIR emission, so the result is
+    # matched by hand.
+    let mut head: Head = Head { request: empty_request(), content_length: 0 }
+    match parse_head(buf, head_end, limits):
+        Ok(h) => head = h
+        Err(e) => return Err(e)
+    if buf.len() < head_end + head.content_length:
+        return Err(http_error(400, "incomplete request body"))
+    let mut request: Request = head.request
+    for i: usize in range(head_end, head_end + head.content_length):
+        request.body.push(buf[i])
+    return Ok(request)

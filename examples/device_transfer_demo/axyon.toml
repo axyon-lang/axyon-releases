@@ -1,0 +1,16 @@
+[package]
+name = "device_transfer_demo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# Device buffers need a GPU target with a device runtime (#2301). This demo
+# selects CUDA; `metal-apple-gpu` has one too (Metal, #2386), but its row
+# declares no `f32` yet (#2122), and selecting both targets is AX0623.
+[target]
+gpu = ["nvptx-sm80"]

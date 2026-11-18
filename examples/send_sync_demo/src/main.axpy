@@ -1,0 +1,38 @@
+# Send / Sync Demo - auto-trait enforcement (issue #169)
+#
+# `Send` (safe to move across threads) and `Sync` (safe to share) are auto
+# traits: a bound `T: Send` is satisfied structurally. Raw pointers, `Rc`
+# and (for `Sync`) `Cell` are rejected; `@traits(Send)` is an explicit opt-in.
+
+def needs_send[T: Send](x: T) -> T:
+    return x
+
+def needs_sync[T: Sync](x: T) -> T:
+    return x
+
+struct Plain:
+    a: i64
+    b: f64
+
+struct Wrapper[T]:
+    item: T
+
+# Explicit `unsafe impl Send`: fields (a raw pointer) are not inspected.
+@traits(Send)
+struct Transfer[T]:
+    p: *mut T
+
+def pass_through(t: Transfer[i64]) -> Transfer[i64]:
+    return needs_send(t)
+
+# Uncommenting either line fails with AX070 (bound `Send` not satisfied):
+#   struct Rc[T]: value: T   ->   needs_send(Rc { value: 1 })
+#   needs_sync(t)            ->   Transfer is Send but not Sync
+
+def main() -> i32:
+    let p: Plain = Plain { a: 1, b: 2.0 }
+    let q: Plain = needs_send(p)
+    let w: Wrapper[i64] = Wrapper { item: 7 }
+    let v: Wrapper[i64] = needs_sync(w)
+    println!("Send/Sync checks passed: {q.a} {v.item}")
+    return 0

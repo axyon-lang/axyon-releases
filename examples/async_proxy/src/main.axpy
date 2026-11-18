@@ -1,0 +1,112 @@
+# Async TCP proxy on loopback with std.async_io_util (#3088).
+#
+# Three tasks run under one `block_on`, joined by the hand-written `All3`
+# future (as in examples/async_echo):
+#   upstream  accepts one connection and echoes it with `async_split` + `async_copy`;
+#   proxy     accepts the client, connects to the upstream and relays both
+#             directions with `async_copy_bidirectional`;
+#   client    sends a message through the proxy, half-closes, reads the echo.
+
+from core.task import Context
+from std.async_runtime import block_on
+from core.future import Future, Poll
+from std.async_io import AsyncTcpStream, AsyncTcpListener
+from std.async_io_util import async_split, async_copy, async_copy_bidirectional
+from std.net import SocketAddr
+from std.alloc import Vec
+
+def bytes_of(text: str) -> Vec[u8]:
+    let mut v: Vec[u8] = Vec.new()
+    let b: Slice[u8] = text.as_bytes()
+    for i: usize in range(b.len()):
+        v.push(b[i])
+    return v
+
+async def upstream(l: AsyncTcpListener) -> i64:
+    let s: AsyncTcpStream = (await l.accept()).unwrap()
+    let (r, w) = async_split(s)
+    let n: usize = (await async_copy(r, w)).unwrap()
+    let _c = s.close()
+    return n as i64
+
+async def proxy(l: AsyncTcpListener, upstream_port: u16) -> i64:
+    let c: AsyncTcpStream = (await l.accept()).unwrap()
+    let u: AsyncTcpStream = (await AsyncTcpStream.connect(SocketAddr.new(127, 0, 0, 1, upstream_port))).unwrap()
+    let (up, down) = (await async_copy_bidirectional(c, u)).unwrap()
+    let _c1 = c.close()
+    let _c2 = u.close()
+    return (up + down) as i64
+
+async def client(port: u16) -> i64:
+    let s: AsyncTcpStream = (await AsyncTcpStream.connect(SocketAddr.new(127, 0, 0, 1, port))).unwrap()
+    let _sent: usize = (await s.write_all(bytes_of("hello proxy\n"))).unwrap()
+    let _h = s.shutdown(1)
+    let mut total: i64 = 0
+    let mut done: bool = False
+    while not done:
+        let chunk: Vec[u8] = (await s.read(64)).unwrap()
+        if chunk.len() == 0:
+            done = True
+        total = total + (chunk.len() as i64)
+    let _c = s.close()
+    return total
+
+struct All3:
+    a: __Future_upstream
+    b: __Future_proxy
+    c: __Future_client
+    ra: i64
+    rb: i64
+    rc: i64
+    da: bool
+    db: bool
+    dc: bool
+
+impl Future for All3:
+    type Output = i64
+
+    def poll(mut self, cx: ref_mut[Context]) -> Poll[i64]:
+        if not self.da:
+            match self.a.poll(cx):
+                case Poll.Ready(v):
+                    self.ra = v
+                    self.da = True
+                case Poll.Pending:
+                    pass
+        if not self.db:
+            match self.b.poll(cx):
+                case Poll.Ready(v):
+                    self.rb = v
+                    self.db = True
+                case Poll.Pending:
+                    pass
+        if not self.dc:
+            match self.c.poll(cx):
+                case Poll.Ready(v):
+                    self.rc = v
+                    self.dc = True
+                case Poll.Pending:
+                    pass
+        if self.da and self.db and self.dc:
+            return Poll.Ready(self.ra * 10000 + self.rb * 100 + self.rc)
+        return Poll.Pending
+
+async def run(up: AsyncTcpListener, px: AsyncTcpListener, up_port: u16, px_port: u16) -> i64:
+    let all: All3 = All3 { a: upstream(up), b: proxy(px, up_port), c: client(px_port), ra: 0, rb: 0, rc: 0, da: False, db: False, dc: False }
+    let r: i64 = await all
+    return r
+
+def main() -> i32:
+    let up: AsyncTcpListener = AsyncTcpListener.bind(SocketAddr.new(127, 0, 0, 1, 0)).unwrap()
+    let px: AsyncTcpListener = AsyncTcpListener.bind(SocketAddr.new(127, 0, 0, 1, 0)).unwrap()
+    let up_port: u16 = up.local_addr().unwrap().port
+    let px_port: u16 = px.local_addr().unwrap().port
+    let mut f = run(up, px, up_port, px_port)
+    let r: i64 = block_on(&mut f)
+    let _c1 = up.close()
+    let _c2 = px.close()
+    # upstream echoed 12 bytes; the proxy relayed 12 + 12; the client read 12.
+    println!("proxy result {r}")
+    if r != 12 * 10000 + 24 * 100 + 12:
+        return 1
+    return 0

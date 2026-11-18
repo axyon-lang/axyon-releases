@@ -1,0 +1,49 @@
+# Kernels on sub-range views of device buffers (issues #2668, #2705)
+#
+# `buffer_view(&d, start, len)` borrows rows `start..start + len` of the
+# `device_global` buffer `d`, and `buffer_view_mut(&mut d, start, len)` does
+# the same for writing. A view can be bound to an annotated `let`, passed to
+# and returned from functions, viewed again, and passed to `gpu_launch` for a
+# kernel parameter with a run-time leading extent (`(N,)` here), so the
+# kernel sees a buffer of exactly `len` elements: `buffer_dim` reads `len`,
+# and an index past it stops the kernel. The range is checked before the
+# launch (an AXYON panic otherwise), and the rest of `d` is untouched.
+#
+# Running it needs an NVIDIA GPU and driver; without one the first device
+# allocation stops the program with an AXYON panic.
+
+@gpu(entry)
+def add_into(src: &Buffer[f32, (N,), device_global], dst: &mut Buffer[f32, (M,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    # `buffer_dim(dst, 0)` is the view's length, not the whole buffer's.
+    if i < buffer_dim(dst, 0) and i < buffer_dim(src, 0):
+        buffer_set(dst, i, buffer_get(dst, i) + buffer_get(src, i))
+
+# A view returned from a helper: it borrows `s` for as long as the caller
+# uses it, so `s` cannot be freed meanwhile.
+def quarter(s: &Buffer[f32, (N,), device_global], k: i64) -> &Buffer[f32, (Q,), device_global]:
+    return buffer_view(s, 4 * k, 4)
+
+def main() -> i32:
+    let n: i64 = 12
+    let mut hs: Buffer[f32, (N,)] = buffer_alloc([n])
+    let mut hd: Buffer[f32, (N,)] = buffer_alloc([n])
+    for i: i64 in range(n):
+        buffer_set(hs, i, (i + 1) as f32)
+        buffer_set(hd, i, 0.0)
+    let s: Buffer[f32, (N,), device_global] = buffer_to_device(hs)
+    let mut d: Buffer[f32, (N,), device_global] = buffer_to_device(hd)
+
+    # Add elements 0..4 of `s` into elements 4..8 of `d`, then elements
+    # 8..12 of `s` into the same four elements: each launch binds only its
+    # views, so elements 0..4 and 8..12 of `d` stay 0.
+    # The destination view is bound once and launched twice.
+    let rows: &mut Buffer[f32, (Q,), device_global] = buffer_view_mut(&mut d, 4, 4)
+    gpu_launch(add_into, 1, 32, buffer_view(&s, 0, 4), rows)
+    gpu_launch(add_into, 1, 32, quarter(&s, 2), rows)
+
+    let back: Buffer[f32, (N,)] = buffer_to_host(d)
+    for i: i64 in range(n):
+        let v: f32 = buffer_get(back, i)
+        println!("d[{i}] = {v}")
+    return 0

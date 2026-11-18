@@ -1,0 +1,63 @@
+# std.concurrent channel payloads and the `Owned` bound (issue #177)
+#
+# The runtime channel queues raw `size_of[T]` byte blobs, so a payload must be:
+#   - `Copy`: it is moved into the queue by bitwise copy, and a droppable value
+#     (`string`, `Vec`, ...) would need ownership transfer and cleanup;
+#   - `Owned`: it holds no borrow (`ref`/`ref_mut`, slice or view) anywhere in
+#     its fields, tuple elements or generic arguments. The queue does not keep
+#     the borrowed value alive, so a stored reference would dangle.
+#
+# `Owned` is a compiler-evaluated, structural bound. No `impl` or `@derive`
+# can grant it. Your own generic code can require it like any other bound.
+#
+# Rejected at compile time (AX070 on the statement that instantiates the
+# channel):
+#   channel[string]()              # `string` is not `Copy`
+#   channel[ref[i32]]()            # `ref[i32]` is not `Owned`
+#   channel[Tagged]()              # a `Copy` struct with a `ref` field
+
+from std.concurrent import channel, Channel, Sender, Receiver, CHANNEL_OK, CHANNEL_CLOSED
+
+# An owned payload: plain scalars, no borrows, `Copy`.
+@derive(Copy, Clone)
+struct Reading:
+    sensor: i32
+    value: i64
+
+# A user generic that carries the channel's bounds: it accepts exactly the
+# payloads a channel accepts and forwards them to `channel[T]()`, so a bad
+# payload is reported at this function's caller (`owned_channel[ref[i32]]()`
+# is AX070 on that statement) instead of inside the stdlib.
+def owned_channel[T: Copy + Owned + Send]() -> Channel[T]:
+    return channel[T]()
+
+def main() -> i32:
+    let ch: Channel[Reading] = owned_channel[Reading]()
+    let tx: Sender[Reading] = ch.sender()
+    let rx: Receiver[Reading] = ch.receiver()
+
+    let first: i64 = tx.send(Reading { sensor: 1, value: 40_i64 })
+    let second: i64 = tx.send(Reading { sensor: 2, value: 2_i64 })
+    tx.close()
+
+    let mut total: i64 = 0_i64
+    let mut count: i64 = 0_i64
+    unsafe:
+        # SAFETY: `slot` is a fresh, zeroed allocation sized and aligned for one
+        # `Reading`; `recv` overwrites it in place and it is freed below.
+        let raw: ptr_mut[u8] = global_alloc_zeroed(16, 8)
+        let slot: ptr_mut[Reading] = raw as ptr_mut[Reading]
+        while rx.recv(slot) == CHANNEL_OK:
+            let r: Reading = *slot
+            total = total + r.value
+            count = count + 1_i64
+        let after_close: i64 = rx.recv(slot)
+        assert!(after_close == CHANNEL_CLOSED, "a closed, drained channel reports CHANNEL_CLOSED")
+        global_dealloc(raw, 16, 8)
+
+    assert!(first == CHANNEL_OK, "the first send succeeds on an open channel")
+    assert!(second == CHANNEL_OK, "the second send succeeds on an open channel")
+    assert!(count == 2_i64, "both readings are received")
+    assert!(total == 42_i64, "payload fields survive the byte queue")
+    println!("channel owned demo ok: {total}")
+    return 0

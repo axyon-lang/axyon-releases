@@ -1,0 +1,12 @@
+[package]
+name = "parallel_for_demo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+opt_level = 3
+# Default thread count of `prange` loops; 0 or absent = one per CPU.
+# AXYON_NUM_THREADS overrides it when the program runs.
+parallel_threads = 4

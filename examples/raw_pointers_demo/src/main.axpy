@@ -1,0 +1,41 @@
+# Raw Pointers Demo
+# Demonstrates raw pointer type syntax (*const T, *mut T)
+#
+# Raw pointer types are parsed but full runtime semantics
+# require additional backend support.
+
+# Note: Raw pointer types are recognized by the parser but
+# full pointer operations require runtime support.
+#
+# Syntax examples (shown in comments):
+#   def ffi_memcpy(dst: *mut u8, src: *const u8, len: i64) -> i32
+#   def read_ptr(ptr: *const i32) -> i32
+#   def write_ptr(ptr: *mut i32, value: i32) -> i32
+
+def main() -> i32:
+    """Entry point demonstrating raw pointer syntax."""
+    # Raw pointers compare by address with ==/!= (ordering is rejected, AX0577).
+    let a: ptr_mut[u8] = global_alloc_zeroed(16, 8)
+    let b: ptr_mut[u8] = global_alloc_zeroed(16, 8)
+    let pa: ptr[u8] = a as ptr[u8]
+    let pa2: ptr[u8] = a as ptr[u8]
+    let pb: ptr[u8] = b as ptr[u8]
+    assert!(pa == pa2, "same allocation compares equal")
+    assert!(pa != pb, "distinct allocations compare unequal")
+    unsafe:
+        global_dealloc(a, 16, 8)
+        global_dealloc(b, 16, 8)
+    println!("Raw pointers demo")
+    println!("")
+    println!("Pointer types:")
+    println!("  *const T - immutable raw pointer")
+    println!("  *mut T   - mutable raw pointer")
+    println!("")
+    println!("Raw pointers require 'unsafe:' blocks for:")
+    println!("  - Dereferencing (*ptr)")
+    println!("  - Pointer arithmetic")
+    println!("  - Type casting")
+    println!("")
+    println!("Example function signature:")
+    println!("  def ffi_memcpy(dst: *mut u8, src: *const u8) -> i32")
+    return 0

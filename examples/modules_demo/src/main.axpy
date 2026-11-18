@@ -1,0 +1,50 @@
+# Modules Demo - Main Entry Point
+#
+# Demonstrates importing from the library package.
+# The main entry point imports from modules_demo, not the other way around.
+
+from modules_demo import Vec3
+from modules_demo import dot
+from modules_demo import Axis, Length
+from modules_demo.math import vector, kinds
+
+# Module-qualified type annotations: `vector.Vec3` / `kinds.Length`
+# name the same types as the bare imported names.
+def scale_x(v: vector.Vec3, k: f32) -> f32:
+    return v.x * k
+
+def main() -> i32:
+    println!("Modules Demo")
+    println!("============")
+
+    # Create two vectors using imported Vec3
+    let a: Vec3 = Vec3 { x: 1.0, y: 2.0, z: 3.0 }
+    let b: Vec3 = Vec3 { x: 4.0, y: 5.0, z: 6.0 }
+
+    # Use imported dot function
+    # dot(a, b) = 1*4 + 2*5 + 3*6 = 4 + 10 + 18 = 32
+    let result: f32 = dot(a, b)
+
+    println!("Vector a = (1.0, 2.0, 3.0)")
+    println!("Vector b = (4.0, 5.0, 6.0)")
+    println!("Dot product = {result}")
+
+    # Items declared with `@public` on an enum / type alias
+    let axis: Axis = Axis.Y
+    let step: Length = 1_i64
+    println!("Step length = {step}")
+
+    # Qualified annotations are the same types as the bare names
+    let q: vector.Vec3 = Vec3 { x: 1.5, y: 0.0, z: 0.0 }
+    let w: kinds.Length = step
+    let sx: f32 = scale_x(q, 2.0)
+    println!("Scaled x = {sx}, qualified length = {w}")
+
+    # Qualified value spellings: struct literals and enum variants
+    let v2: vector.Vec3 = vector.Vec3 { x: 2.0, y: 0.0, z: 0.0 }
+    let ax: kinds.Axis = kinds.Axis.Z
+    println!("Qualified literal x = {v2.x}")
+    assert!(v2.x == 2.0, "qualified struct literal")
+
+    println!("Demo complete!")
+    return 0

@@ -1,0 +1,23 @@
+# Tensor extent queries: dim / ndim / numel / shape (issue #1627).
+#
+# Both spellings (`t.numel()` and `T.numel(t)`) share one lowering. Extents are
+# `i64`; a `?` extent is read at run time. The `dim` axis must be a constant
+# (negative axes count from the end).
+
+import std.tensor as T
+
+def rows(n: i64) -> Tensor[f32, (?, 3)]:
+    return T.full([n, 3], 1.0)
+
+def describe(x: &Tensor[f32, (?, 3)]) -> i64:
+    let n: i64 = x.numel()
+    let r: i64 = T.ndim(x)
+    let (a, b) = x.shape()
+    let last: i64 = T.dim(x, -1)
+    println!("numel={n} ndim={r} shape=({a}, {b}) last={last}")
+    return n
+
+def main() -> i32:
+    let a: Tensor[f32, (?, 3)] = rows(4)
+    assert!(describe(&a) == 12, "numel of a 4x3 tensor")
+    return 0

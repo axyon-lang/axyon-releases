@@ -1,0 +1,222 @@
+# Per-function relaxed math (issue #2866, numeric-contract §6.1)
+#
+# `@relaxed_math` relaxes one function's `f32`/`f64` `+ - * /` and negation
+# (`fastmath<reassoc,contract>`, never `nnan`/`ninf`/`nsz`, no `.ftz` or
+# `.approx` on the device), whatever the build-wide mode. `@fast_math("off")`
+# pins one function strict. The same `a * b + c` runs in three kernel
+# flavours per type, and every result is compared with the strict host
+# evaluation (u = 2^-24 for f32, 2^-53 for f64):
+#
+#   marked  (`@relaxed_math`):     relaxed in every build; may contract into
+#                                  one `fma.rn`, within 4u (|a b| + |c|)
+#   pinned  (`@fast_math("off")`): strict in every build; bit-identical
+#   plain   (no attribute):        follows `[target] gpu-math` (strict here)
+#
+# The counts of results that differ from the host are printed per flavour;
+# `cuda_relaxed_math_2866` checks them under both build modes. A host
+# `@relaxed_math` function is checked against the same tolerance. Any result
+# outside its rule fails the run.
+
+const N: i64 = 4096
+const BLOCK: i64 = 128
+const U32: f64 = 0.000000059604644775390625
+const U64: f64 = 0.00000000000000011102230246251565
+
+@relaxed_math
+@gpu(entry)
+def marked_f32(n: i64, a: &Buffer[f32, (4096,), device_global], b: &Buffer[f32, (4096,), device_global], c: &Buffer[f32, (4096,), device_global], out: &mut Buffer[f32, (4096,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, buffer_get(a, i) * buffer_get(b, i) + buffer_get(c, i))
+
+@relaxed_math
+@gpu(entry)
+def marked_f64(n: i64, a: &Buffer[f64, (4096,), device_global], b: &Buffer[f64, (4096,), device_global], c: &Buffer[f64, (4096,), device_global], out: &mut Buffer[f64, (4096,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, buffer_get(a, i) * buffer_get(b, i) + buffer_get(c, i))
+
+@fast_math("off")
+@gpu(entry)
+def pinned_f32(n: i64, a: &Buffer[f32, (4096,), device_global], b: &Buffer[f32, (4096,), device_global], c: &Buffer[f32, (4096,), device_global], out: &mut Buffer[f32, (4096,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, buffer_get(a, i) * buffer_get(b, i) + buffer_get(c, i))
+
+@fast_math("off")
+@gpu(entry)
+def pinned_f64(n: i64, a: &Buffer[f64, (4096,), device_global], b: &Buffer[f64, (4096,), device_global], c: &Buffer[f64, (4096,), device_global], out: &mut Buffer[f64, (4096,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, buffer_get(a, i) * buffer_get(b, i) + buffer_get(c, i))
+
+@gpu(entry)
+def plain_f32(n: i64, a: &Buffer[f32, (4096,), device_global], b: &Buffer[f32, (4096,), device_global], c: &Buffer[f32, (4096,), device_global], out: &mut Buffer[f32, (4096,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, buffer_get(a, i) * buffer_get(b, i) + buffer_get(c, i))
+
+@gpu(entry)
+def plain_f64(n: i64, a: &Buffer[f64, (4096,), device_global], b: &Buffer[f64, (4096,), device_global], c: &Buffer[f64, (4096,), device_global], out: &mut Buffer[f64, (4096,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, buffer_get(a, i) * buffer_get(b, i) + buffer_get(c, i))
+
+# Host code: a relaxed multiply-add next to the strict one. Whether the host
+# contracts depends on the CPU, so only the tolerance is checked.
+@relaxed_math
+def mad_relaxed(a: f64, b: f64, c: f64) -> f64:
+    return a * b + c
+
+def mad_strict(a: f64, b: f64, c: f64) -> f64:
+    return a * b + c
+
+# A fixed-seed linear congruential generator: the same inputs every run.
+def next_seed(s: i64) -> i64:
+    return (s * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+
+# A value in [-1, 1) from a seed (53 random bits).
+def unit(s: i64) -> f64:
+    return ((s >> 10) as f64) / 4503599627370496.0 - 1.0
+
+def blocks_for(n: i64) -> i64:
+    return (n + BLOCK - 1) / BLOCK
+
+def absf(x: f64) -> f64:
+    if x < 0.0:
+        return -x
+    return x
+
+# The same value: equal bit patterns (no NaN arises from these inputs).
+def same(x: f64, y: f64) -> bool:
+    return x.to_bits() == y.to_bits()
+
+# Whether `got` is within `tol` of `want`; a NaN is never within.
+def within(got: f64, want: f64, tol: f64) -> bool:
+    return absf(got - want) <= tol
+
+def report(what: &str, i: i64, got: f64, want: f64, tol: f64) -> i64:
+    println!("{what} lane {i}: got {got}, want {want} (tolerance {tol})")
+    return 1
+
+# Compare one kernel's f32 results with the strict host references.
+# Returns (violations, results that differ from the host). `exact` kernels
+# (the pinned ones) must match bit for bit.
+def compare_f32(what: &str, h: Buffer[f32, (4096,)], want: Array[f32; 4096], tol: Array[f64; 4096], exact: bool) -> Array[i64; 2]:
+    let mut bad: i64 = 0
+    let mut differ: i64 = 0
+    for i: i64 in range(N):
+        let got: f64 = buffer_get(h, i) as f64
+        let w: f64 = want[i] as f64
+        if not same(got, w):
+            differ = differ + 1
+            if exact:
+                bad = bad + report(what, i, got, w, 0.0)
+            elif not within(got, w, tol[i]):
+                bad = bad + report(what, i, got, w, tol[i])
+    return [bad, differ]
+
+def compare_f64(what: &str, h: Buffer[f64, (4096,)], want: Array[f64; 4096], tol: Array[f64; 4096], exact: bool) -> Array[i64; 2]:
+    let mut bad: i64 = 0
+    let mut differ: i64 = 0
+    for i: i64 in range(N):
+        let got: f64 = buffer_get(h, i)
+        if not same(got, want[i]):
+            differ = differ + 1
+            if exact:
+                bad = bad + report(what, i, got, want[i], 0.0)
+            elif not within(got, want[i], tol[i]):
+                bad = bad + report(what, i, got, want[i], tol[i])
+    return [bad, differ]
+
+# Returns (violations, marked, pinned, plain differing counts).
+def check_f32(seed: i64) -> Array[i64; 4]:
+    let mut s: i64 = seed
+    let mut a: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut b: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut c: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let o1: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let o2: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let o3: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    for i: i64 in range(N):
+        s = next_seed(s)
+        buffer_set(a, i, unit(s) as f32)
+        s = next_seed(s)
+        buffer_set(b, i, unit(s) as f32)
+        s = next_seed(s)
+        buffer_set(c, i, unit(s) as f32)
+    let mut want: Array[f32; 4096] = [0.0_f32; 4096]
+    let mut tol: Array[f64; 4096] = [0.0; 4096]
+    for i: i64 in range(N):
+        let ai: f32 = buffer_get(a, i)
+        let bi: f32 = buffer_get(b, i)
+        let ci: f32 = buffer_get(c, i)
+        want[i] = ai * bi + ci
+        tol[i] = 4.0 * U32 * (absf((ai as f64) * (bi as f64)) + absf(ci as f64))
+    let da: Buffer[f32, (4096,), device_global] = buffer_to_device(a)
+    let db: Buffer[f32, (4096,), device_global] = buffer_to_device(b)
+    let dc: Buffer[f32, (4096,), device_global] = buffer_to_device(c)
+    let mut d1: Buffer[f32, (4096,), device_global] = buffer_to_device(o1)
+    let mut d2: Buffer[f32, (4096,), device_global] = buffer_to_device(o2)
+    let mut d3: Buffer[f32, (4096,), device_global] = buffer_to_device(o3)
+    gpu_launch(marked_f32, blocks_for(N), BLOCK, N, &da, &db, &dc, &mut d1)
+    gpu_launch(pinned_f32, blocks_for(N), BLOCK, N, &da, &db, &dc, &mut d2)
+    gpu_launch(plain_f32, blocks_for(N), BLOCK, N, &da, &db, &dc, &mut d3)
+    let marked: Array[i64; 2] = compare_f32("f32 marked", buffer_to_host(d1), want, tol, false)
+    let pinned: Array[i64; 2] = compare_f32("f32 pinned", buffer_to_host(d2), want, tol, true)
+    let plain: Array[i64; 2] = compare_f32("f32 plain", buffer_to_host(d3), want, tol, false)
+    return [marked[0] + pinned[0] + plain[0], marked[1], pinned[1], plain[1]]
+
+def check_f64(seed: i64) -> Array[i64; 4]:
+    let mut s: i64 = seed
+    let mut a: Buffer[f64, (4096,)] = buffer_alloc([4096])
+    let mut b: Buffer[f64, (4096,)] = buffer_alloc([4096])
+    let mut c: Buffer[f64, (4096,)] = buffer_alloc([4096])
+    let o1: Buffer[f64, (4096,)] = buffer_alloc([4096])
+    let o2: Buffer[f64, (4096,)] = buffer_alloc([4096])
+    let o3: Buffer[f64, (4096,)] = buffer_alloc([4096])
+    for i: i64 in range(N):
+        s = next_seed(s)
+        buffer_set(a, i, unit(s))
+        s = next_seed(s)
+        buffer_set(b, i, unit(s))
+        s = next_seed(s)
+        buffer_set(c, i, unit(s))
+    let mut want: Array[f64; 4096] = [0.0; 4096]
+    let mut tol: Array[f64; 4096] = [0.0; 4096]
+    let mut host_bad: i64 = 0
+    for i: i64 in range(N):
+        let ai: f64 = buffer_get(a, i)
+        let bi: f64 = buffer_get(b, i)
+        let ci: f64 = buffer_get(c, i)
+        want[i] = mad_strict(ai, bi, ci)
+        tol[i] = 4.0 * U64 * (absf(ai * bi) + absf(ci))
+        let relaxed: f64 = mad_relaxed(ai, bi, ci)
+        if not within(relaxed, want[i], tol[i]):
+            host_bad = host_bad + report("f64 host mad_relaxed", i, relaxed, want[i], tol[i])
+    let da: Buffer[f64, (4096,), device_global] = buffer_to_device(a)
+    let db: Buffer[f64, (4096,), device_global] = buffer_to_device(b)
+    let dc: Buffer[f64, (4096,), device_global] = buffer_to_device(c)
+    let mut d1: Buffer[f64, (4096,), device_global] = buffer_to_device(o1)
+    let mut d2: Buffer[f64, (4096,), device_global] = buffer_to_device(o2)
+    let mut d3: Buffer[f64, (4096,), device_global] = buffer_to_device(o3)
+    gpu_launch(marked_f64, blocks_for(N), BLOCK, N, &da, &db, &dc, &mut d1)
+    gpu_launch(pinned_f64, blocks_for(N), BLOCK, N, &da, &db, &dc, &mut d2)
+    gpu_launch(plain_f64, blocks_for(N), BLOCK, N, &da, &db, &dc, &mut d3)
+    let marked: Array[i64; 2] = compare_f64("f64 marked", buffer_to_host(d1), want, tol, false)
+    let pinned: Array[i64; 2] = compare_f64("f64 pinned", buffer_to_host(d2), want, tol, true)
+    let plain: Array[i64; 2] = compare_f64("f64 plain", buffer_to_host(d3), want, tol, false)
+    return [host_bad + marked[0] + pinned[0] + plain[0], marked[1], pinned[1], plain[1]]
+
+def main() -> i32:
+    let r32: Array[i64; 4] = check_f32(2866)
+    let r64: Array[i64; 4] = check_f64(6682)
+    println!("scoped-math: marked f32 {r32[1]} f64 {r64[1]} differ from the strict host")
+    println!("scoped-math: pinned f32 {r32[2]} f64 {r64[2]} differ from the strict host")
+    println!("scoped-math: plain f32 {r32[3]} f64 {r64[3]} differ from the strict host")
+    let bad: i64 = r32[0] + r64[0]
+    println!("scoped-math: {bad} results outside their tolerance or exactness rule")
+    if bad != 0:
+        return 1
+    println!("scoped-math: every result within its rule")
+    return 0

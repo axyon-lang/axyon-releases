@@ -1,0 +1,15 @@
+[package]
+name = "cuda_async_copy_gemm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# Asynchronous global-to-workgroup copies lower to `cp.async` on CUDA
+# (#2514): exactly one GPU target with a copy engine and a device runtime.
+[target]
+gpu = ["nvptx-sm80"]

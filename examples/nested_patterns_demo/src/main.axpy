@@ -1,0 +1,54 @@
+# Nested class patterns (#932): destructure an enum inside an enum payload
+# in a single `case`, with bindings, exhaustiveness and payload moves.
+
+enum Shape:
+    Circle(r: i32)
+    Square(side: i32)
+    Dot
+
+enum Outer:
+    W(inner: Shape, tag: i32)
+    Empty
+
+enum Deep:
+    D(o: Outer)
+    Nil
+
+def area(o: Outer) -> i32:
+    match o:
+        case Outer.W(inner=Shape.Circle(r=r), tag=t):
+            return r * r * 3 + t
+        case Outer.W(inner=Shape.Square(side=s)):
+            return s * s
+        case Outer.W(inner=Shape.Dot):
+            return 0
+        case Outer.Empty:
+            return -1
+
+def deep(d: Deep) -> i32:
+    match d:
+        case Deep.D(o=Outer.W(inner=Shape.Circle(r=r))):
+            return r
+        case Deep.D(o=Outer.W(inner=Shape.Square(side=s))):
+            return s + 100
+        case Deep.D(o=_):
+            return -2
+        case Deep.Nil:
+            return -3
+
+def main() -> i32:
+    let c1: Shape = Shape.Circle(2)
+    let s1: Shape = Shape.Square(4)
+    let s2: Shape = Shape.Square(7)
+    let o1: Outer = Outer.W(c1, 5)
+    let o2: Outer = Outer.W(s1, 0)
+    let o3: Outer = Outer.W(s2, 0)
+    let d1: Deep = Deep.D(o3)
+    let a: i32 = area(o1)
+    let b: i32 = area(o2)
+    let c: i32 = deep(d1)
+    println!("{a} {b} {c}")
+    assert!(a == 17, "circle")
+    assert!(b == 16, "square")
+    assert!(c == 107, "deep")
+    return 0

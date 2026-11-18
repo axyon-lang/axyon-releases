@@ -1,0 +1,28 @@
+# Runtime-length device views (issue #2565) -- compile-only.
+#
+# A kernel takes a view of device memory whose length is known only at
+# launch: `Slice[T, device_global]` (read), `SliceMut[T, device_global]`
+# (read and write, through a `mut` binding as for any written slice) or
+# `Slice[T, constant]` (read). Device code reads `p[i]`, writes `p[i] = v`
+# and queries `p.len()`. Every access is checked against the view's own
+# length first: an out-of-range thread traps on NVPTX and records
+# `IndexOutOfBounds` in the device error record on Metal, so no thread reads
+# or writes outside the view.
+#
+# Build the device image with
+#   axyon build --emit device   (axyon.toml selects nvptx-sm80)
+# (docs/src/reference/gpu-backend.md section 8). Host code cannot launch a
+# view kernel yet: it holds device memory only as buffers
+# (docs/known-limitations/2565-device-views.md).
+
+@gpu(entry)
+def vadd(a: Slice[f32, device_global], b: Slice[f32, constant], mut out: SliceMut[f32, device_global]) -> None:
+    let i: u64 = (gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)) as u64
+    # Tail guard: the last block's extra threads do nothing.
+    if i < out.len():
+        out[i] = a[i] + b[i]
+
+@host
+def main() -> i32:
+    println!("device_views_demo: build with --emit device")
+    return 0

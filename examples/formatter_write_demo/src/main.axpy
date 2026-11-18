@@ -1,0 +1,52 @@
+# formatter_write_demo - a user `impl Display` writing through `Formatter`
+#
+# `Formatter` owns a fixed 256-byte inline buffer. A `Display.fmt` body appends
+# with `write_byte` / `write_bytes` through its `ref_mut[Formatter]` parameter;
+# each write stores everything or nothing and returns `Err(FmtError)` when the
+# buffer is full. Import `Formatter` from `core.formatter` (the module that
+# carries its write methods). `println!("{}", t)` does not call a user
+# `Display` impl yet (AX210; see docs/known-limitations/3482-*.md), so the
+# written bytes are read back with `as_bytes()` and printed.
+
+from core.formatter import Formatter
+from core import FmtError, Display
+
+struct Tag:
+    digit: u8
+
+impl Display for Tag:
+    def fmt(self, f: ref_mut[Formatter]) -> Result[unit, FmtError]:
+        f.write_byte(60_u8)?
+        f.write_byte(self.digit + 48_u8)?
+        f.write_bytes("> ok".as_bytes())?
+        return Ok(())
+
+def main() -> i32:
+    let t: Tag = Tag { digit: 7_u8 }
+    let mut f: Formatter = Formatter.new(16)
+    let r: Result[unit, FmtError] = t.fmt(&mut f)
+    assert!(r.is_ok())
+    assert!(f.written() == 6)
+    let out: Slice[u8] = f.as_bytes()
+    assert!(out[0] == 60_u8)
+    assert!(out[1] == 55_u8)
+    assert!(out[5] == 107_u8)
+    println!("wrote {} bytes", out.len())
+    let mut i: usize = 0
+    while i < out.len():
+        println!("{}", out[i])
+        i = i + 1
+
+    # A full buffer is an error, and a failed write_bytes stores nothing.
+    let mut small: Formatter = Formatter.new(4)
+    let ok: Result[unit, FmtError] = small.write_bytes("abc".as_bytes())
+    assert!(ok.is_ok())
+    let too_big: Result[unit, FmtError] = small.write_bytes("de".as_bytes())
+    assert!(too_big.is_err())
+    assert!(small.written() == 3)
+    let last: Result[unit, FmtError] = small.write_byte(100_u8)
+    assert!(last.is_ok())
+    let full: Result[unit, FmtError] = small.write_byte(101_u8)
+    assert!(full.is_err())
+    assert!(small.written() == 4)
+    return 0

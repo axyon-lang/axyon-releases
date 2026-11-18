@@ -1,0 +1,57 @@
+# async_net_demo - std.async_net on loopback (#3087)
+#
+# Resolves a literal address with `lookup_host` (on the runtime's blocking
+# pool, no network needed), sends a UDP datagram between two sockets, and
+# shows a per-operation timeout: a second `recv_from` with nothing queued
+# fails with `ErrorKind.TimedOut` instead of waiting forever. Every socket is
+# closed and the program checks that no handle leaked.
+
+from core.future import Future, Poll
+from core.task import Context
+from std.async_runtime import block_on
+from std.async_net import AsyncUdpSocket, Datagram, lookup_host
+from std.net import InetAddr, axyon_rt_net_live_handles
+from std.io_core import IoError, ErrorKind
+from std.time import Duration
+from std.alloc import Vec
+
+def bytes_of(text: str) -> Vec[u8]:
+    let mut v: Vec[u8] = Vec.new()
+    let b: Slice[u8] = text.as_bytes()
+    for i: usize in range(b.len()):
+        v.push(b[i])
+    return v
+
+async def demo(tag: i64) -> i64:
+    let server: AsyncUdpSocket = AsyncUdpSocket.bind(InetAddr.v4(127, 0, 0, 1, 0)).unwrap()
+    let port: u16 = server.local_inet().unwrap().port
+    let addrs: Vec[InetAddr] = (await lookup_host("127.0.0.1", port).with_timeout(Duration.from_secs(5))).unwrap()
+    let client: AsyncUdpSocket = AsyncUdpSocket.bind(InetAddr.v4(127, 0, 0, 1, 0)).unwrap()
+    let sent: usize = (await client.send_to(bytes_of("hello, udp"), addrs[0])).unwrap()
+    let got: Datagram = (await server.recv_from(64).with_timeout(Duration.from_secs(5))).unwrap()
+    let from_client: bool = got.peer.same(client.local_inet().unwrap())
+    let n: usize = got.data.len()
+    println!("received {n} bytes, from the client: {from_client}")
+    let idle: Result[Datagram, IoError] = await server.recv_from(64).with_timeout(Duration.from_millis(50))
+    let mut timed_out: bool = False
+    match idle:
+        case Ok(d):
+            pass
+        case Err(e):
+            timed_out = e.kind() == ErrorKind.TimedOut
+    println!("idle receive timed out: {timed_out}")
+    client.close().unwrap()
+    server.close().unwrap()
+    return sent as i64
+
+def main() -> i32:
+    let mut f = demo(0)
+    let sent: i64 = block_on(&mut f)
+    let mut open: i64 = 0
+    unsafe:
+        # SAFETY: runtime counter with no arguments.
+        open = axyon_rt_net_live_handles()
+    println!("sent {sent} bytes; open handles: {open}")
+    if sent != 10 or open != 0:
+        return 1
+    return 0

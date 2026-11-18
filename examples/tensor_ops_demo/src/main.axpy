@@ -1,0 +1,77 @@
+# Tensor operations example (issue #192): broadcasting element-wise ops, unary
+# math, reductions, creation and shape ops. Tensors are values that move on
+# use, so each intermediate result is bound once and consumed once.
+
+import std.tensor as T
+
+# Borrowed weights (issue #1531): a `&Tensor` parameter reads the weight
+# without consuming it, so one `w` serves every call. `T.*` builtins take the
+# borrow directly and return an owned tensor; no per-call copy is made.
+def fwd(w: &Tensor[f32, (2, 2)], b: &Tensor[f32, (2, 1)], x: Tensor[f32, (2, 1)]) -> Tensor[f32, (2, 1)]:
+    let y: Tensor[f32, (2, 1)] = T.matmul(w, x)
+    return T.add(b, y)
+
+# Runtime-length creation (issue #1567): `T.arange[f32](n)` takes a run-time
+# `n` (negative `n` traps), so a sequence-length mask `[n, n]` can be built
+# without a fixed size. Entry `(i, j)` is `j - i`.
+def seq_mask(n: i64) -> Tensor[f32, (?, ?)]:
+    let a: Tensor[f32, (?,)] = T.arange[f32](n)
+    let col: Tensor[f32, (?, 1)] = T.unsqueeze(a, 1)
+    let row: Tensor[f32, (1, ?)] = T.unsqueeze(a, 0)
+    return T.sub(row, col)
+
+def main() -> i32:
+    println!("Tensor Ops Example")
+
+    # Creation
+    let ramp: Tensor[f32, (6,)] = T.arange[f32](6)
+    let grid: Tensor[f32, (2, 3)] = T.reshape(ramp, [2, 3])
+    let ones: Tensor[f32, (3,)] = T.full[f32]([3], 1.0_f32)
+
+    # Broadcasting: (2, 3) + (3,) -> (2, 3), then unary math
+    let shifted: Tensor[f32, (2, 3)] = T.add(grid, ones)
+    let rooted: Tensor[f32, (2, 3)] = T.sqrt(shifted)
+
+    # Shape ops feeding other ops
+    let moved: Tensor[f32, (3, 2)] = T.transpose(rooted)
+    let flat: Tensor[f32, (6,)] = T.flatten(moved)
+    let mags: Tensor[f32, (6,)] = T.abs(flat)
+
+    # Reductions: positional axis, or none for a rank-0 result
+    let col: Tensor[f32, (1,)] = T.unsqueeze(T.max(mags), 0)
+    let total: Tensor[f32, ()] = T.sum(col)
+
+    let eye: Tensor[f32, (3, 3)] = T.eye[f32](3)
+    let row_sums: Tensor[f32, (3,)] = T.sum(eye, 1)
+
+    let table: Tensor[f32, (3, 2)] = T.reshape(T.arange[f32](6), [3, 2])
+
+    # Integer ids and row lookup (embedding): ids take their dtype from the
+    # declaration; `T.full` takes it from the fill value, hence `0_i32`.
+    let mut ids: Tensor[i32, (3,)] = T.full([3], 0_i32)
+    ids[0] = 2
+    ids[2] = 1
+    let rows: Tensor[f32, (3, 2)] = T.gather(table, ids)
+    let picked: Tensor[f32, (6,)] = T.flatten(rows)
+
+    # Borrowed weights: `&w` / `&b` lend the tensors to `fwd` on every
+    # iteration, and a builtin borrows `&w` directly.
+    let w: Tensor[f32, (2, 2)] = T.full[f32]([2, 2], 1.0_f32)
+    let b: Tensor[f32, (2, 1)] = T.full[f32]([2, 1], 0.5_f32)
+    let mut acc: f32 = 0.0
+    for i: i64 in range(0, 3):
+        let x: Tensor[f32, (2, 1)] = T.full[f32]([2, 1], 1.0_f32)
+        let y: Tensor[f32, (2, 1)] = fwd(&w, &b, x)
+        let yf: Tensor[f32, (2,)] = T.flatten(y)
+        acc = acc + yf[0]
+    let probe: Tensor[f32, (2, 1)] = T.full[f32]([2, 1], 2.0_f32)
+    let direct: Tensor[f32, (2,)] = T.flatten(T.matmul(&w, probe))
+    println!("Borrowed weights: acc = {}, direct = {}", acc, direct[0])
+
+    # Runtime sequence length: row 0 of the 4x4 mask sums to 0+1+2+3 = 6.
+    let m: Tensor[f32, (?, ?)] = seq_mask(4)
+    let m_rows: Tensor[f32, (?,)] = T.sum(m, 1)
+    println!("Sequence mask row-0 sum = {}", m_rows[0])
+
+    println!("Done: element-wise, reduction and shape ops lowered")
+    return 0

@@ -1,0 +1,449 @@
+# A minimal JSON value type with an encoder and a decoder (RFC 8259):
+# objects, arrays, strings with escapes (including `\uXXXX` surrogate
+# pairs), numbers, booleans and null.
+#
+# Objects keep their members in insertion order; a duplicate key is kept as
+# written and `find` returns the first one. Numbers are `f64`, so integers
+# beyond 2^53 lose precision. Nesting deeper than MAX_DEPTH is rejected so a
+# hostile body cannot exhaust the stack.
+
+from std.core import Result, Ok, Err, Option, Some, None_
+from std.strconv import parse_f64
+from std.io_core import is_valid_utf8
+
+# Maximum nesting depth of arrays and objects accepted by `decode`.
+const MAX_DEPTH: usize = 64
+
+# Byte values of the ASCII characters the codec looks at (there are no byte
+# literals).
+const QUOTE: u8 = 34
+const BACKSLASH: u8 = 92
+const SLASH: u8 = 47
+const COMMA: u8 = 44
+const COLON: u8 = 58
+const LBRACKET: u8 = 91
+const RBRACKET: u8 = 93
+const LBRACE: u8 = 123
+const RBRACE: u8 = 125
+const MINUS: u8 = 45
+const PLUS: u8 = 43
+const DOT: u8 = 46
+const DIGIT_0: u8 = 48
+const DIGIT_9: u8 = 57
+
+# One `"key": value` member of an object.
+@public
+struct Member:
+    @public
+    key: String
+    @public
+    value: Json
+
+# A JSON value.
+@public
+enum Json:
+    Null
+    Bool(value: bool)
+    Num(value: f64)
+    Str(value: String)
+    Arr(items: Vec[Json])
+    Obj(members: Vec[Member])
+
+# A decode failure: the byte offset where it was detected and a message.
+@public
+struct JsonError:
+    @public
+    offset: usize
+    @public
+    message: String
+
+def json_error(offset: usize, message: String) -> JsonError:
+    return JsonError { offset: offset, message: message }
+
+# Build an object member.
+@public
+def member(key: String, value: Json) -> Member:
+    return Member { key: key, value: value }
+
+# Index of the first member named `key`, if any.
+# (`key` is a `String` so callers can pass a literal: a literal does not
+# convert to a `Slice[u8]` parameter, #3552.)
+@public
+def find(members: &Vec[Member], key: String) -> Option[usize]:
+    for i: usize in range(0, members.len()):
+        if members[i].key == key:
+            return Some(i)
+    # Workaround (#3533): a bare imported `None_` is read as an
+    # uninitialized local (AX0381); spell the variant through its enum.
+    return Option.None_
+
+# (Helper names avoid those of private stdlib helpers such as
+# std.safetensors' `bytes_equal`, `skip_ws` and `parse_string`: with a
+# prebuilt sysroot a clash is an internal compiler error, #3557.)
+def same_bytes(a: Slice[u8], b: Slice[u8]) -> bool:
+    if a.len() != b.len():
+        return False
+    for i: usize in range(0, a.len()):
+        if a[i] != b[i]:
+            return False
+    return True
+
+# =============================================================================
+# Encoder
+# =============================================================================
+
+# Encode `v` as compact JSON text.
+@public
+def encode(v: &Json) -> String:
+    let mut out: String = String.new()
+    encode_into(v, &mut out)
+    return out
+
+def encode_into(v: &Json, out: &mut String) -> unit:
+    match v:
+        case Json.Null:
+            out.push_str("null")
+        case Json.Bool(value=b):
+            # Workaround (#3532): a `bool` bound through a reference
+            # match must be dereferenced; `if b:` is an internal error.
+            if *b:
+                out.push_str("true")
+            else:
+                out.push_str("false")
+        case Json.Num(value=n):
+            encode_number(*n, out)
+        case Json.Str(value=s):
+            encode_string(s.as_bytes(), out)
+        case Json.Arr(items=items):
+            out.push(LBRACKET)
+            for i: usize in range(0, items.len()):
+                if i > 0:
+                    out.push(COMMA)
+                encode_into(&items[i], out)
+            out.push(RBRACKET)
+        case Json.Obj(members=members):
+            out.push(LBRACE)
+            for i: usize in range(0, members.len()):
+                if i > 0:
+                    out.push(COMMA)
+                encode_string(members[i].key.as_bytes(), out)
+                out.push(COLON)
+                encode_into(&members[i].value, out)
+            out.push(RBRACE)
+
+# Integral values within the exactly representable range print without a
+# fraction; others use the shortest text that round-trips. NaN and infinities
+# have no JSON spelling and encode as `null`.
+def encode_number(n: f64, out: &mut String) -> unit:
+    if n != n or n - n != 0.0:
+        out.push_str("null")
+    elif n == ((n as i64) as f64) and n < 9007199254740992.0 and n > -9007199254740992.0:
+        let i: i64 = n as i64
+        out.push_str(format!("{i}"))
+    else:
+        out.push_str(format!("{n}"))
+
+# Lower-case hex digit of `n` (0..15).
+# Workaround (#3548): a `const` lookup table
+# (`const HEX: Array[u8; 16] = [...]`) is rejected with AX0605.
+def hex_digit(n: u8) -> u8:
+    if n < 10:
+        return DIGIT_0 + n
+    return 87 + n
+
+def encode_string(s: Slice[u8], out: &mut String) -> unit:
+    out.push(QUOTE)
+    for i: usize in range(0, s.len()):
+        let b: u8 = s[i]
+        if b == QUOTE:
+            out.push_str("\\\"")
+        elif b == BACKSLASH:
+            out.push_str("\\\\")
+        elif b == 10:
+            out.push_str("\\n")
+        elif b == 13:
+            out.push_str("\\r")
+        elif b == 9:
+            out.push_str("\\t")
+        elif b == 8:
+            out.push_str("\\b")
+        elif b == 12:
+            out.push_str("\\f")
+        elif b < 32:
+            out.push_str("\\u00")
+            out.push(hex_digit(b >> 4))
+            out.push(hex_digit(b & 15))
+        else:
+            out.push(b)
+    out.push(QUOTE)
+
+# =============================================================================
+# Decoder
+# =============================================================================
+
+# Decode one JSON value from `text`; anything but whitespace after it is an
+# error, as is text that is not UTF-8.
+@public
+def decode(text: Slice[u8]) -> Result[Json, JsonError]:
+    if not is_valid_utf8(text):
+        return Err(json_error(0, "input is not valid UTF-8"))
+    let mut pos: usize = 0
+    let v: Json = parse_value(text, &mut pos, 0)?
+    skip_space(text, &mut pos)
+    if pos != text.len():
+        return Err(json_error(pos, "trailing characters after the value"))
+    return Ok(v)
+
+# (Named `JsonDecoded`, not `Decoded`, to avoid a std type name, #3557.)
+# The outcome of `decode_value`: the value (`Json.Null` on failure) and the
+# error, if any.
+# Workaround (#3542): a package that depends on this
+# one cannot match the `Result[Json, JsonError]` of `decode` (internal
+# compiler error), so dependents use this struct instead.
+@public
+struct JsonDecoded:
+    @public
+    value: Json
+    @public
+    error: Option[JsonError]
+
+# `decode` for dependent packages: see `JsonDecoded`.
+@public
+def decode_value(text: Slice[u8]) -> JsonDecoded:
+    match decode(text):
+        Ok(v) => return JsonDecoded { value: v, error: Option.None_ }
+        Err(e) => return JsonDecoded { value: Json.Null, error: Some(e) }
+
+def is_ws(b: u8) -> bool:
+    return b == 32 or b == 9 or b == 10 or b == 13
+
+def is_dec_digit(b: u8) -> bool:
+    return b >= DIGIT_0 and b <= DIGIT_9
+
+def skip_space(s: Slice[u8], pos: &mut usize) -> unit:
+    while *pos < s.len() and is_ws(s[*pos]):
+        *pos = *pos + 1
+
+def parse_value(s: Slice[u8], pos: &mut usize, depth: usize) -> Result[Json, JsonError]:
+    skip_space(s, pos)
+    if *pos >= s.len():
+        return Err(json_error(*pos, "unexpected end of input"))
+    let b: u8 = s[*pos]
+    if b == QUOTE:
+        match parse_json_string(s, pos):
+            Ok(text) => return Ok(Json.Str(text))
+            Err(e) => return Err(e)
+    if b == LBRACKET:
+        return parse_array(s, pos, depth + 1)
+    if b == LBRACE:
+        return parse_object(s, pos, depth + 1)
+    if b == MINUS or is_dec_digit(b):
+        return parse_number(s, pos)
+    if expect_word(s, pos, "true"):
+        return Ok(Json.Bool(True))
+    if expect_word(s, pos, "false"):
+        return Ok(Json.Bool(False))
+    if expect_word(s, pos, "null"):
+        return Ok(Json.Null)
+    return Err(json_error(*pos, "unexpected character"))
+
+# Consume `word` at `pos` when it is there.
+def expect_word(s: Slice[u8], pos: &mut usize, word: String) -> bool:
+    let w: Slice[u8] = word.as_bytes()
+    if *pos + w.len() > s.len():
+        return False
+    if not same_bytes(s.slice(*pos, *pos + w.len()), w):
+        return False
+    *pos = *pos + w.len()
+    return True
+
+def parse_number(s: Slice[u8], pos: &mut usize) -> Result[Json, JsonError]:
+    let start: usize = *pos
+    if s[*pos] == MINUS:
+        *pos = *pos + 1
+    # Integer part: `0` or a non-zero digit followed by digits.
+    if *pos >= s.len() or not is_dec_digit(s[*pos]):
+        return Err(json_error(*pos, "expected a digit"))
+    if s[*pos] == DIGIT_0:
+        *pos = *pos + 1
+    else:
+        while *pos < s.len() and is_dec_digit(s[*pos]):
+            *pos = *pos + 1
+    # Fraction.
+    if *pos < s.len() and s[*pos] == DOT:
+        *pos = *pos + 1
+        if *pos >= s.len() or not is_dec_digit(s[*pos]):
+            return Err(json_error(*pos, "expected a digit after '.'"))
+        while *pos < s.len() and is_dec_digit(s[*pos]):
+            *pos = *pos + 1
+    # Exponent.
+    if *pos < s.len() and (s[*pos] == 101 or s[*pos] == 69):
+        *pos = *pos + 1
+        if *pos < s.len() and (s[*pos] == PLUS or s[*pos] == MINUS):
+            *pos = *pos + 1
+        if *pos >= s.len() or not is_dec_digit(s[*pos]):
+            return Err(json_error(*pos, "expected a digit in the exponent"))
+        while *pos < s.len() and is_dec_digit(s[*pos]):
+            *pos = *pos + 1
+    match parse_f64(s.slice(start, *pos)):
+        Ok(n) => return Ok(Json.Num(n))
+        Err(e) => return Err(json_error(start, "number out of range"))
+
+def hex_value(b: u8) -> i64:
+    if is_dec_digit(b):
+        return (b - DIGIT_0) as i64
+    if b >= 97 and b <= 102:
+        return (b - 87) as i64
+    if b >= 65 and b <= 70:
+        return (b - 55) as i64
+    return -1
+
+# Read the four hex digits of a `\uXXXX` escape whose `u` is at `pos - 1`.
+def parse_hex4(s: Slice[u8], pos: &mut usize) -> Result[u32, JsonError]:
+    if *pos + 4 > s.len():
+        return Err(json_error(*pos, "truncated \\u escape"))
+    let mut cp: u32 = 0
+    for i: usize in range(0, 4):
+        let h: i64 = hex_value(s[*pos + i])
+        if h < 0:
+            return Err(json_error(*pos + i, "invalid hex digit in \\u escape"))
+        cp = cp * 16 + (h as u32)
+    *pos = *pos + 4
+    return Ok(cp)
+
+# Append the UTF-8 encoding of code point `cp` (a scalar value).
+def push_utf8(out: &mut String, cp: u32) -> unit:
+    if cp < 128:
+        out.push(cp as u8)
+    elif cp < 2048:
+        out.push((192 | (cp >> 6)) as u8)
+        out.push((128 | (cp & 63)) as u8)
+    elif cp < 65536:
+        out.push((224 | (cp >> 12)) as u8)
+        out.push((128 | ((cp >> 6) & 63)) as u8)
+        out.push((128 | (cp & 63)) as u8)
+    else:
+        out.push((240 | (cp >> 18)) as u8)
+        out.push((128 | ((cp >> 12) & 63)) as u8)
+        out.push((128 | ((cp >> 6) & 63)) as u8)
+        out.push((128 | (cp & 63)) as u8)
+
+# Parse a string whose opening quote is at `pos`. The input was checked to be
+# UTF-8 by `decode`, so unescaped bytes are copied as they are.
+def parse_json_string(s: Slice[u8], pos: &mut usize) -> Result[String, JsonError]:
+    *pos = *pos + 1
+    let mut out: String = String.new()
+    while True:
+        if *pos >= s.len():
+            return Err(json_error(*pos, "unterminated string"))
+        let b: u8 = s[*pos]
+        *pos = *pos + 1
+        if b == QUOTE:
+            return Ok(out)
+        if b < 32:
+            return Err(json_error(*pos - 1, "control character in string"))
+        if b != BACKSLASH:
+            out.push(b)
+            continue
+        if *pos >= s.len():
+            return Err(json_error(*pos, "unterminated escape"))
+        let e: u8 = s[*pos]
+        *pos = *pos + 1
+        if e == QUOTE or e == BACKSLASH or e == SLASH:
+            out.push(e)
+        elif e == 98:
+            out.push(8 as u8)
+        elif e == 102:
+            out.push(12 as u8)
+        elif e == 110:
+            out.push(10 as u8)
+        elif e == 114:
+            out.push(13 as u8)
+        elif e == 116:
+            out.push(9 as u8)
+        elif e == 117:
+            # Workaround (#3547): `?` is rejected inside an `if`
+            # or `while` body, so each fallible call is matched by hand.
+            let mut cp: u32 = 0
+            match parse_hex4(s, pos):
+                Ok(v) => cp = v
+                Err(e) => return Err(e)
+            if cp >= 56320 and cp <= 57343:
+                return Err(json_error(*pos - 6, "unpaired low surrogate"))
+            if cp >= 55296 and cp <= 56319:
+                # A high surrogate must be followed by a `\u` low surrogate.
+                if *pos + 2 > s.len() or s[*pos] != BACKSLASH or s[*pos + 1] != 117:
+                    return Err(json_error(*pos, "unpaired high surrogate"))
+                *pos = *pos + 2
+                let mut low: u32 = 0
+                match parse_hex4(s, pos):
+                    Ok(v) => low = v
+                    Err(e) => return Err(e)
+                if low < 56320 or low > 57343:
+                    return Err(json_error(*pos - 6, "invalid low surrogate"))
+                cp = 65536 + ((cp - 55296) << 10) + (low - 56320)
+            push_utf8(&mut out, cp)
+        else:
+            return Err(json_error(*pos - 1, "invalid escape"))
+    return Err(json_error(*pos, "unterminated string"))
+
+def parse_array(s: Slice[u8], pos: &mut usize, depth: usize) -> Result[Json, JsonError]:
+    if depth > MAX_DEPTH:
+        return Err(json_error(*pos, "nesting too deep"))
+    *pos = *pos + 1
+    let mut items: Vec[Json] = Vec.new()
+    skip_space(s, pos)
+    if *pos < s.len() and s[*pos] == RBRACKET:
+        *pos = *pos + 1
+        return Ok(Json.Arr(items))
+    while True:
+        # Workaround (#3547): no `?` inside a `while` body.
+        match parse_value(s, pos, depth):
+            Ok(item) => items.push(item)
+            Err(e) => return Err(e)
+        skip_space(s, pos)
+        if *pos >= s.len():
+            return Err(json_error(*pos, "unterminated array"))
+        let b: u8 = s[*pos]
+        *pos = *pos + 1
+        if b == RBRACKET:
+            return Ok(Json.Arr(items))
+        if b != COMMA:
+            return Err(json_error(*pos - 1, "expected ',' or ']'"))
+    return Err(json_error(*pos, "unterminated array"))
+
+def parse_object(s: Slice[u8], pos: &mut usize, depth: usize) -> Result[Json, JsonError]:
+    if depth > MAX_DEPTH:
+        return Err(json_error(*pos, "nesting too deep"))
+    *pos = *pos + 1
+    let mut members: Vec[Member] = Vec.new()
+    skip_space(s, pos)
+    if *pos < s.len() and s[*pos] == RBRACE:
+        *pos = *pos + 1
+        return Ok(Json.Obj(members))
+    while True:
+        skip_space(s, pos)
+        if *pos >= s.len() or s[*pos] != QUOTE:
+            return Err(json_error(*pos, "expected a string key"))
+        # Workaround (#3547): no `?` inside a `while` body.
+        let mut key: String = String.new()
+        match parse_json_string(s, pos):
+            Ok(k) => key = k
+            Err(e) => return Err(e)
+        skip_space(s, pos)
+        if *pos >= s.len() or s[*pos] != COLON:
+            return Err(json_error(*pos, "expected ':'"))
+        *pos = *pos + 1
+        match parse_value(s, pos, depth):
+            Ok(value) => members.push(Member { key: key, value: value })
+            Err(e) => return Err(e)
+        skip_space(s, pos)
+        if *pos >= s.len():
+            return Err(json_error(*pos, "unterminated object"))
+        let b: u8 = s[*pos]
+        *pos = *pos + 1
+        if b == RBRACE:
+            return Ok(Json.Obj(members))
+        if b != COMMA:
+            return Err(json_error(*pos - 1, "expected ',' or '}'"))
+    return Err(json_error(*pos, "unterminated object"))

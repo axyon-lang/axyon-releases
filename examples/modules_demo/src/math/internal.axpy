@@ -1,0 +1,23 @@
+# Internal Math Helpers
+#
+# This module is private (declared with `from . import` not `@public from . import`).
+# It can only be accessed from within the math package.
+
+# Internal constant for numerical stability
+def epsilon() -> f32:
+    return 0.000001
+
+# Internal helper for clamping values
+def clamp(x: f32, min_val: f32, max_val: f32) -> f32:
+    if x < min_val:
+        return min_val
+    if x > max_val:
+        return max_val
+    return x
+
+# Internal helper for approximate equality
+def approx_equal(a: f32, b: f32) -> bool:
+    let diff: f32 = a - b
+    if diff < 0.0:
+        let diff: f32 = 0.0 - diff
+    return diff < epsilon()

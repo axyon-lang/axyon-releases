@@ -1,0 +1,46 @@
+# Experimental checked local type inference (issue #805).
+#
+# Signatures, struct fields and constants stay annotated; locals may omit the
+# annotation when the initializer's type is fully determined. Built with
+# `[build] local_inference = true` (this package) or `--local-inference`.
+
+const LIMIT: i64 = 10
+
+struct Point:
+    x: f64
+    y: f64
+
+impl Point:
+    def new(x: f64, y: f64) -> Self:
+        return Point { x: x, y: y }
+
+    def scaled(self, k: f64) -> Point:
+        return Point { x: self.x * k, y: self.y * k }
+
+    def norm2(self) -> f64:
+        return self.x * self.x + self.y * self.y
+
+def identity[T](x: T) -> T:
+    return x
+
+def squares(n: i64) -> Vec[i64]:
+    let mut v: Vec[i64] = Vec.new()    # an empty Vec.new() still needs its type
+    for i in range(n):                  # i: i64, from the bound `n`
+        v.push(i * i)
+    return v
+
+def main() -> i32:
+    let count = 3_i32                   # i32 (literal suffix)
+    let mut total = 0                   # i64 (integer literal default)
+    for i in range(LIMIT):              # i64
+        total = total + i
+    let p = Point.new(3.0, 4.0)         # Point
+    let m = p.scaled(2.0).norm2()       # f64 (method chain)
+    let k = identity[i64](total)        # i64 (explicit type argument)
+    let sq = squares(4)                 # Vec[i64]
+    let n = sq.len()                    # usize
+    let ratio = 0.5_f64                 # f64; a bare `0.5` would be rejected
+    println!("count={count} total={total} m={m} k={k} n={n} ratio={ratio}")
+    if total == 45 and k == 45 and n == 4 and count == 3_i32:
+        return 0
+    return 1

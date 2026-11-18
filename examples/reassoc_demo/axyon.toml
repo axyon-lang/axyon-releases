@@ -1,0 +1,12 @@
+[package]
+name = "reassoc_demo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+opt_level = 3
+# Opt in to float reassociation (and FMA contraction) so the sum loop below can
+# vectorize. Compare with: axyon run --fast-math off
+fast_math = "reassoc"

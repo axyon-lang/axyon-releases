@@ -1,0 +1,26 @@
+# Kinds Module
+#
+# Demonstrates `@public` on every item kind: enum, generic enum, trait,
+# const and type alias. Visibility is not enforced yet (#769), but the
+# decorator parses and the items are importable from other modules.
+
+@public
+enum Axis:
+    X
+    Y
+    Z
+
+@public
+enum Maybe[T]:
+    Nothing
+    Just(T)
+
+@public
+trait Measure:
+    def measure(self) -> i64
+
+@public
+const UNIT_LENGTH: i64 = 1
+
+@public
+type Length = i64

@@ -1,0 +1,55 @@
+# Stable in-place sorting of a `Vec` (#2914): `sort`, `sort_by`, `sort_by_key`.
+#
+# Any `std.core` import loads `core.cmp`, where the sort lives.
+
+from std.core import Ordering
+import std.diagnostics as D
+
+struct Job:
+    priority: i64
+    id: i64
+
+# Higher priority first.
+def by_priority_desc(a: ref[Job], b: ref[Job]) -> Ordering:
+    return b.priority.cmp(ref(a.priority))
+
+def job_id(j: ref[Job]) -> i64:
+    return j.id
+
+def print_jobs(label: String, jobs: ref[Vec[Job]]) -> unit:
+    D.print(label)
+    for i: usize in range(jobs.len()):
+        D.print(" ")
+        D.print_i64(jobs[i].priority)
+        D.print(":")
+        D.print_i64(jobs[i].id)
+    D.println("")
+
+def main() -> i32:
+    let mut v: Vec[i64] = Vec.new()
+    v.push(5)
+    v.push(2)
+    v.push(9)
+    v.push(1)
+    v.sort()
+    let first: i64 = v[0]
+    let last: i64 = v[3]
+    println!("ascending: {first} .. {last}")
+    v.sort_by(lambda a, b: b.cmp(a))
+    let top: i64 = v[0]
+    println!("descending starts at {top}")
+
+    let mut jobs: Vec[Job] = Vec.new()
+    jobs.push(Job { priority: 1, id: 10 })
+    jobs.push(Job { priority: 3, id: 11 })
+    jobs.push(Job { priority: 1, id: 12 })
+    jobs.push(Job { priority: 3, id: 13 })
+    # Stable: equal priorities keep their insertion order (11 before 13).
+    jobs.sort_by(by_priority_desc)
+    print_jobs("by priority:", ref(jobs))
+    jobs.sort_by_key(job_id)
+    print_jobs("by id:", ref(jobs))
+    # An inline key lambda: the key type (`i64`) is read off its body.
+    jobs.sort_by_key(lambda j: j.priority)
+    print_jobs("by priority, ascending:", ref(jobs))
+    return 0

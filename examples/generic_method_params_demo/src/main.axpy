@@ -1,0 +1,47 @@
+# Method-level type parameters for AXYON (issue #845).
+#
+# A method of a generic struct/enum may declare its own type parameters next to
+# the impl's: `def ok_or[E](self, err: E) -> Res[T, E]`. They share one scope
+# with the impl's `T`; each call is monomorphized per (impl args, method args).
+# `E` is inferred from the argument, or given explicitly: `m.ok_or[bool](False)`.
+#
+# Not supported yet (spanned diagnostics): method type parameters on a
+# non-generic impl, trait bounds on them, and calling such a method from inside
+# a generic function or impl method when the receiver or a method type argument
+# still depends on that function's type parameters (fully concrete calls are
+# fine). See TODO_AND_KNOWN_LIMITATIONS.md.
+
+enum Res[T, E]:
+    Good(T)
+    Bad(E)
+
+enum Maybe[T]:
+    Just(T)
+    Nothing
+
+impl Maybe[T]:
+    def ok_or[E](self, err: E) -> Res[T, E]:
+        match self:
+            case Maybe.Just(v):
+                return Res.Good(v)
+            case Maybe.Nothing:
+                return Res.Bad(err)
+
+struct Holder[T]:
+    v: T
+
+impl Holder[T]:
+    def pick[U](self, u: U) -> U:
+        return u
+
+@host
+def main() -> i32:
+    let a: Maybe[i32] = Maybe.Just(3)
+    let _r: Res[i32, i64] = a.ok_or(7_i64)
+    let b: Maybe[i32] = Maybe.Nothing
+    let _s: Res[i32, bool] = b.ok_or[bool](False)
+
+    let h: Holder[i32] = Holder { v: 1 }
+    let x: i64 = h.pick(5_i64)
+    println!("pick = {x}")
+    return 0

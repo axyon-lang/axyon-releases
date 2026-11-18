@@ -1,0 +1,64 @@
+# Fused attention (issue #1772): `T.attention(q, k, v, mask, scale)` computes
+# softmax(q kT * scale + mask) v with an online softmax (running max and sum
+# per query row), so the (Sq, Skv) score matrix is never materialized.
+# `mask` is 0 (none) or 1 (causal). The unfused reference below builds the
+# scores of one row at a time and normalizes them explicitly; the two agree
+# to rounding, not bit-for-bit (different summation order).
+
+import std.tensor as T
+from std.math import exp
+
+def fill(n: i64, d: i64, seed: i64) -> Tensor[f64, (8, 4)]:
+    let mut t: Tensor[f64, (8, 4)] = T.zeros([8, 4])
+    for i: i64 in range(0, n):
+        for j: i64 in range(0, d):
+            t[i, j] = (((i * 7 + j * 13 + seed) % 17) as f64) * 0.11 - 0.8
+    return t
+
+def reference(q: Tensor[f64, (8, 4)], k: Tensor[f64, (8, 4)], v: Tensor[f64, (8, 4)], scale: f64, causal: bool) -> Tensor[f64, (8, 4)]:
+    let mut out: Tensor[f64, (8, 4)] = T.zeros([8, 4])
+    for i: i64 in range(0, 8):
+        let mut scores: Tensor[f64, (8,)] = T.zeros([8])
+        let mut top: f64 = -1.0e300
+        for j: i64 in range(0, 8):
+            let mut dot: f64 = 0.0
+            for d: i64 in range(0, 4):
+                dot = dot + q[i, d] * k[j, d]
+            scores[j] = dot * scale
+            if (not causal or j <= i) and scores[j] > top:
+                top = scores[j]
+        let mut denom: f64 = 0.0
+        for j: i64 in range(0, 8):
+            if not causal or j <= i:
+                denom = denom + exp(scores[j] - top)
+        for d: i64 in range(0, 4):
+            let mut acc: f64 = 0.0
+            for j: i64 in range(0, 8):
+                if not causal or j <= i:
+                    acc = acc + exp(scores[j] - top) * v[j, d]
+            out[i, d] = acc / denom
+    return out
+
+def max_diff(a: Tensor[f64, (8, 4)], b: Tensor[f64, (8, 4)]) -> f64:
+    let mut worst: f64 = 0.0
+    for i: i64 in range(0, 8):
+        for d: i64 in range(0, 4):
+            let diff: f64 = a[i, d] - b[i, d]
+            let mag: f64 = diff if diff >= 0.0 else -diff
+            # NaN is unordered: propagate it so the final bound check fails.
+            if not (mag <= worst):
+                worst = mag
+    return worst
+
+def main() -> i32:
+    let q: Tensor[f64, (8, 4)] = fill(8, 4, 1)
+    let k: Tensor[f64, (8, 4)] = fill(8, 4, 5)
+    let v: Tensor[f64, (8, 4)] = fill(8, 4, 9)
+    let full: Tensor[f64, (8, 4)] = T.attention(q, k, v, 0, 0.5)
+    let causal: Tensor[f64, (8, 4)] = T.attention(q, k, v, 1, 0.5)
+    let e_full: f64 = max_diff(full, reference(fill(8, 4, 1), fill(8, 4, 5), fill(8, 4, 9), 0.5, false))
+    let e_causal: f64 = max_diff(causal, reference(fill(8, 4, 1), fill(8, 4, 5), fill(8, 4, 9), 0.5, true))
+    println!("max |fused - unfused| = {e_full} (full), {e_causal} (causal)")
+    assert!(e_full <= 1.0e-12, "fused attention must match the unfused reference")
+    assert!(e_causal <= 1.0e-12, "causal fused attention must match the reference")
+    return 0

@@ -1,0 +1,60 @@
+# Ownership Demo Example for AXYON
+# Demonstrates Rust-like ownership, borrowing, and move semantics.
+
+struct Point:
+    @public x: f32
+    @public y: f32
+
+def consume_point(p: Point) -> f32:
+    # Takes ownership of a Point and returns its x + y.
+    return p.x + p.y
+
+def take_and_return(p: Point) -> Point:
+    # Takes ownership and returns the same point.
+    return p
+
+def square_i32(x: i32) -> i32:
+    # Primitive types are copied, not moved.
+    return x * x
+
+def main() -> i32:
+    println!("Ownership Demo - Memory Safety Without GC")
+    println!("==========================================")
+    println!("")
+
+    println!("1. Copy Types (Primitives)")
+    let x: i32 = 42
+    let squared: i32 = square_i32(x)
+    let doubled: i32 = x * 2
+    println!("   Original x: {x}")
+    println!("   Squared: {squared}")
+    println!("   Doubled: {doubled}")
+    println!("   (x remains usable because i32 is Copy)")
+    println!("")
+
+    println!("2. Move Semantics (Ownership Transfer)")
+    let p1: Point = Point { x: 3.0, y: 4.0 }
+    println!("   Created Point p1")
+    let sum: f32 = consume_point(p1)
+    println!("   Consumed p1, got sum: {sum}")
+    println!("   (p1 is no longer usable - ownership moved)")
+    println!("")
+
+    println!("3. Take and Return Pattern")
+    let p2: Point = Point { x: 1.0, y: 2.0 }
+    println!("   Created Point p2")
+    let p2_back: Point = take_and_return(p2)
+    let x_val: f32 = p2_back.x
+    println!("   Got p2 back, x = {x_val}")
+    println!("   (Ownership was transferred and returned)")
+    println!("")
+
+    println!("4. Borrow Rules (enforced at compile time)")
+    println!("   - Each value has exactly one owner")
+    println!("   - Values can be borrowed or moved")
+    println!("   - Cannot use a value after it has been moved")
+    println!("   - Primitives (i32, f32, bool) are Copy types")
+    println!("")
+
+    println!("Demo complete!")
+    return 0

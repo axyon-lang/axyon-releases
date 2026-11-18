@@ -1,0 +1,33 @@
+# Structured logging spans: span! guards with a thread-local span stack (#1687).
+#
+# Events written while a span is open carry it (`span=outer>inner` plus the span
+# fields; JSON: a "spans" array) and leaving the span writes one `close` record
+# with `elapsed_ms`:
+#
+#   AXYON_LOG=debug axyon run
+#   AXYON_LOG_FORMAT=json axyon run
+#
+# `with` closes the span on every way out of the block; the guard form closes it
+# when the named local drops. Spawned threads start with an empty span stack.
+
+import std.log as log
+
+def lookup(id: i32) -> i32:
+    with span!("lookup", id=id, table="users"):
+        info!("cache miss")
+        debug!("query plan chosen", cost=1.5)
+        if id < 0:
+            return 0  # the span still closes
+        return id * 2
+
+def handle(id: i32) -> i32:
+    # Guard form: bind to a NAMED local; `let _ = span!(..)` would warn (AX2008).
+    let _span: log.Span = span!("handle", id=id)
+    info!("parsed")
+    return lookup(id)
+
+def main() -> i32:
+    let a: i32 = handle(21)
+    let b: i32 = handle(-1)
+    println!("a={a} b={b}")
+    return 0

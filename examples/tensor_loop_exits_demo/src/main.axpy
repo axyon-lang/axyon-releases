@@ -1,0 +1,84 @@
+# `break`, `continue` and early `return` inside loops of a program that uses
+# tensors (issue #1902). The tensor pipeline lifts these loops to structured
+# control flow before buffer deallocation, so ordinary helpers (here a byte
+# search and a token counter) and tensor code that only reads a tensor in
+# such a loop can sit in the same module as tensor arithmetic.
+#
+# Since issue #1905 a loop may also carry a tensor across `break`/`continue`
+# or return one from inside (training-style early stopping, below), also with
+# the exit inside a statement `match` arm (#1929). An exit inside an `unsafe`
+# block or a `prange` body of such a loop is still error AX0566.
+
+import std.tensor as T
+
+# Early `return` from a `for` loop in a function that touches no tensor.
+def find_byte(s: &string, c: u8) -> i64:
+    let b = s.as_bytes()
+    for i: i64 in range(0, b.len() as i64):
+        if b[i] == c:
+            return i
+    return -1
+
+# `continue` and `break` in a `while` loop.
+def count_words(s: &string, limit: i64) -> i64:
+    let b = s.as_bytes()
+    let n: i64 = b.len() as i64
+    let mut i: i64 = 0
+    let mut words: i64 = 0
+    while i < n:
+        i = i + 1
+        if b[i - 1] == 32_u8:
+            continue
+        if i == n or b[i] == 32_u8:
+            words = words + 1
+            if words == limit:
+                break
+    return words
+
+# A loop that only reads a tensor may exit early.
+def first_above(t: Tensor[f32, (6,)], threshold: f32) -> i64:
+    for i: i64 in range(0, 6):
+        if t[i] > threshold:
+            return i
+    return -1
+
+# Early stopping: the weights are carried across iterations and returned as
+# soon as the loss is small enough; `break` gives up after `max_steps`.
+def train(max_steps: i64, tol: f32) -> Tensor[f32, (6,)]:
+    let mut w: Tensor[f32, (6,)] = T.full([6], 16.0)
+    let mut step: i64 = 0
+    while True:
+        step = step + 1
+        w = T.mul(w, T.full([6], 0.5))
+        if w[0] < tol:
+            return w
+        if step >= max_steps:
+            break
+    return T.full([6], -1.0)
+
+def main() -> i32:
+    let mut flat: Tensor[f32, (6,)] = T.zeros([6])
+    for i: i64 in range(0, 6):
+        flat[i] = (i * i) as f32
+    let scaled: Tensor[f32, (6,)] = T.add(flat, flat)
+
+    let at: i64 = first_above(scaled, 10.0)
+    let space: i64 = find_byte(&"tensor loop exits", 32)
+    let words: i64 = count_words(&"one two  three four", 3)
+    println!("first above 10: {at}, first space: {space}, words: {words}")
+
+    let trained: Tensor[f32, (6,)] = train(100, 0.3)
+    let gave_up: Tensor[f32, (6,)] = train(2, 0.3)
+    let w0: f32 = trained[0]
+    let g0: f32 = gave_up[0]
+    println!("trained: {w0}, gave up: {g0}")
+
+    if at != 3:
+        return 1
+    if space != 6:
+        return 2
+    if words != 3:
+        return 3
+    if w0 != 0.25 or g0 != -1.0:
+        return 4
+    return 0

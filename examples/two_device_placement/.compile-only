@@ -1,0 +1,2 @@
+Needs two visible CUDA devices to run (#2678); CI stops at MLIR emission.
+The run is covered by the device_placement regression test when two devices exist.

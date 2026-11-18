@@ -1,0 +1,38 @@
+# Issue #1362: a `let` initializer may continue over several lines while a
+# `(`/`[`/`{` opened on the `let` line is still open.
+struct Point:
+    x: i64
+    y: i64
+
+def add3(a: i64, b: i64, c: i64) -> i64:
+    return a + b + c
+
+def main() -> i32:
+    # Call arguments, one per line, with a trailing comment.
+    let sum: i64 = add3(
+        1,  # first
+        2,
+        3,
+    )
+    # Struct literal.
+    let p: Point = Point {
+        x: 4,
+        y: 5,
+    }
+    # Parenthesised arithmetic (operator continuation needs the parentheses).
+    let total: i64 = (sum +
+                      p.x +
+                      p.y)
+    # A line-leading `*` after an operand is multiplication, not a dereference.
+    let prod: i64 = (2
+                     * 3)
+    assert!(prod == 6, "continuation-line * multiplies")
+    # Bracketed list.
+    let xs: Vec[i64] = [
+        10,
+        20,
+    ]
+    println!("total = {total}")
+    assert!(total == 15, "total should be 15")
+    assert!(xs.len() == 2, "two elements")
+    return 0

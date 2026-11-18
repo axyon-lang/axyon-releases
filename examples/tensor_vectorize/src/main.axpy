@@ -1,0 +1,73 @@
+# Tile + vectorize of tensor elementwise chains and reductions (issue #1702).
+#
+# At opt_level >= 2 the compiler tiles rank-1 elementwise ops and vectorizes
+# the tiles with masked vector ops, so every extent -- including 0, 1 and the
+# sizes around a tile multiple -- must give the same answer as a scalar loop.
+# Integer reductions are vectorized (wrapping integer addition is associative);
+# float reductions keep their strict left-to-right order unless
+# `fast_math = "reassoc"` is set, so the float sum below is bit-identical to
+# the scalar accumulation.
+
+import std.tensor as T
+
+# a * 2 + 1 over 0..n, as two chained elementwise ops (fused into one loop).
+def chain_f32(n: i64) -> Tensor[f32, (?,)]:
+    let a: Tensor[f32, (?,)] = T.arange[f32](n)
+    let b: Tensor[f32, (?,)] = T.full[f32]([n], 2.0_f32)
+    let c: Tensor[f32, (?,)] = T.full[f32]([n], 1.0_f32)
+    let m: Tensor[f32, (?,)] = T.mul(a, b)
+    return T.add(m, c)
+
+def sum_i32(n: i64) -> i32:
+    let a: Tensor[i32, (?,)] = T.arange[i32](n)
+    let s: Tensor[i32, ()] = T.sum(a)
+    let u: Tensor[i32, (1,)] = T.unsqueeze(s, 0)
+    return u[0]
+
+# 0.1 * i is not exactly representable, so f32 addition order matters.
+def inexact_f32(n: i64) -> Tensor[f32, (?,)]:
+    let a: Tensor[f32, (?,)] = T.arange[f32](n)
+    let k: Tensor[f32, (?,)] = T.full[f32]([n], 0.1_f32)
+    return T.mul(a, k)
+
+def sum_f32(n: i64) -> f32:
+    let s: Tensor[f32, ()] = T.sum(inexact_f32(n))
+    let u: Tensor[f32, (1,)] = T.unsqueeze(s, 0)
+    return u[0]
+
+def scalar_sum_f32(n: i64) -> f32:
+    let v: Tensor[f32, (?,)] = inexact_f32(n)
+    let mut acc: f32 = 0.0_f32
+    for i: i64 in range(0, n):
+        acc = acc + v[i]
+    return acc
+
+# Integer division must stay scalar: the zero-padded lanes of a partial tile
+# would otherwise divide by zero (SIGFPE) although every real divisor is
+# nonzero. Extents 0..=70 include 1, TILE-1 and TILE+1 for every tile size.
+def div_i32(n: i64) -> Tensor[i32, (?,)]:
+    let a: Tensor[i32, (?,)] = T.arange[i32](n)
+    let b: Tensor[i32, (?,)] = T.full[i32]([n], 2_i32)
+    return T.div(T.add(a, b), b)
+
+def div_u32(n: i64) -> Tensor[u32, (?,)]:
+    let a: Tensor[u32, (?,)] = T.arange[u32](n)
+    let b: Tensor[u32, (?,)] = T.full[u32]([n], 2_u32)
+    return T.div(T.add(a, b), b)
+
+def main() -> i32:
+    # Sizes 0..=70 cover 0, 1, N-1, N, N+1 for every tile size (8/16/32).
+    for n: i64 in range(0, 71):
+        let v: Tensor[f32, (?,)] = chain_f32(n)
+        for i: i64 in range(0, n):
+            assert!(v[i] == (i * 2 + 1) as f32, "elementwise chain")
+        assert!(sum_i32(n) == (n * (n - 1) / 2) as i32, "integer reduction")
+        assert!(sum_f32(n) == scalar_sum_f32(n), "strict float reduction is bit-identical")
+    for n: i64 in range(0, 71):
+        let q: Tensor[i32, (?,)] = div_i32(n)
+        let uq: Tensor[u32, (?,)] = div_u32(n)
+        for i: i64 in range(0, n):
+            assert!(q[i] == ((i + 2) / 2) as i32, "signed integer division")
+            assert!(uq[i] == ((i + 2) / 2) as u32, "unsigned integer division")
+    println!("tensor_vectorize ok")
+    return 0

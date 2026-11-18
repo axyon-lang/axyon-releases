@@ -1,0 +1,38 @@
+# A recursive struct that owns `Vec[Self]` is dropped recursively (#1663).
+#
+# Every `Node` runs its `Drop` impl exactly once when the tree goes out of
+# scope, children included (the root is dropped first, then its children).
+# A type that owns itself through `Box` (a binary tree) gets the same
+# treatment: every box is freed exactly once (#1726).
+
+struct Node:
+    id: i64
+    kids: Vec[Node]
+
+impl Drop for Node:
+    def drop(self) -> unit:
+        println!("drop {self.id}")
+
+def make(id: i64, depth: i64) -> Node:
+    let mut kids: Vec[Node] = Vec.new()
+    if depth > 0:
+        kids.push(make(id * 2, depth - 1))
+        kids.push(make(id * 2 + 1, depth - 1))
+    return Node { id: id, kids: kids }
+
+enum Tree:
+    Leaf
+    Node(l: Box[Tree], r: Box[Tree])
+
+def build(depth: i64) -> Tree:
+    if depth == 0:
+        return Tree.Leaf
+    return Tree.Node(Box.new(build(depth - 1)), Box.new(build(depth - 1)))
+
+def main() -> i32:
+    let t: Node = make(1, 2)
+    let n: i64 = t.kids.len() as i64
+    println!("built {n}")
+    let _tree: Tree = build(3)
+    println!("built box tree")
+    return 0

@@ -1,0 +1,62 @@
+# Disjoint Tensor Borrows Demo
+# Demonstrates borrowing non-overlapping slices of a tensor simultaneously
+#
+# AXYON allows multiple mutable borrows of the same tensor IF the
+# borrowed slices are disjoint (non-overlapping ranges).
+
+# Process two halves of a tensor in parallel
+def process_halves(t: &mut Tensor[f32, (100,)]) -> i32:
+    """Borrow disjoint halves of a tensor simultaneously."""
+    # These two slices don't overlap, so both can be mutably borrowed
+    # let left: &mut Tensor[f32, (50,)] = &mut t[0:50]
+    # let right: &mut Tensor[f32, (50,)] = &mut t[50:100]
+    # process_slice(left)
+    # process_slice(right)
+    return 0
+
+# Split tensor into three disjoint parts
+def triple_split(t: &mut Tensor[f32, (300,)]) -> i32:
+    """Borrow three disjoint parts of a tensor."""
+    # Three non-overlapping slices
+    # let a = &mut t[0:100]
+    # let b = &mut t[100:200]
+    # let c = &mut t[200:300]
+    return 0
+
+# Interleaved slices with step
+def interleaved_access(t: &mut Tensor[f32, (100,)]) -> i32:
+    """Borrow interleaved elements (even/odd indices)."""
+    # Even and odd indices are disjoint
+    # let evens = &mut t[0:100:2]   # indices 0, 2, 4, ...
+    # let odds = &mut t[1:100:2]    # indices 1, 3, 5, ...
+    return 0
+
+# Helper function that processes a slice
+def process_slice(s: &mut Tensor[f32, (N,)]) -> i32:
+    """Process a mutable tensor slice."""
+    return 0
+
+# This would be an ERROR - overlapping slices
+# def overlapping_error(t: &mut Tensor[f32, (100,)]) -> i32:
+#     let a = &mut t[0:60]   # [0, 60)
+#     let b = &mut t[40:100] # [40, 100) - OVERLAPS with a!
+#     # ERROR: cannot borrow overlapping regions mutably
+#     return 0
+
+def main() -> i32:
+    """Entry point demonstrating disjoint borrow syntax."""
+    println!("Disjoint tensor borrows demo")
+    println!("")
+    println!("AXYON allows multiple mutable borrows of a tensor")
+    println!("when the slices are DISJOINT (non-overlapping).")
+    println!("")
+    println!("Example - allowed:")
+    println!("  let left = &mut t[0:50]")
+    println!("  let right = &mut t[50:100]")
+    println!("")
+    println!("Example - ERROR (overlapping):")
+    println!("  let a = &mut t[0:60]")
+    println!("  let b = &mut t[40:100]  # Overlaps!")
+    println!("")
+    println!("The borrow checker uses SliceRange to detect overlaps.")
+    return 0

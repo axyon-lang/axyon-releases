@@ -1,0 +1,13 @@
+[package]
+name = "local_inference_demo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+# Experimental (issue #805): an unannotated `let` must have a type its
+# initializer fully determines (AX0818 otherwise). Same as `--local-inference`.
+local_inference = true

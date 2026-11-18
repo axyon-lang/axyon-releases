@@ -1,0 +1,11 @@
+[package]
+name = "vec_elem_update_mut"
+version = "0.1.0"
+edition = "2024"
+description = "Owning Vec element update through &mut (#1323)"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true

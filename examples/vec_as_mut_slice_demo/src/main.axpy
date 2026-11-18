@@ -1,0 +1,34 @@
+# Vec.as_mut_slice() (#2924): a writable SliceMut[T] view of a whole Vec.
+#
+# The view is an exclusive borrow of the vector, so the Vec cannot be read or
+# mutated while it is live. `slice_mut(start, end)` narrows it to a sub-range
+# that can be handed to any API taking SliceMut[T]; writes land in the Vec.
+
+def scale(s: SliceMut[f64], factor: f64) -> unit:
+    let mut i: u64 = 0
+    while i < s.len():
+        let r: &mut f64 = s.get_mut(i)
+        *r = *r * factor
+        i = i + 1
+
+def main() -> i32:
+    let mut v: Vec[f64] = Vec.new()
+    v.push(1.0)
+    v.push(2.0)
+    v.push(3.0)
+    v.push(4.0)
+    v.push(5.0)
+    let whole: SliceMut[f64] = v.as_mut_slice()
+    assert!(whole.len() == 5, "the view covers every element")
+    let middle: SliceMut[f64] = whole.slice_mut(1, 4)
+    scale(middle, 10.0)
+    # The borrow has ended: the Vec is readable again.
+    assert!(v.get(0) == 1.0, "head untouched")
+    assert!(v.get(1) == 20.0, "v[1] scaled")
+    assert!(v.get(2) == 30.0, "v[2] scaled")
+    assert!(v.get(3) == 40.0, "v[3] scaled")
+    assert!(v.get(4) == 5.0, "tail untouched")
+    let a: f64 = v.get(1)
+    let b: f64 = v.get(3)
+    println!("v[1]={a} v[3]={b}")
+    return 0

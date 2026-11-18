@@ -1,0 +1,48 @@
+# Tensors as struct fields (issue #1532).
+#
+# A struct owns its tensor fields' storage. Construct it with tensor values,
+# use the fields as borrowed `T.*` operands through `&Layer`, and replace a
+# field (directly, by index, or in a `mut self` method): the old storage is
+# freed exactly once. Fields may have runtime (`?`) extents, and `&l.w` is a
+# shared borrow of a field.
+import std.tensor as T
+
+struct Layer:
+    w: Tensor[f32, (2, 2)]
+    b: Tensor[f32, (2,)]
+
+impl Layer:
+    def set_w(mut self, w: Tensor[f32, (2, 2)]) -> None:
+        self.w = w
+
+struct Linear:
+    weight: Tensor[f32, (?, ?)]
+
+def apply(w: &Tensor[f32, (?, ?)], x: &Tensor[f32, (?, ?)]) -> Tensor[f32, (?, ?)]:
+    return T.matmul(*w, *x)
+
+def forward(l: &Layer, x: Tensor[f32, (2, 1)]) -> Tensor[f32, (2,)]:
+    let y: Tensor[f32, (2, 1)] = T.matmul(l.w, x)
+    return T.add(T.flatten(y), l.b)
+
+def main() -> i32:
+    let mut l: Layer = Layer { w: T.full([2, 2], 1.0), b: T.full([2], 0.5) }
+    let out: Tensor[f32, (2,)] = forward(&l, T.full([2, 1], 1.0))
+    println!("{}", out[0])
+    l.set_w(T.full([2, 2], 2.0))
+    l.b[0] = 1.0
+    l.w = T.full([2, 2], 3.0)
+    let out2: Tensor[f32, (2,)] = forward(&l, T.full([2, 1], 1.0))
+    println!("{} {}", out2[0], out2[1])
+    # A runtime-extent field, borrowed with `&lin.weight`.
+    let lin: Linear = Linear { weight: T.full([3, 2], 1.0) }
+    let xs: Tensor[f32, (2, 1)] = T.full([2, 1], 1.0)
+    let ys: Tensor[f32, (?, ?)] = apply(&lin.weight, &xs)
+    let yf: Tensor[f32, (?,)] = T.flatten(ys)
+    if yf[2] != 2.0:
+        return 3
+    if out[0] != 2.5:
+        return 1
+    if out2[0] != 7.0:
+        return 2
+    return 0

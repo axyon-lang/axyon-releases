@@ -1,0 +1,118 @@
+# Integration test: the server over real TCP round trips on loopback, with
+# a small test resource. The listener binds 127.0.0.1:0 (an OS-assigned
+# port, never a fixed one); see http.testing for how one thread plays both
+# client and server.
+#
+# Failures are reported with `assert!`: a test that returns non-zero is
+# reported as passing (#3534).
+
+from std.core import Result, Ok, Err
+from std.io_core import IoError
+from std.net import SocketAddr, TcpListener
+from http.json import Json, decode, encode
+from http.request import Request, Limits, default_limits
+from http.response import Response, text_response, json_response
+from http.router import Router, Param, param
+from http.testing import Reply, round_trip, parse_reply, request_text
+
+struct Counter:
+    @public
+    hits: i64
+
+def count(state: &mut Counter, request: &Request, params: &Vec[Param]) -> Result[Response, String]:
+    state.hits = state.hits + 1
+    let hits: i64 = state.hits
+    return Ok(text_response(200, format!("{hits}")))
+
+# Decode the JSON body and send it back re-encoded.
+def echo(state: &mut Counter, request: &Request, params: &Vec[Param]) -> Result[Response, String]:
+    match decode(request.body.as_slice()):
+        Ok(v) => return Ok(json_response(200, &v))
+        Err(e) => return Ok(text_response(400, e.message))
+
+def item(state: &mut Counter, request: &Request, params: &Vec[Param]) -> Result[Response, String]:
+    match param(params, "id"):
+        Some(id) => return Ok(text_response(200, id))
+        None_ => return Err("unbound :id")
+
+def fail(state: &mut Counter, request: &Request, params: &Vec[Param]) -> Result[Response, String]:
+    return Err("boom")
+
+def routes() -> Router[Counter]:
+    let mut router: Router[Counter] = Router.new()
+    router.add("GET", "/count", count)
+    router.add("POST", "/echo", echo)
+    router.add("GET", "/items/:id", item)
+    router.add("GET", "/fail", fail)
+    return router
+
+def bind_loopback() -> TcpListener:
+    let mut listener: TcpListener = TcpListener { handle: -1 }
+    match TcpListener.bind(SocketAddr.new(127, 0, 0, 1, 0)):
+        Ok(l) => listener = l
+        Err(e) => assert!(False, "bind 127.0.0.1:0")
+    match listener.local_addr():
+        Ok(a) => assert!(a.port != 0, "the OS assigned a port")
+        Err(e) => assert!(False, "local_addr")
+    return listener
+
+# Send `raw` and return the parsed reply.
+def send(listener: &TcpListener, router: &Router[Counter], state: &mut Counter, limits: &Limits, raw: String) -> Reply:
+    match round_trip(listener, router, state, limits, raw.as_bytes()):
+        Ok(bytes) => return parse_reply(bytes.as_slice())
+        Err(e) => assert!(False, "round trip failed")
+    let none: Vec[u8] = Vec.new()
+    return parse_reply(none.as_slice())
+
+@test
+def test_routes_over_tcp() -> i32:
+    let listener: TcpListener = bind_loopback()
+    let router: Router[Counter] = routes()
+    let mut state: Counter = Counter { hits: 0 }
+    let limits: Limits = default_limits()
+    let first: Reply = send(&listener, &router, &mut state, &limits, request_text("GET", "/count", ""))
+    assert!(first.status == 200 and first.body == "1", "a handler runs and sees the state")
+    let second: Reply = send(&listener, &router, &mut state, &limits, request_text("GET", "/count?x=1", ""))
+    assert!(second.body == "2", "state persists across connections; the query is not part of the path")
+    assert!(second.head.contains("Content-Length: 1\r\n") and second.head.contains("Connection: close\r\n"), "length and close headers")
+    let echoed: Reply = send(&listener, &router, &mut state, &limits, request_text("POST", "/echo", "{\"a\": [1, 2.5, \"x\\ny\"], \"b\": null}"))
+    assert!(echoed.status == 200 and echoed.body == "{\"a\":[1,2.5,\"x\\ny\"],\"b\":null}", "the JSON body round-trips")
+    let bad_json: Reply = send(&listener, &router, &mut state, &limits, request_text("POST", "/echo", "{\"a\": }"))
+    assert!(bad_json.status == 400, "a handler can answer 400")
+    let item: Reply = send(&listener, &router, &mut state, &limits, request_text("GET", "/items/abc", ""))
+    assert!(item.status == 200 and item.body == "abc", "path parameter")
+    let _closed: Result[unit, IoError] = listener.close()
+    return 0
+
+@test
+def test_error_statuses_over_tcp() -> i32:
+    let listener: TcpListener = bind_loopback()
+    let router: Router[Counter] = routes()
+    let mut state: Counter = Counter { hits: 0 }
+    let limits: Limits = Limits { max_head_bytes: 256, max_body_bytes: 16 }
+    let missing: Reply = send(&listener, &router, &mut state, &limits, request_text("GET", "/missing", ""))
+    assert!(missing.status == 404 and missing.body == "{\"error\":\"no route for this path\"}", "404 with a JSON error")
+    let wrong_method: Reply = send(&listener, &router, &mut state, &limits, request_text("DELETE", "/count", ""))
+    assert!(wrong_method.status == 405 and wrong_method.head.contains("Allow: GET\r\n"), "405 with Allow")
+    let failed: Reply = send(&listener, &router, &mut state, &limits, request_text("GET", "/fail", ""))
+    assert!(failed.status == 500 and failed.body == "{\"error\":\"boom\"}", "a handler error is a 500")
+    let garbage: Reply = send(&listener, &router, &mut state, &limits, "not http\r\n\r\n")
+    assert!(garbage.status == 400, "malformed request line")
+    let bad_header: Reply = send(&listener, &router, &mut state, &limits, "GET /count HTTP/1.1\r\nno colon\r\n\r\n")
+    assert!(bad_header.status == 400, "malformed header")
+    let version: Reply = send(&listener, &router, &mut state, &limits, "GET /count HTTP/3.0\r\n\r\n")
+    assert!(version.status == 505, "unsupported version")
+    let chunked: Reply = send(&listener, &router, &mut state, &limits, "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+    assert!(chunked.status == 501, "chunked is not implemented")
+    let too_big: Reply = send(&listener, &router, &mut state, &limits, request_text("POST", "/echo", "[1, 2, 3, 4, 5, 6, 7, 8, 9]"))
+    assert!(too_big.status == 413, "body over the limit")
+    let mut long_path: String = "/"
+    for i: usize in range(0, 300):
+        long_path.push_str("a")
+    let too_long: Reply = send(&listener, &router, &mut state, &limits, request_text("GET", long_path, ""))
+    assert!(too_long.status == 431, "head over the limit")
+    let short: Reply = send(&listener, &router, &mut state, &limits, "POST /echo HTTP/1.1\r\nContent-Length: 10\r\n\r\n[1]")
+    assert!(short.status == 400, "the client closed before the announced body arrived")
+    assert!(state.hits == 0, "no failed request reached a handler")
+    let _closed: Result[unit, IoError] = listener.close()
+    return 0

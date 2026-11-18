@@ -1,0 +1,13 @@
+import std.tensor as T
+
+def main() -> i32:
+    let mut xf: Tensor[f32, (8,)] = T.zeros([8])
+    for i: i64 in range(0, 8):
+        xf[i] = i as f32
+    let x: Tensor[f32, (2, 4)] = T.reshape(xf, [2, 4])
+    let lo: Tensor[f32, (2, 2)] = T.slice(x, 1, 0, 2)
+    let hi: Tensor[f32, (2, 2)] = T.slice(x, 1, 2, 2)
+    let sw: Tensor[f32, (2, 4)] = T.concat(hi, lo, 1)
+    let f: Tensor[f32, (8,)] = T.flatten(sw)
+    println!("{} {} {} {}", f[0], f[1], f[2], f[4])
+    return 0

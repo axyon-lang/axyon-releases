@@ -1,0 +1,17 @@
+[package]
+name = "rocm_numeric_contract"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# Generated kernels run on an AMD GPU through ROCm/HIP under the strict
+# device math (#2957): every result is compared bit for bit with the strict
+# host build of the same expression.
+[target]
+gpu = ["rocdl-gfx942"]

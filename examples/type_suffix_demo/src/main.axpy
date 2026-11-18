@@ -1,0 +1,44 @@
+# Type Suffix Demo for AXYON
+# Demonstrates Rust-style type suffixes on numeric literals.
+
+def main() -> i32:
+    println!("Type Suffix Demo")
+
+    # Integer type suffixes
+    let a = 42_i32
+    let b = 100_i64
+    let c = 255_u8
+    let d: u32 = 0xFF_u32
+
+    println!("i32: {a}")
+    println!("i64: {b}")
+    println!("u8:  {c}")
+    println!("u32 (hex): {d}")
+
+    # 128-bit suffixes (#1276): `_i128` fits i64, `_u128` fits u64
+    let wide_s: i128 = -128_i128
+    let wide_u: u128 = 18446744073709551615_u128
+    let wide_s_low: i64 = wide_s as i64
+    let wide_u_low: u64 = wide_u as u64
+    println!("i128: {wide_s_low}")
+    println!("u128 (low 64 bits): {wide_u_low}")
+
+    # Float type suffixes
+    let pi: f64 = 3_f64
+    let half: f32 = 0_f32
+
+    println!("f64: {pi}")
+    println!("f32: {half}")
+
+    # Arithmetic with suffixed literals
+    let sum: i32 = 10_i32 + 20_i32
+    let product: i64 = 6_i64 * 7_i64
+
+    println!("10_i32 + 20_i32 = {sum}")
+    println!("6_i64 * 7_i64 = {product}")
+
+    # Negative suffixed literals
+    let neg: i32 = -42_i32
+    println!("negative: {neg}")
+
+    return 0

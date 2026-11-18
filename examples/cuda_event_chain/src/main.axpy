@@ -1,0 +1,83 @@
+# Transfer -> several kernels -> readback, ordered by completion events, on an
+# NVIDIA GPU (issue #2114)
+#
+# The host fills two buffers from a fixed seed and copies them to the device.
+# Three kernels then run on them, ordered only by completion handles
+# (`gpu_submit`, `gpu_submit_after`, `gpu_submit_on`), never by a hidden wait:
+#
+#   a = scale(x)            x[i] = x[i] * 3 + 1        (queue 0)
+#   b = shift(y)            y[i] = y[i] - 7            (queue 1, independent of a)
+#   c = combine(x, y) after a, on queue 1 after b
+#                           x[i] = x[i] + y[i]
+#
+# `combine` writes `x`, which `scale` also writes, and reads `y`, which `shift`
+# writes, so it must be ordered after both: after `a` explicitly, after `b` by
+# queue order. Leaving either dependency out is a compile error: without `a`,
+# `combine` writes `x` unordered with `scale` (AX0644); on another queue,
+# `shift`'s dropped handle `_b` is no longer covered by any wait (AX0639). The
+# compiler also rejects copying `x` back before `gpu_wait(c)` (AX0646). One
+# wait for `c` covers the whole chain. The results are copied
+# back and checked element by element against a host reference: integer
+# arithmetic is exact.
+#
+# Set `AXYON_GPU_LAUNCH_EVIDENCE=1` to see each launch's backend, device and
+# image. Without a CUDA device the first device allocation stops the program
+# with an AXYON panic: there is no CPU fallback. On the CUDA runtime the three
+# launches still complete one after another (#2790); the ordering contract and
+# its compile-time checks are the same either way.
+
+from std import CompletionId
+
+@gpu(entry)
+def scale(n: i64, x: &mut Buffer[i32, (1000,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(x, i, buffer_get(x, i) * 3 + 1)
+
+@gpu(entry)
+def shift(n: i64, y: &mut Buffer[i32, (1000,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(y, i, buffer_get(y, i) - 7)
+
+@gpu(entry)
+def combine(n: i64, x: &mut Buffer[i32, (1000,), device_global], y: &Buffer[i32, (1000,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(x, i, buffer_get(x, i) + buffer_get(y, i))
+
+const CAP: i64 = 1000
+const BLOCK: i64 = 128
+
+def next_seed(s: i64) -> i64:
+    return (s * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+
+def fill(seed: i64) -> Buffer[i32, (1000,)]:
+    let mut s: i64 = seed
+    let mut b: Buffer[i32, (1000,)] = buffer_alloc([1000])
+    for i: i64 in range(CAP):
+        s = next_seed(s)
+        buffer_set(b, i, ((s >> 40) & 65535) as i32 - 32768)
+    return b
+
+def main() -> i32:
+    let hx: Buffer[i32, (1000,)] = fill(2114)
+    let hy: Buffer[i32, (1000,)] = fill(4112)
+    let mut dx: Buffer[i32, (1000,), device_global] = buffer_to_device(fill(2114))
+    let mut dy: Buffer[i32, (1000,), device_global] = buffer_to_device(fill(4112))
+    let blocks: i64 = (CAP + BLOCK - 1) / BLOCK
+    let a: CompletionId = gpu_submit_on(0, scale, blocks, BLOCK, CAP, &mut dx)
+    let _b: CompletionId = gpu_submit_on(1, shift, blocks, BLOCK, CAP, &mut dy)
+    let c: CompletionId = gpu_submit_on_after(1, a, combine, blocks, BLOCK, CAP, &mut dx, &dy)
+    gpu_wait(c)
+    let rx: Buffer[i32, (1000,)] = buffer_to_host(dx)
+    let mut bad: i64 = 0
+    for i: i64 in range(CAP):
+        let want: i32 = (buffer_get(hx, i) * 3 + 1) + (buffer_get(hy, i) - 7)
+        if buffer_get(rx, i) != want:
+            bad = bad + 1
+    if bad != 0:
+        println!("event chain: {bad} mismatches")
+        return 1
+    println!("event chain: transfer, three ordered kernels and readback match the host reference")
+    return 0

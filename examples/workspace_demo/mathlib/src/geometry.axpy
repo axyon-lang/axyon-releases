@@ -1,0 +1,13 @@
+# Geometry helpers
+
+const PI: f64 = 3.141592653589793
+
+@public
+def circle_area(radius: f64) -> f64:
+    """Compute the area of a circle."""
+    return PI * radius * radius
+
+@public
+def rect_area(width: f64, height: f64) -> f64:
+    """Compute the area of a rectangle."""
+    return width * height

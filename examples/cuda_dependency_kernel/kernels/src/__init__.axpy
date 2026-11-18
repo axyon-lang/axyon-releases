@@ -1,0 +1,26 @@
+# A library of CUDA kernels (issue #2663).
+#
+# Every kernel defined here is compiled into this package's own device image
+# (`axyon_cuda_kernel_image__kernels`), which the library's object defines.
+# A dependent package that imports a kernel and launches it with
+# `gpu_launch` names that image: the importer never recompiles the kernel.
+#
+# The buffers have a static capacity (`CAP` elements); each launch processes
+# its first `n` and leaves the tail lanes alone (`if i < n`).
+
+# y[i] = a * x[i] + y[i], two rounded f32 operations (never fused).
+@public
+@gpu(entry)
+def saxpy(n: i64, a: f32, x: &Buffer[f32, (1000,), device_global], y: &mut Buffer[f32, (1000,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(y, i, a * buffer_get(x, i) + buffer_get(y, i))
+
+# out[i] = x[i] * x[i] + k, wrapping like the host's i32 arithmetic.
+@public
+@gpu(entry)
+def square_plus(n: i64, k: i32, x: &Buffer[i32, (1000,), device_global], out: &mut Buffer[i32, (1000,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let v: i32 = buffer_get(x, i)
+        buffer_set(out, i, v * v + k)

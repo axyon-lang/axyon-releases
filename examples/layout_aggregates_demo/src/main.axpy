@@ -1,0 +1,66 @@
+# Aggregate Layout Intrinsics Demo for AXYON
+# ===========================================
+#
+# `size_of[T]()` and `align_of[T]()` accept any sized type, not just scalars:
+# structs, enums, arrays, tuples, `Vec`/slice fat pointers, references, raw
+# pointers and function pointers. Type arguments may nest and may name
+# user-defined structs/enums, bare (`Pair`) or module-qualified
+# (`app.models.Pair`, useful when two modules define the same short name).
+#
+# Layouts follow the C ABI rules of the default target (LP64): fields are
+# padded to their natural alignment and the total size is rounded up to the
+# alignment of the most strictly aligned field.
+
+struct Pair:
+    a: i32
+    b: i64
+
+struct Nested:
+    p: Pair
+    flag: bool
+
+def main() -> i32:
+    println!("Aggregate layout intrinsics")
+
+    # Structs: i32 (4) + 4 padding + i64 (8) = 16, aligned to 8.
+    let v1: i64 = size_of[Pair]()
+    assert!(v1 == 16, "Pair is 16 bytes")
+    let v2: i64 = align_of[Pair]()
+    assert!(v2 == 8, "Pair is 8-aligned")
+    let v3: i64 = size_of[Nested]()
+    assert!(v3 == 24, "Nested is Pair + flag + padding")
+
+    # Arrays: element size times length, element alignment.
+    let v4: i64 = size_of[Array[i32; 4]]()
+    assert!(v4 == 16, "4 x i32")
+    let v5: i64 = size_of[Array[Pair; 2]]()
+    assert!(v5 == 32, "2 x Pair")
+    let v6: i64 = align_of[Array[i64; 2]]()
+    assert!(v6 == 8, "array alignment is the element type")
+
+    # Tuples (including nested tuples and the unit tuple).
+    let v7: i64 = size_of[(i32, i64)]()
+    assert!(v7 == 16, "(i32, i64)")
+    let v8: i64 = align_of[(i8, i32)]()
+    assert!(v8 == 4, "(i8, i32)")
+    let v9: i64 = size_of[(i8, (i32, i64))]()
+    assert!(v9 == 24, "nested tuple")
+    let v10: i64 = size_of[(i32, Pair)]()
+    assert!(v10 == 24, "tuple containing a struct")
+    let v11: i64 = size_of[()]()
+    assert!(v11 == 0, "unit has no size")
+    let v12: i64 = align_of[()]()
+    assert!(v12 == 1, "unit is 1-aligned")
+
+    # Fat / thin pointers and function pointers.
+    let v13: i64 = size_of[Vec[i32]]()
+    assert!(v13 == 24, "Vec is ptr + len + cap")
+    let v14: i64 = size_of[Vec[(i32, Pair)]]()
+    assert!(v14 == 24, "Vec size is independent of T")
+    let v15: i64 = size_of[Slice[Pair]]()
+    assert!(v15 == 16, "slice is ptr + len")
+    let v16: i64 = size_of[fn(i32) -> i32]()
+    assert!(v16 == 8, "function pointer")
+
+    println!("all layout assertions passed")
+    return 0

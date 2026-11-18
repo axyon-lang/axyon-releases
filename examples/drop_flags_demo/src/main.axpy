@@ -1,0 +1,54 @@
+# Conditional and loop moves with drop flags (#762).
+#
+# Each owned value below is moved on some paths only. The compiler decides
+# these moves on the control-flow graph and drops each value behind a
+# run-time drop flag, so every `Noisy` prints "drop <id>" exactly once.
+
+struct Noisy:
+    id: i64
+
+impl Drop for Noisy:
+    def drop(self) -> unit:
+        println!("drop {self.id}")
+
+def consume(n: Noisy) -> i64:
+    return n.id
+
+# A move in one branch of an `if` expression: the untaken source is
+# dropped at the return.
+def pick(c: bool) -> i64:
+    let v: Noisy = Noisy { id: 1 }
+    let w: Noisy = Noisy { id: 2 }
+    let x: Noisy = v if c else w
+    return x.id
+
+# A move inside a loop, re-initialized before the next iteration.
+def refill(n: i64) -> i64:
+    let mut v: Noisy = Noisy { id: 10 }
+    let mut total: i64 = 0
+    for i: i64 in range(n):
+        total = total + consume(v)
+        v = Noisy { id: 11 + i }
+    return total
+
+# A move followed by `break`: `v` is dropped after the loop only when the
+# loop never moved it.
+def take_at(n: i64) -> i64:
+    let v: Noisy = Noisy { id: 20 }
+    let mut total: i64 = 0
+    for i: i64 in range(n):
+        if i == 3:
+            total = consume(v)
+            break
+    return total
+
+def main() -> i32:
+    let a: i64 = pick(True)
+    println!("pick -> {a}")
+    let b: i64 = refill(2)
+    println!("refill -> {b}")
+    let c: i64 = take_at(5)
+    println!("take_at(5) -> {c}")
+    let d: i64 = take_at(1)
+    println!("take_at(1) -> {d}")
+    return 0

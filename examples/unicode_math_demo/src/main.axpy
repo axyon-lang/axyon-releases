@@ -1,0 +1,47 @@
+# Unicode math operators (#2823): vector algebra written as on paper.
+#
+# `×` and `·` are trait-backed like `+`: implementing `Cross` and `Dot` gives
+# `V3` the operators. `≤ ≥ ≠ ¬ ∧ ∨` are other spellings of `<= >= != not and
+# or`, `√` is the square root of a float, and `∑` is an ordinary function name.
+# See docs/src/guide/unicode-operators.md.
+
+from core.ops import Cross, Dot
+
+@derive(Copy, Clone)
+struct V3:
+    x: f64
+    y: f64
+    z: f64
+
+impl Cross for V3:
+    type Output = V3
+
+    def cross(self, o: V3) -> V3:
+        return V3 { x: self.y * o.z - self.z * o.y, y: self.z * o.x - self.x * o.z, z: self.x * o.y - self.y * o.x }
+
+impl Dot for V3:
+    type Output = f64
+
+    def dot(self, o: V3) -> f64:
+        return self.x * o.x + self.y * o.y + self.z * o.z
+
+def ∑(a: f64, b: f64, c: f64) -> f64:
+    return a + b + c
+
+def norm(v: V3) -> f64:
+    return √(v · v)
+
+def main() -> i32:
+    let a: V3 = V3 { x: 1.0, y: 2.0, z: 3.0 }
+    let b: V3 = V3 { x: 4.0, y: 5.0, z: 6.0 }
+    let n: V3 = a × b
+    # The cross product is orthogonal to both factors.
+    assert!(n · a == 0.0 ∧ n · b == 0.0, "a × b is orthogonal to a and b")
+    let area: f64 = norm(n)
+    println!("|a × b| = {area}")
+    let s: f64 = ∑(n.x, n.y, n.z)
+    println!("∑(a × b) = {s}")
+    let θ: f64 = 0.5
+    if 0.0 ≤ θ ∧ θ ≤ 1.0 ∧ ¬(area ≠ area):
+        println!("θ in range")
+    return 0

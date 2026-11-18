@@ -1,0 +1,428 @@
+# Pipelined GEMM with asynchronous global-to-workgroup copies (issue #2514)
+#
+# `c = a · b` in f32 with `a: M x K`, `b: K x N`, `c: M x N`, every buffer
+# a row-major `device_global` buffer with run-time extents. Three kernels
+# compute each 16 x 16 tile of `c` with the same arithmetic:
+#
+# - `gemm_staged`: the #2110 tiled kernel. Each thread loads one element of
+#   the `a` and `b` tiles into registers and stores it to workgroup memory,
+#   then the workgroup computes. Nothing overlaps.
+# - `gemm_async`: the tiles are copied with `gpu_copy_async` (`cp.async`
+#   on `nvptx-sm80`: global to shared memory without staging through
+#   registers) and waited for at once. Not pipelined.
+# - `gemm_pipelined`: double buffering. While the workgroup computes on one
+#   pair of tiles, the copies of the next pair are already in flight; the
+#   token of each copy owns its tile until `gpu_copy_wait`, and the tokens
+#   rotate across the loop's two halves.
+#
+# The token is checked at compile time (the GPU completion contract of
+# #478): reading a tile before its wait (AX0647), writing it or starting a
+# second copy into it while a copy is in flight (AX0646, AX0644), and a
+# token still in flight when the kernel returns (AX0639) are errors.
+#
+# Numerics are strict and identical for all three kernels: each output is
+# `((0 + a[i,0]*b[0,j]) + a[i,1]*b[1,j]) + ...` in increasing `p`, every
+# product and sum rounded to nearest-even in f32. A copied tile element
+# outside its buffer is zero-filled and never added (`lim` below), so the
+# kernels match a sequential host loop bit for bit at every shape.
+#
+# Launch shape (as in `examples/cuda_matmul`): a 1-D grid; block `g`
+# computes the output tile at tile row `g >> sh`, tile column
+# `g & ((1 << sh) - 1)`, with `1 << sh` the tile-column count rounded up to
+# a power of two. Thread `t` of the 256-thread block covers row `t / 16`,
+# column `t % 16` of its tile.
+#
+# Run with an argument (`cuda_async_copy_gemm bench`) the executable times
+# the three kernels instead (`gpu_timer_start`/`gpu_timer_stop`, device
+# nanoseconds). Without a CUDA device the first device allocation stops the
+# program with an AXYON panic: there is no CPU fallback.
+
+from std.env import argc
+
+const TILE: i64 = 16
+# The output tile of the register-blocked kernels.
+const BIG: i64 = 32
+const TILE_THREADS: i64 = 256
+const MAX_GRID: i64 = 2147483647
+
+@gpu(entry)
+def gemm_staged(sh: i64, a: &Buffer[f32, (M, K), device_global], b: &Buffer[f32, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    let ta: &mut Buffer[f32, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let tb: &mut Buffer[f32, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let ty: i64 = gpu_thread_id(0) / TILE
+    let tx: i64 = gpu_thread_id(0) % TILE
+    let row: i64 = (gpu_block_id(0) >> sh) * TILE + ty
+    let col: i64 = (gpu_block_id(0) & ((1 << sh) - 1)) * TILE + tx
+    let m: i64 = buffer_dim(c, 0)
+    let n: i64 = buffer_dim(c, 1)
+    let k: i64 = buffer_dim(a, 1)
+    let mut acc: f32 = 0.0
+    for t: i64 in range((buffer_dim(a, 1) + TILE - 1) / TILE):
+        let pa: i64 = t * TILE + tx
+        let mut va: f32 = 0.0
+        if row < m and pa < k:
+            va = buffer_get(a, row, pa)
+        buffer_set(ta, ty, tx, va)
+        let pb: i64 = t * TILE + ty
+        let mut vb: f32 = 0.0
+        if pb < k and col < n:
+            vb = buffer_get(b, pb, col)
+        buffer_set(tb, ty, tx, vb)
+        gpu_barrier()
+        let mut lim: i64 = k - t * TILE
+        if lim > TILE:
+            lim = TILE
+        for q: i64 in range(lim):
+            acc = acc + buffer_get(ta, ty, q) * buffer_get(tb, q, tx)
+        gpu_barrier()
+    if row < m and col < n:
+        buffer_set(c, row, col, acc)
+
+@gpu(entry)
+def gemm_async(sh: i64, a: &Buffer[f32, (M, K), device_global], b: &Buffer[f32, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    let ta: &mut Buffer[f32, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let tb: &mut Buffer[f32, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let ty: i64 = gpu_thread_id(0) / TILE
+    let tx: i64 = gpu_thread_id(0) % TILE
+    # The tile origin is the same in every thread of the block.
+    let row0: i64 = (gpu_block_id(0) >> sh) * TILE
+    let col0: i64 = (gpu_block_id(0) & ((1 << sh) - 1)) * TILE
+    let k: i64 = buffer_dim(a, 1)
+    let mut acc: f32 = 0.0
+    for t: i64 in range((buffer_dim(a, 1) + TILE - 1) / TILE):
+        let sa: u64 = gpu_copy_async(ta, a, row0, t * TILE)
+        let sb: u64 = gpu_copy_async(tb, b, t * TILE, col0)
+        gpu_copy_wait(sa)
+        gpu_copy_wait(sb)
+        let mut lim: i64 = k - t * TILE
+        if lim > TILE:
+            lim = TILE
+        for q: i64 in range(lim):
+            acc = acc + buffer_get(ta, ty, q) * buffer_get(tb, q, tx)
+    if row0 + ty < buffer_dim(c, 0) and col0 + tx < buffer_dim(c, 1):
+        buffer_set(c, row0 + ty, col0 + tx, acc)
+
+@gpu(entry)
+def gemm_pipelined(sh: i64, a: &Buffer[f32, (M, K), device_global], b: &Buffer[f32, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    # Two stages: tiles 2p in (a0, b0), tiles 2p + 1 in (a1, b1).
+    let a0: &mut Buffer[f32, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let b0: &mut Buffer[f32, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let a1: &mut Buffer[f32, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let b1: &mut Buffer[f32, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let ty: i64 = gpu_thread_id(0) / TILE
+    let tx: i64 = gpu_thread_id(0) % TILE
+    let row0: i64 = (gpu_block_id(0) >> sh) * TILE
+    let col0: i64 = (gpu_block_id(0) & ((1 << sh) - 1)) * TILE
+    let k: i64 = buffer_dim(a, 1)
+    let mut acc: f32 = 0.0
+    # Tile 0 is in flight before the loop.
+    let mut sa: u64 = gpu_copy_async(a0, a, row0, 0)
+    let mut sb: u64 = gpu_copy_async(b0, b, 0, col0)
+    # Two K tiles (32 elements) per iteration.
+    for p: i64 in range((buffer_dim(a, 1) + 31) / 32):
+        # Start tile 2p + 1 while tile 2p lands.
+        let na: u64 = gpu_copy_async(a1, a, row0, (2 * p + 1) * TILE)
+        let nb: u64 = gpu_copy_async(b1, b, (2 * p + 1) * TILE, col0)
+        gpu_copy_wait(sa)
+        gpu_copy_wait(sb)
+        let mut lim: i64 = k - 2 * p * TILE
+        if lim > TILE:
+            lim = TILE
+        for q: i64 in range(lim):
+            acc = acc + buffer_get(a0, ty, q) * buffer_get(b0, q, tx)
+        # Start tile 2p + 2 into the stage just consumed (past `K` it is
+        # zero-filled and never read), then finish tile 2p + 1.
+        sa = gpu_copy_async(a0, a, row0, (2 * p + 2) * TILE)
+        sb = gpu_copy_async(b0, b, (2 * p + 2) * TILE, col0)
+        gpu_copy_wait(na)
+        gpu_copy_wait(nb)
+        let mut lim1: i64 = k - (2 * p + 1) * TILE
+        if lim1 > TILE:
+            lim1 = TILE
+        for q: i64 in range(lim1):
+            acc = acc + buffer_get(a1, ty, q) * buffer_get(b1, q, tx)
+    # The last prefetch is past `K`: wait for it before the kernel ends.
+    gpu_copy_wait(sa)
+    gpu_copy_wait(sb)
+    if row0 + ty < buffer_dim(c, 0) and col0 + tx < buffer_dim(c, 1):
+        buffer_set(c, row0 + ty, col0 + tx, acc)
+
+# Register-blocked variants (#2514): a 32 x 32 output tile per block, each
+# thread computing a 2 x 2 block of it (rows `ty`, `ty + 16`, columns `tx`,
+# `tx + 16`) from 32 x 16 tiles of `a` and 16 x 32 tiles of `b`. More work
+# per staged tile is where overlapping the next copy pays off.
+@gpu(entry)
+def gemm_async_rb(sh: i64, a: &Buffer[f32, (M, K), device_global], b: &Buffer[f32, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    let ta: &mut Buffer[f32, (32, 16), workgroup] = gpu_workgroup_buffer()
+    let tb: &mut Buffer[f32, (16, 32), workgroup] = gpu_workgroup_buffer()
+    let ty: i64 = gpu_thread_id(0) / TILE
+    let tx: i64 = gpu_thread_id(0) % TILE
+    let row0: i64 = (gpu_block_id(0) >> sh) * BIG
+    let col0: i64 = (gpu_block_id(0) & ((1 << sh) - 1)) * BIG
+    let k: i64 = buffer_dim(a, 1)
+    let mut c00: f32 = 0.0
+    let mut c01: f32 = 0.0
+    let mut c10: f32 = 0.0
+    let mut c11: f32 = 0.0
+    for t: i64 in range((buffer_dim(a, 1) + TILE - 1) / TILE):
+        let sa: u64 = gpu_copy_async(ta, a, row0, t * TILE)
+        let sb: u64 = gpu_copy_async(tb, b, t * TILE, col0)
+        gpu_copy_wait(sa)
+        gpu_copy_wait(sb)
+        let mut lim: i64 = k - t * TILE
+        if lim > TILE:
+            lim = TILE
+        for q: i64 in range(lim):
+            let a0: f32 = buffer_get(ta, ty, q)
+            let a1: f32 = buffer_get(ta, ty + 16, q)
+            let b0: f32 = buffer_get(tb, q, tx)
+            let b1: f32 = buffer_get(tb, q, tx + 16)
+            c00 = c00 + a0 * b0
+            c01 = c01 + a0 * b1
+            c10 = c10 + a1 * b0
+            c11 = c11 + a1 * b1
+    # The thread's 2 x 2 block; elements outside `c` are skipped.
+    let r: i64 = row0 + ty
+    let q: i64 = col0 + tx
+    let m: i64 = buffer_dim(c, 0)
+    let n: i64 = buffer_dim(c, 1)
+    if r < m and q < n:
+        buffer_set(c, r, q, c00)
+    if r < m and q + 16 < n:
+        buffer_set(c, r, q + 16, c01)
+    if r + 16 < m and q < n:
+        buffer_set(c, r + 16, q, c10)
+    if r + 16 < m and q + 16 < n:
+        buffer_set(c, r + 16, q + 16, c11)
+
+@gpu(entry)
+def gemm_pipelined_rb(sh: i64, a: &Buffer[f32, (M, K), device_global], b: &Buffer[f32, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    let a0: &mut Buffer[f32, (32, 16), workgroup] = gpu_workgroup_buffer()
+    let b0: &mut Buffer[f32, (16, 32), workgroup] = gpu_workgroup_buffer()
+    let a1: &mut Buffer[f32, (32, 16), workgroup] = gpu_workgroup_buffer()
+    let b1: &mut Buffer[f32, (16, 32), workgroup] = gpu_workgroup_buffer()
+    let ty: i64 = gpu_thread_id(0) / TILE
+    let tx: i64 = gpu_thread_id(0) % TILE
+    let row0: i64 = (gpu_block_id(0) >> sh) * BIG
+    let col0: i64 = (gpu_block_id(0) & ((1 << sh) - 1)) * BIG
+    let k: i64 = buffer_dim(a, 1)
+    let mut c00: f32 = 0.0
+    let mut c01: f32 = 0.0
+    let mut c10: f32 = 0.0
+    let mut c11: f32 = 0.0
+    let mut sa: u64 = gpu_copy_async(a0, a, row0, 0)
+    let mut sb: u64 = gpu_copy_async(b0, b, 0, col0)
+    for p: i64 in range((buffer_dim(a, 1) + 31) / 32):
+        let na: u64 = gpu_copy_async(a1, a, row0, (2 * p + 1) * TILE)
+        let nb: u64 = gpu_copy_async(b1, b, (2 * p + 1) * TILE, col0)
+        gpu_copy_wait(sa)
+        gpu_copy_wait(sb)
+        let mut lim: i64 = k - 2 * p * TILE
+        if lim > TILE:
+            lim = TILE
+        for q: i64 in range(lim):
+            let x0: f32 = buffer_get(a0, ty, q)
+            let x1: f32 = buffer_get(a0, ty + 16, q)
+            let y0: f32 = buffer_get(b0, q, tx)
+            let y1: f32 = buffer_get(b0, q, tx + 16)
+            c00 = c00 + x0 * y0
+            c01 = c01 + x0 * y1
+            c10 = c10 + x1 * y0
+            c11 = c11 + x1 * y1
+        sa = gpu_copy_async(a0, a, row0, (2 * p + 2) * TILE)
+        sb = gpu_copy_async(b0, b, (2 * p + 2) * TILE, col0)
+        gpu_copy_wait(na)
+        gpu_copy_wait(nb)
+        let mut lim1: i64 = k - (2 * p + 1) * TILE
+        if lim1 > TILE:
+            lim1 = TILE
+        for q: i64 in range(lim1):
+            let x0: f32 = buffer_get(a1, ty, q)
+            let x1: f32 = buffer_get(a1, ty + 16, q)
+            let y0: f32 = buffer_get(b1, q, tx)
+            let y1: f32 = buffer_get(b1, q, tx + 16)
+            c00 = c00 + x0 * y0
+            c01 = c01 + x0 * y1
+            c10 = c10 + x1 * y0
+            c11 = c11 + x1 * y1
+    gpu_copy_wait(sa)
+    gpu_copy_wait(sb)
+    # The thread's 2 x 2 block; elements outside `c` are skipped.
+    let r: i64 = row0 + ty
+    let q: i64 = col0 + tx
+    let m: i64 = buffer_dim(c, 0)
+    let n: i64 = buffer_dim(c, 1)
+    if r < m and q < n:
+        buffer_set(c, r, q, c00)
+    if r < m and q + 16 < n:
+        buffer_set(c, r, q + 16, c01)
+    if r + 16 < m and q < n:
+        buffer_set(c, r + 16, q, c10)
+    if r + 16 < m and q + 16 < n:
+        buffer_set(c, r + 16, q + 16, c11)
+
+# The smallest `sh` with `1 << sh >= tiles`.
+def col_shift(tiles: i64) -> i64:
+    let mut sh: i64 = 0
+    while (1 << sh) < tiles:
+        sh = sh + 1
+    return sh
+
+# The launch's column shift for an `m x n` output (see `cuda_matmul`).
+def checked_shift(m: i64, n: i64, k: i64, tile: i64) -> i64:
+    assert!(m >= 0 and n >= 0 and k >= 0, "gemm: extents are non-negative")
+    let tiles_m: i64 = (m + tile - 1) / tile
+    let sh: i64 = col_shift((n + tile - 1) / tile)
+    assert!(sh < 31, "gemm: too many output columns for one launch")
+    assert!(tiles_m <= (MAX_GRID >> sh), "gemm: too many output tiles for one launch")
+    return sh
+
+def grid_for(m: i64, n: i64, sh: i64, tile: i64) -> i64:
+    if m == 0 or n == 0:
+        return 0
+    return ((m + tile - 1) / tile) << sh
+
+# The kernels, by `variant`.
+const VARIANTS: i64 = 5
+
+# `c = a · b` with kernel `variant`: 0 staged, 1 async, 2 pipelined,
+# 3 async register-blocked, 4 pipelined register-blocked.
+def gemm(variant: i64, m: i64, n: i64, k: i64, a: &Buffer[f32, (M, K), device_global], b: &Buffer[f32, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    let mut tile: i64 = TILE
+    if variant >= 3:
+        tile = BIG
+    let sh: i64 = checked_shift(m, n, k, tile)
+    let grid: i64 = grid_for(m, n, sh, tile)
+    if variant == 0:
+        gpu_launch(gemm_staged, grid, TILE_THREADS, sh, a, b, c)
+    elif variant == 1:
+        gpu_launch(gemm_async, grid, TILE_THREADS, sh, a, b, c)
+    elif variant == 2:
+        gpu_launch(gemm_pipelined, grid, TILE_THREADS, sh, a, b, c)
+    elif variant == 3:
+        gpu_launch(gemm_async_rb, grid, TILE_THREADS, sh, a, b, c)
+    else:
+        gpu_launch(gemm_pipelined_rb, grid, TILE_THREADS, sh, a, b, c)
+
+def next_seed(s: i64) -> i64:
+    return (s * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+
+# A multiple of 1/3 in [-2^10, 2^10): products and sums round.
+def rand_value(r: i64) -> f32:
+    return ((((r >> 20) & 2097151) - 1048576) as f64 / 3072.0) as f32
+
+# Exact equality: the same value with the same sign of zero, or both NaN.
+def same_f32(x: f32, y: f32) -> bool:
+    if x != x:
+        return y != y
+    if x != y:
+        return false
+    if x != 0.0:
+        return true
+    return 1.0 / x == 1.0 / y
+
+# Random `a` (`m x k`) and `b` (`k x n`) inputs from `seed`.
+def fill_a(m: i64, k: i64, seed: i64) -> Buffer[f32, (M, K)]:
+    let mut s: i64 = seed
+    let mut h: Buffer[f32, (M, K)] = buffer_alloc([m, k])
+    for i: i64 in range(m):
+        for j: i64 in range(k):
+            s = next_seed(s)
+            buffer_set(h, i, j, rand_value(s))
+    return h
+
+def fill_b(k: i64, n: i64, seed: i64) -> Buffer[f32, (K, N)]:
+    let mut s: i64 = seed
+    let mut h: Buffer[f32, (K, N)] = buffer_alloc([k, n])
+    for i: i64 in range(k):
+        for j: i64 in range(n):
+            s = next_seed(s)
+            buffer_set(h, i, j, rand_value(s))
+    return h
+
+# Run every kernel on an `m x k` by `k x n` random product; returns the
+# number of output elements (over the three kernels) that differ from the
+# sequential host loop.
+def check(m: i64, n: i64, k: i64, seed: i64) -> i64:
+    let ha: Buffer[f32, (M, K)] = fill_a(m, k, seed)
+    let hb: Buffer[f32, (K, N)] = fill_b(k, n, seed + 1)
+    let mut r: Buffer[f32, (M, N)] = buffer_alloc([m, n])
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            let mut acc: f32 = 0.0
+            for p: i64 in range(k):
+                acc = acc + buffer_get(ha, i, p) * buffer_get(hb, p, j)
+            buffer_set(r, i, j, acc)
+    let da: Buffer[f32, (M, K), device_global] = buffer_to_device(ha)
+    let db: Buffer[f32, (K, N), device_global] = buffer_to_device(hb)
+    let mut bad: i64 = 0
+    for variant: i64 in range(VARIANTS):
+        # Sentinels: every element must be overwritten.
+        let mut hc: Buffer[f32, (M, N)] = buffer_alloc([m, n])
+        for i: i64 in range(m):
+            for j: i64 in range(n):
+                buffer_set(hc, i, j, -7.0)
+        let mut dc: Buffer[f32, (M, N), device_global] = buffer_to_device(hc)
+        gemm(variant, m, n, k, &da, &db, &mut dc)
+        let out: Buffer[f32, (M, N)] = buffer_to_host(dc)
+        for i: i64 in range(m):
+            for j: i64 in range(n):
+                if not same_f32(buffer_get(out, i, j), buffer_get(r, i, j)):
+                    bad = bad + 1
+    return bad
+
+# Time `reps` warm launches of each kernel at `size^3` (device
+# nanoseconds per launch, best of `reps`), print one line per kernel, and
+# return 1 when the kernels' results differ.
+def bench(size: i64, reps: i64) -> i64:
+    let ha: Buffer[f32, (M, K)] = fill_a(size, size, 11)
+    let hb: Buffer[f32, (K, N)] = fill_b(size, size, 12)
+    let da: Buffer[f32, (M, K), device_global] = buffer_to_device(ha)
+    let db: Buffer[f32, (K, N), device_global] = buffer_to_device(hb)
+    let mut first: Buffer[f32, (M, N)] = buffer_alloc([size, size])
+    let mut bad: i64 = 0
+    for variant: i64 in range(VARIANTS):
+        let hc: Buffer[f32, (M, N)] = buffer_alloc([size, size])
+        let mut dc: Buffer[f32, (M, N), device_global] = buffer_to_device(hc)
+        # Warm-up launch (module load, first-touch).
+        gemm(variant, size, size, size, &da, &db, &mut dc)
+        let mut best: i64 = 9223372036854775807
+        for rep: i64 in range(reps):
+            let timer: i64 = gpu_timer_start()
+            gemm(variant, size, size, size, &da, &db, &mut dc)
+            let ns: i64 = gpu_timer_stop(timer)
+            if ns < best:
+                best = ns
+        println!("bench,{variant},{size},{best}")
+        let out: Buffer[f32, (M, N)] = buffer_to_host(dc)
+        for i: i64 in range(size):
+            for j: i64 in range(size):
+                if variant == 0:
+                    buffer_set(first, i, j, buffer_get(out, i, j))
+                elif not same_f32(buffer_get(out, i, j), buffer_get(first, i, j)):
+                    bad = 1
+    return bad
+
+def main() -> i32:
+    if argc() > 1:
+        let mut bad: i64 = 0
+        let sizes: Array[i64; 3] = [512, 1024, 2048]
+        for s: i64 in range(3):
+            bad = bad + bench(sizes[s], 20)
+        if bad != 0:
+            println!("FAIL: the kernels disagree")
+            return 1
+        return 0
+    let mut bad: i64 = 0
+    let mut cases: i64 = 0
+    # (m, n, k): one tile, an odd number of K tiles, M/N/K tails, K = 0,
+    # a single K element, and an empty output.
+    let shapes: Array[i64; 27] = [16, 16, 16, 64, 48, 80, 33, 17, 50, 100, 70, 15, 5, 7, 0, 20, 30, 1, 128, 128, 128, 0, 9, 4, 47, 1, 129]
+    for c: i64 in range(9):
+        bad = bad + check(shapes[3 * c], shapes[3 * c + 1], shapes[3 * c + 2], 2514 + c)
+        cases = cases + 1
+    if bad != 0:
+        println!("FAIL: {bad} mismatches")
+        return 1
+    println!("cuda_async_copy_gemm: {cases} shapes x {VARIANTS} kernels match the host reference")
+    return 0

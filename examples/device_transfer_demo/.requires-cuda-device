@@ -1,0 +1,4 @@
+# Built everywhere, run only where a CUDA device is visible (#2301): without
+# one the program's first device allocation is an AXYON panic by design.
+# Honoured by examples/build_all.sh.
+# AXYON_REQUIRE_CUDA_DEVICE=1 always runs it.

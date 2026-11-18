@@ -1,0 +1,9 @@
+# A trait with a default method, declared in its own module.
+@public
+trait Shape:
+    def area(self) -> i64
+
+    # Self-contained default (only `self`, parameters and literals): an impl
+    # in another module inherits it without restating it (#2787).
+    def double_area(self) -> i64:
+        return self.area() * 2

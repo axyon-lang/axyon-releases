@@ -1,0 +1,18 @@
+# Modules Demo - Root Package
+#
+# This example demonstrates AXYON's module system:
+# - `@public from . import X` declares public submodules
+# - `from . import X` declares private submodules
+# - `@public from path import item` re-exports items from submodules
+
+# Declare the math submodule as public
+@public from . import math
+
+# Re-export commonly used items from math.vector
+@public from math.vector import Vec3
+@public from math.vector import dot
+@public from math.kinds import Axis
+@public from math.kinds import Maybe
+@public from math.kinds import Measure
+@public from math.kinds import UNIT_LENGTH
+@public from math.kinds import Length

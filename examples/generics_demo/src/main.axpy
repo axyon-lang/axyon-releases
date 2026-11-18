@@ -1,0 +1,144 @@
+# Generics Demo Example for AXYON
+# Demonstrates generic types AND generic functions with compile-time monomorphization.
+#
+# AXYON supports generic structs, enums, and functions with type parameters.
+# At compile time, each unique instantiation (e.g., Pair[i64, f32], identity[i64])
+# creates a specialized monomorphized version.
+
+# ============================================================================
+# Generic Struct Definitions
+# ============================================================================
+
+# Pair[T, U] - A generic struct holding two values of potentially different types
+struct Pair[T, U]:
+    first: T
+    second: U
+
+# Box[T] - A simple wrapper around a value
+struct Box[T]:
+    value: T
+
+# Triple[T] - A struct with three values of the same type
+struct Triple[T]:
+    a: T
+    b: T
+    c: T
+
+# ============================================================================
+# Generic Functions
+# ============================================================================
+
+# identity[T] - Returns its argument unchanged
+# The simplest possible generic function, useful for testing.
+def identity[T](x: T) -> T:
+    return x
+
+# get_first[T, U] - Get the first element of a Pair
+def get_first[T, U](p: Pair[T, U]) -> T:
+    return p.first
+
+# get_second[T, U] - Get the second element of a Pair
+def get_second[T, U](p: Pair[T, U]) -> U:
+    return p.second
+
+# unbox[T] - Extract value from a Box
+def unbox[T](b: Box[T]) -> T:
+    return b.value
+
+# sum_triple[T] - Sum all three elements (works with numeric types)
+# Note: This is a specialized version for i64 since we need + operator
+def sum_triple_i64(t: Triple[i64]) -> i64:
+    return t.a + t.b + t.c
+
+def sum_triple_f32(t: Triple[f32]) -> f32:
+    return t.a + t.b + t.c
+
+# ============================================================================
+# Main Function - Demonstrates Generic Types and Functions
+# ============================================================================
+
+def main() -> i32:
+    println!("Generics Demo - Parametric Polymorphism")
+    println!("========================================")
+    println!("")
+
+    # --- Generic identity function ---
+    println!("1. Generic identity[T] Function")
+    let int_id: i64 = identity(42)
+    let float_id: f32 = identity(3.14)
+    let bool_id: bool = identity(True)
+    println!("   identity[i64](42) = {int_id}")
+    println!("   identity[f32](3.14) = {float_id}")
+    if bool_id:
+        println!("   identity[bool](True) = True")
+    else:
+        println!("   identity[bool](True) = False")
+    println!("")
+
+    # --- Generic Pair functions ---
+    println!("2. Generic Pair Functions")
+    # Create separate pairs since get_first/get_second consume the pair
+    let my_pair1: Pair[i64, f32] = Pair { first: 10, second: 2.5 }
+    let my_pair2: Pair[i64, f32] = Pair { first: 10, second: 2.5 }
+    let p_first: i64 = get_first(my_pair1)
+    let p_second: f32 = get_second(my_pair2)
+    println!("   Pair {{ first: 10, second: 2.5 }}")
+    println!("   get_first[i64, f32](pair) = {p_first}")
+    println!("   get_second[i64, f32](pair) = {p_second}")
+    println!("")
+
+    # --- Generic Box functions ---
+    println!("3. Generic Box Functions")
+    let boxed_int: Box[i64] = Box { value: 100 }
+    let boxed_float: Box[f32] = Box { value: 9.81 }
+    let unboxed_int: i64 = unbox(boxed_int)
+    let unboxed_float: f32 = unbox(boxed_float)
+    println!("   Box[i64] {{ value: 100 }} then unbox = {unboxed_int}")
+    println!("   Box[f32] {{ value: 9.81 }} then unbox = {unboxed_float}")
+    println!("")
+
+    # --- Generic Triple with type-specific sum ---
+    println!("4. Generic Triple Struct")
+    let int_triple: Triple[i64] = Triple { a: 1, b: 2, c: 3 }
+    let float_triple: Triple[f32] = Triple { a: 1.5, b: 2.5, c: 3.0 }
+    let int_sum: i64 = sum_triple_i64(int_triple)
+    let float_sum: f32 = sum_triple_f32(float_triple)
+    println!("   Triple[i64] {{ a: 1, b: 2, c: 3 }}")
+    println!("   sum = {int_sum}")
+    println!("   Triple[f32] {{ a: 1.5, b: 2.5, c: 3.0 }}")
+    println!("   sum = {float_sum}")
+    println!("")
+
+    # --- Multiple instantiations of same generic ---
+    println!("5. Multiple Instantiations")
+    # Create pairs - need duplicates since get_first/get_second consume the pair
+    let pair_int_int1: Pair[i64, i64] = Pair { first: 1, second: 2 }
+    let pair_int_int2: Pair[i64, i64] = Pair { first: 1, second: 2 }
+    let pair_float_float1: Pair[f32, f32] = Pair { first: 1.1, second: 2.2 }
+    let pair_float_float2: Pair[f32, f32] = Pair { first: 1.1, second: 2.2 }
+    let pair_bool_int: Pair[bool, i64] = Pair { first: True, second: 42 }
+    let ii1: i64 = get_first(pair_int_int1)
+    let ii2: i64 = get_second(pair_int_int2)
+    let ff1: f32 = get_first(pair_float_float1)
+    let ff2: f32 = get_second(pair_float_float2)
+    let bi2: i64 = get_second(pair_bool_int)
+    println!("   Pair[i64, i64]: ({ii1}, {ii2})")
+    println!("   Pair[f32, f32]: ({ff1}, {ff2})")
+    println!("   Pair[bool, i64]: (True, {bi2})")
+    println!("")
+
+    # --- Summary ---
+    println!("Summary:")
+    println!("   - Generic functions: identity[T], get_first[T,U], get_second[T,U]")
+    println!("   - Generic structs: Pair[T,U], Box[T], Triple[T]")
+    println!("   - Same function works with i64, f32, bool types")
+    println!("   - Each call site infers type arguments automatically")
+    println!("   - Monomorphization creates specialized versions:")
+    println!("     * identity__i64, identity__f32, identity__bool")
+    println!("     * get_first__i64__f32, get_second__i64__f32")
+    println!("     * unbox__i64, unbox__f32")
+    println!("   - All resolved at compile time, no runtime overhead!")
+    println!("")
+
+    println!("Generics demo complete!")
+    return 0

@@ -1,0 +1,98 @@
+# Allow-list for everything AXYON publishes (#2532). Read by check-public-tree.sh,
+# which ships with it in the public repo (scripts/) and runs there in CI and
+# before every publish from the private repo.
+#
+# Sections:
+#   [tree]     paths of the public git repository (axyon-lang/axyon-releases)
+#   [archive]  members of a release archive, relative to its top directory
+#              axyon-<version>-<triple>/
+#   [assets]   files attached to a GitHub release
+#   [content]  extended regexes that must not appear in any text file of the tree
+#
+# `+ GLOB` allows, `- GLOB` denies, `- GLOB unless GLOB` denies except where the
+# second glob matches. A deny always wins over an allow, and every file must be
+# allowed: a path matching no `+` rule fails. Globs: `*` and `?` stay inside one
+# path component, `**/` spans any number of directories, `**` at the end matches
+# everything below. Directories need no rule (only files and symlinks are checked).
+#
+# Never widen [tree] to compiler source, design docs, perf studies, dev-loop
+# material or internal scripts. The private repo's copy is the source of truth.
+
+[tree]
++ README.md
+# Terms and notices from copy-licenses.sh.
++ LICENSE
++ LICENSE-BINARY
++ THIRD-PARTY-NOTICES
++ LICENSES/**
++ install.sh
++ .gitignore
++ docs/book.toml
++ docs/src/**/*.md
++ examples/*/axyon.toml
++ examples/*/**/axyon.toml
++ examples/*/README.md
++ examples/*/**/*.axpy
++ examples/*/.compile-only
++ examples/*/.requires-cuda-device
++ examples/*/.requires-rocm-device
++ examples/*/.requires-device
++ examples/*/.x86-64-only
++ .github/ISSUE_TEMPLATE/*.yml
++ .github/workflows/public-tree-guard.yml
++ .github/workflows/docs.yml
++ scripts/check-public-tree.sh
++ scripts/public-tree-allowlist.txt
+- **/*.rs
+- **/Cargo.toml
+- **/Cargo.lock
+- **/*.axpy unless examples/**
+- docs/src/development/**
+- **/design/**
+- **/.dev-loop/**
+- **/*.debug
+- **/*.build-id
+- **/*.key
+- **/*.pem
+
+[archive]
++ RELEASE
++ bin/axyon
++ bin/axyon-ls
++ bin/axyon-launch
++ lib/axyon/sysroot/**
++ lib/axyon/runtime/libaxyon_rt.a
++ lib/axyon/llvm/**
++ share/axyon/stdlib-src/**
++ share/axyon/licenses/**
+- **/*.rs
+- **/Cargo.toml
+- **/Cargo.lock
+- **/*.debug
+- **/*.build-id
+- **/BUILD_INFO
+- **/.dev-loop/**
+- **/*.axpy unless share/axyon/stdlib-src/**
+- **/*.key
+- **/*.pem
+
+[assets]
++ axyon-*.tar.gz
++ SHA256SUMS
++ SHA256SUMS.minisig
++ install.sh
+
+[content]
+# Private-tree locations. (The guard's own two files are not content-scanned.)
+- \.dev-loop/
+- docs/src/development/
+- development/design/
+- scripts/agents/
+# Compiler source layout (the same rule audit-release-binary.sh applies to binaries),
+# except crates.io URLs (`https://crates.io/crates/<name>/...`), which the
+# verbatim third-party notices under LICENSES/ cite (#3584). POSIX ERE (no
+# look-behind): prepare-public-tree.sh runs these patterns through `grep -E`.
+- (^|[^/]|(^|[^o])/|(^|[^i])o/|(^|[^.])io/)crates/[A-Za-z0-9_-]+/
+# Signing secrets.
+- -----BEGIN [A-Z ]*PRIVATE KEY-----
+- untrusted comment: minisign (encrypted )?secret key

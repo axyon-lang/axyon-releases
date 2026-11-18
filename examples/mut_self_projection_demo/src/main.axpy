@@ -1,0 +1,48 @@
+# `mut self` method calls on index and dereference projections (issue #2154).
+#
+# `self.slots[i].take()`, `a[i].take()` and `(*p).next.take()` pass the
+# address of the projected place to the callee, so `take` mutates the original
+# element in place. A receiver without storage (a tuple element, a `Vec`
+# subscript with a computed index such as `v[f(&mut v)]`, a temporary) is
+# rejected with a spanned diagnostic: bind it to a `let mut` local first.
+
+struct Slot:
+    v: i64
+
+impl Slot:
+    def take(mut self) -> i64:
+        let old: i64 = self.v
+        self.v = 0
+        return old
+
+struct Table:
+    slots: Vec[Slot]
+
+impl Table:
+    def take_at(mut self, i: usize) -> i64:
+        return self.slots[i].take()
+
+struct Node:
+    next: Slot
+
+def detach(p: ref_mut[Node]) -> i64:
+    return (*p).next.take()
+
+def main() -> i32:
+    let mut slots: Vec[Slot] = Vec.new()
+    slots.push(Slot { v: 7 })
+    slots.push(Slot { v: 9 })
+    let mut t: Table = Table { slots: slots }
+    let first: i64 = t.take_at(1)
+
+    let mut arr: Array[Slot; 2] = [Slot { v: 3 }, Slot { v: 4 }]
+    let second: i64 = arr[0].take()
+
+    let mut n: Node = Node { next: Slot { v: 5 } }
+    let third: i64 = detach(ref_mut(n))
+
+    let ok: bool = first == 9 and second == 3 and third == 5 and t.slots[1].v == 0 and t.slots[0].v == 7 and arr[0].v == 0 and arr[1].v == 4 and n.next.v == 0
+    if not ok:
+        return 1
+    println!("projection receivers ok: {first} {second} {third}")
+    return 0

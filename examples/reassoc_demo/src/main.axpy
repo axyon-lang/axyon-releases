@@ -1,0 +1,27 @@
+# fast_math = "reassoc": a float sum loop LLVM may reorder (and so vectorize).
+#
+# Reassociation changes which rounding errors occur, so the result can differ
+# from strict left-to-right order. This demo checks it stays within a stated
+# tolerance of the closed form sum(i * 0.5) = 0.25 * n * (n - 1):
+#   relative error < 1e-9 for n = 100000.
+# Nothing here is bit-exact; the same program built with `--fast-math off` must
+# also pass, so compare modes with:
+#   axyon run --fast-math off
+#   axyon run                    # uses fast_math = "reassoc" from axyon.toml
+# NaN, infinity and signed zero are not assumed absent in `reassoc`, but
+# reordering can still change intermediate overflow and cancellation, so never
+# expect a fixed error bound on arbitrary data.
+import axyon.debug as D
+
+def main() -> i32:
+    let n: i64 = 100000
+    let mut s: f64 = 0.0
+    for i: i64 in range(n):
+        s = s + (i as f64) * 0.5
+    let exact: f64 = 2499975000.0
+    let rel: f64 = (s - exact) / exact
+    if rel < 0.000000001 and rel > -0.000000001:
+        D.println("reassoc sum within tolerance")
+        return 0
+    D.println("reassoc sum out of tolerance")
+    return 1

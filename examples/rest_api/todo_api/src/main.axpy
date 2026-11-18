@@ -1,0 +1,75 @@
+# todo_api: an in-memory CRUD todo service on the `http` package (#3523).
+#
+#   axyon run -- 8080          # port as the first argument
+#   TODO_API_PORT=8080 axyon run
+#   axyon run -- --self-test   # CRUD checks over loopback TCP, then exit
+#
+# Serves on 127.0.0.1 until killed. See ../README.md for the routes.
+
+from std.core import Option, Some, None_
+from std.env import argc, arg, var, VarStatus
+from std.net import SocketAddr, TcpListener
+from std.strconv import parse_u64
+from http.request import Limits, default_limits
+from http.router import Router
+from http.server import serve
+from todos import Store, new_store, build_router
+from checks import self_test
+
+# Parse a TCP port (1..65535).
+def parse_port(text: Slice[u8]) -> Option[u16]:
+    match parse_u64(text):
+        Ok(n) =>
+            if n == 0 or n > 65535 or text[0] == 43:
+                return Option.None_
+            return Some(n as u16)
+        Err(e) => return Option.None_
+
+# The port from the first argument, else from TODO_API_PORT.
+def port_setting() -> Option[Vec[u8]]:
+    if argc() > 1:
+        let a: String = arg(1)
+        let mut bytes: Vec[u8] = Vec.new()
+        for i: usize in range(0, a.len()):
+            bytes.push(a.as_bytes()[i])
+        return Some(bytes)
+    let mut value: Vec[u8] = Vec.new()
+    let name: String = "TODO_API_PORT"
+    if var(name.as_bytes(), &mut value) == VarStatus.Ok:
+        return Some(value)
+    return Option.None_
+
+def main() -> i32:
+    if argc() > 1:
+        let first: String = arg(1)
+        if first == "--self-test":
+            let failures: i32 = self_test()
+            if failures != 0:
+                return 1
+            println!("todo_api self-test passed")
+            return 0
+    let mut port: u16 = 0
+    match port_setting():
+        Some(text) =>
+            match parse_port(text.as_slice()):
+                Some(p) => port = p
+                None_ =>
+                    eprintln!("todo_api: invalid port (expected 1..65535)")
+                    return 2
+        None_ =>
+            eprintln!("usage: todo_api PORT   (or set TODO_API_PORT)")
+            return 2
+    # Workaround (#3546): `let listener = match ...` cannot have an arm that
+    # returns, so a placeholder is assigned from the arms.
+    let mut listener: TcpListener = TcpListener { handle: -1 }
+    match TcpListener.bind(SocketAddr.new(127, 0, 0, 1, port)):
+        Ok(l) => listener = l
+        Err(e) =>
+            eprintln!("todo_api: cannot listen on 127.0.0.1:{port}")
+            return 1
+    println!("todo_api listening on http://127.0.0.1:{port}")
+    let router: Router[Store] = build_router()
+    let mut store: Store = new_store()
+    let limits: Limits = default_limits()
+    serve(&listener, &router, &mut store, &limits)
+    return 0

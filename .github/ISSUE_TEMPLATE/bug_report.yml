@@ -1,0 +1,54 @@
+name: Bug report
+description: Report a compiler crash, a wrong result, a bad diagnostic or an installer problem.
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please do not paste proprietary code, credentials or secrets.
+        Reduce the program to the smallest one that still shows the problem.
+  - type: input
+    id: version
+    attributes:
+      label: AXYON version
+      description: Output of `axyon --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux x86_64
+        - Linux aarch64
+        - macOS (Apple silicon)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version
+      placeholder: Ubuntu 24.04, macOS 15.2, ...
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The source (`.axpy`), the `axyon.toml` if relevant, and the exact command.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Full compiler output, including diagnostic codes such as `AX0123`.
+      render: text
+    validations:
+      required: true

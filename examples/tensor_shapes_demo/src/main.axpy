@@ -1,0 +1,27 @@
+# Tensor Shapes Example for AXYON
+# Demonstrates compile-time tensor shape checking (AX0591).
+#
+# Shapes are part of a tensor's type. Element-wise operands must be broadcast-compatible
+# (right-aligned extents equal or `1`; `+ - * /` broadcast), `matmul` inner
+# dimensions must match, and `?` marks a dimension known only at runtime.
+# Uncommenting the lines marked "rejected" produces a compile-time error.
+
+import std.tensor as T
+
+def main() -> i32:
+    println!("Tensor Shapes Example")
+
+    let a: Tensor[f32, (4,)] = T.zeros([4])
+    let b: Tensor[f32, (4,)] = T.ones([4])
+
+    # OK: identical shapes; the result shape is inferred as (4,).
+    let c: Tensor[f32, (4,)] = T.add(a, b)
+
+    # `?` dimensions are never rejected statically (checked at runtime).
+    let d: Tensor[f32, (?,)] = T.ones([4])
+
+    # rejected (AX0591): shapes (4,) and (5,) are incompatible
+    # let bad: Tensor[f32, (4,)] = a + T.zeros([5])
+
+    println!("Shapes checked at compile time")
+    return 0

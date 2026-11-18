@@ -1,0 +1,16 @@
+# `var` is an alternative spelling of `let mut` (#3563).
+#
+# Both declare a mutable local; neither is canonical and `axyon fmt` never
+# rewrites one into the other. `var` is contextual: it stays an ordinary
+# identifier anywhere but the start of a binding.
+
+def main() -> i32:
+    var a: i64 = 1
+    let mut b: i64 = 1
+    a = a + 41
+    b = b + 41
+    assert!(a == b, "both spellings declare the same mutable binding")
+    var c = a + 1
+    c = c * 2
+    println!("a = {a}, c = {c}")
+    return 0

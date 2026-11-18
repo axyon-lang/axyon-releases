@@ -1,0 +1,35 @@
+# Structured logging end to end: events, a nested span and every field type (#1688).
+#
+# Records are diagnostics on stderr; `println!` is program output on stdout.
+#
+#   AXYON_LOG=debug axyon run                      # text records
+#   AXYON_LOG=debug AXYON_LOG_FORMAT=json axyon run
+#   axyon run --release                            # debug!/trace! are compiled out
+#
+# Field types: bool, signed and unsigned integers, f32/f64, String/str.
+
+import std.log as log
+
+def fetch(id: i32) -> i32:
+    # Inner span: events inside carry `span=request>fetch` and both spans' fields.
+    with span!("fetch", id=id, table="users"):
+        debug!("cache miss", cost=1.5)
+        return id * 2
+
+def request(id: i32) -> i32:
+    let _span: log.Span = span!("request", id=id)
+    info!("parsed", ok=true)
+    return fetch(id)
+
+def main() -> i32:
+    let name: String = String.from("primary db")
+    let attempt: i32 = 2
+    let big: u64 = 18446744073709551615
+    let small: i8 = -7
+    let ratio: f32 = 0.5
+    info!("every field type", flag=true, signed=small, unsigned=big, f=ratio, g=12.25, s="text", owned=name)
+    warn!("retrying {attempt} of 5", backend=name)
+    trace!("below debug", n=attempt)
+    let r: i32 = request(21)
+    println!("result={r}")
+    return 0

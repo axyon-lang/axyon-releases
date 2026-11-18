@@ -1,0 +1,192 @@
+# The todo resource: an in-memory store, its JSON form and the CRUD
+# handlers, wired to routes by `build_router`.
+#
+#   GET    /todos       200, array of todos
+#   GET    /todos/:id   200, the todo; 404 when unknown
+#   POST   /todos       201, the created todo; 400 on an invalid body
+#   PUT    /todos/:id   200, the replaced todo; 400 or 404
+#   DELETE /todos/:id   204; 404 when unknown
+#
+# A todo body is a JSON object with a non-empty string `title` and an
+# optional boolean `done` (false when absent); other members are ignored.
+
+from std.core import Result, Ok, Err, Option, Some, None_
+from std.strconv import parse_u64
+from http.json import Json, JsonError, Member, JsonDecoded, member, find, decode_value
+from http.request import Request
+from http.response import Response, json_response, error_response, with_header
+from http.router import Router, Param, param
+
+@public
+struct Todo:
+    @public
+    id: i64
+    @public
+    title: String
+    @public
+    done: bool
+
+@public
+struct Store:
+    @public
+    todos: Vec[Todo]
+    @public
+    next_id: i64
+
+@public
+def new_store() -> Store:
+    return Store { todos: Vec.new(), next_id: 1 }
+
+# The fields a POST or PUT body supplies.
+struct TodoInput:
+    title: String
+    done: bool
+
+def todo_json(t: &Todo) -> Json:
+    let mut members: Vec[Member] = Vec.new()
+    members.push(member("id", Json.Num(t.id as f64)))
+    members.push(member("title", Json.Str(t.title.clone())))
+    members.push(member("done", Json.Bool(t.done)))
+    return Json.Obj(members)
+
+# Validate a request body as a todo.
+def parse_input(body: Slice[u8]) -> Result[TodoInput, String]:
+    let decoded: JsonDecoded = decode_value(body)
+    let failure: &Option[JsonError] = &decoded.error
+    match failure:
+        Some(e) =>
+            let message: &String = &e.message
+            return Err(format!("invalid JSON: {message}"))
+        None_ => pass
+    let value: &Json = &decoded.value
+    match value:
+        case Json.Obj(members=members):
+            let mut title: String = String.new()
+            match find(members, "title"):
+                Some(i) =>
+                    # Workaround (#3536): `match &expr:` does not
+                    # parse, so the reference is bound first.
+                    let v: &Json = &members[i].value
+                    match v:
+                        case Json.Str(value=s):
+                            title = s.clone()
+                        case _:
+                            return Err("`title` must be a string")
+                None_ => return Err("`title` is required")
+            if title.len() == 0:
+                return Err("`title` must not be empty")
+            let mut done: bool = False
+            match find(members, "done"):
+                Some(i) =>
+                    let v: &Json = &members[i].value
+                    match v:
+                        case Json.Bool(value=b):
+                            done = *b
+                        case _:
+                            return Err("`done` must be a boolean")
+                None_ => pass
+            return Ok(TodoInput { title: title, done: done })
+        case _:
+            return Err("the body must be a JSON object")
+
+# The `:id` parameter as a todo id: a positive decimal integer.
+def id_param(params: &Vec[Param]) -> Option[i64]:
+    match param(params, "id"):
+        Some(text) =>
+            match parse_u64(text.as_bytes()):
+                Ok(n) =>
+                    # parse_u64 accepts a leading `+`; ids are digits only.
+                    if text.as_bytes()[0] == 43 or n == 0 or n > 9007199254740991:
+                        return Option.None_
+                    return Some(n as i64)
+                Err(e) => return Option.None_
+        None_ => return Option.None_
+
+def index_of(store: &Store, id: i64) -> Option[usize]:
+    for i: usize in range(0, store.todos.len()):
+        if store.todos[i].id == id:
+            return Some(i)
+    return Option.None_
+
+# Remove `store.todos[index]`, keeping the order of the others.
+# Workaround (#3549): `Vec` has no `remove(i)`, so the later
+# elements shift down one place and the last one is popped (through the
+# owning struct: `pop` on a `&mut Vec` parameter is rejected, #879).
+def remove_at(store: &mut Store, index: usize) -> unit:
+    for i: usize in range(index, store.todos.len() - 1):
+        store.todos[i] = Todo { id: store.todos[i + 1].id, title: store.todos[i + 1].title.clone(), done: store.todos[i + 1].done }
+    let _removed: Todo = store.todos.pop()
+
+def not_found() -> Response:
+    return error_response(404, "no todo with this id")
+
+@public
+def list_todos(store: &mut Store, request: &Request, params: &Vec[Param]) -> Result[Response, String]:
+    let mut items: Vec[Json] = Vec.new()
+    for i: usize in range(0, store.todos.len()):
+        items.push(todo_json(&store.todos[i]))
+    let body: Json = Json.Arr(items)
+    return Ok(json_response(200, &body))
+
+@public
+def get_todo(store: &mut Store, request: &Request, params: &Vec[Param]) -> Result[Response, String]:
+    match id_param(params):
+        Some(id) =>
+            match index_of(store, id):
+                Some(i) =>
+                    let body: Json = todo_json(&store.todos[i])
+                    return Ok(json_response(200, &body))
+                None_ => return Ok(not_found())
+        None_ => return Ok(not_found())
+
+@public
+def create_todo(store: &mut Store, request: &Request, params: &Vec[Param]) -> Result[Response, String]:
+    match parse_input(request.body.as_slice()):
+        Ok(input) =>
+            let id: i64 = store.next_id
+            store.next_id = store.next_id + 1
+            let todo: Todo = Todo { id: id, title: input.title, done: input.done }
+            let body: Json = todo_json(&todo)
+            store.todos.push(todo)
+            let location: String = format!("/todos/{id}")
+            return Ok(with_header(json_response(201, &body), "Location", location))
+        Err(message) => return Ok(error_response(400, message))
+
+@public
+def update_todo(store: &mut Store, request: &Request, params: &Vec[Param]) -> Result[Response, String]:
+    let mut index: usize = 0
+    match id_param(params):
+        Some(id) =>
+            match index_of(store, id):
+                Some(i) => index = i
+                None_ => return Ok(not_found())
+        None_ => return Ok(not_found())
+    match parse_input(request.body.as_slice()):
+        Ok(input) =>
+            let id: i64 = store.todos[index].id
+            store.todos[index] = Todo { id: id, title: input.title, done: input.done }
+            let body: Json = todo_json(&store.todos[index])
+            return Ok(json_response(200, &body))
+        Err(message) => return Ok(error_response(400, message))
+
+@public
+def delete_todo(store: &mut Store, request: &Request, params: &Vec[Param]) -> Result[Response, String]:
+    match id_param(params):
+        Some(id) =>
+            match index_of(store, id):
+                Some(i) =>
+                    remove_at(store, i)
+                    return Ok(Response.new(204))
+                None_ => return Ok(not_found())
+        None_ => return Ok(not_found())
+
+# The todo API's routes.
+@public
+def build_router() -> Router[Store]:
+    let mut router: Router[Store] = Router.new()
+    router.add("GET", "/todos", list_todos)
+    router.add("POST", "/todos", create_todo)
+    router.add("GET", "/todos/:id", get_todo)
+    router.add("PUT", "/todos/:id", update_todo)
+    router.add("DELETE", "/todos/:id", delete_todo)
+    return router

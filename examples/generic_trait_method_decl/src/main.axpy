@@ -1,0 +1,37 @@
+# Generic trait methods (#2787, #2880). A trait may declare methods with their
+# own type parameters, required or defaulted. An impl of a concrete type
+# implements one (the parameter names may differ from the trait's) or inherits
+# the default; each type argument instantiates the method once.
+# A generic body calls one through a bounded type parameter (#2881): the
+# method's type arguments are inferred or written explicitly, and may name the
+# body's own type parameters.
+
+trait Mapper:
+    def map[B](self: &Self, k: B) -> B
+
+    def twice[B](self: &Self, k: B) -> i64:
+        return 2
+
+struct Wrapper:
+    v: i64
+
+impl Mapper for Wrapper:
+    def map[C](self: &Self, k: C) -> C:
+        return k
+
+def through_bound[M: Mapper, B](m: M, b: B) -> B:
+    # Explicit method type argument, then one inferred as the body's own `B`.
+    assert!(m.twice[f64](0.5) == 2, "inherited default through a bound")
+    return m.map(b)
+
+def main() -> i32:
+    if through_bound(Wrapper { v: 0 }, 7_i64) != 7:
+        return 4
+    let w: Wrapper = Wrapper { v: 1 }
+    if w.map(3_i32) != 3:
+        return 1
+    if w.map[bool](true) != true:
+        return 2
+    if w.twice(1.5) != 2:
+        return 3
+    return 0

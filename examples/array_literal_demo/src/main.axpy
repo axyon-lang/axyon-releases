@@ -1,0 +1,17 @@
+# Array literals as struct-literal array fields and Vec initializers (#1195).
+struct Grid:
+    cells: Array[i64; 3]
+    tag: i64
+
+def main() -> i32:
+    let g: Grid = Grid { cells: [10, 20, 30], tag: 1 }
+    assert!(g.cells[2] == 30)
+
+    # `let v: Vec[T] = [..]` allocates with capacity and pushes each element.
+    let mut v: Vec[i64] = [1, 2, 3]
+    v.push(4)
+    assert!(v.len() == 4)
+    let head: i64 = g.cells[0]
+    let n: usize = v.len()
+    println!("grid head: {head}, vec len: {n}")
+    return 0

@@ -1,0 +1,9 @@
+# Hello World example for AXYON
+
+def main() -> i32:
+    """Entry point demonstrating debug macros."""
+    println!("Hello, world!")
+    let x: i64 = 42+3
+    println!("x = {x}")
+    assert!(x > 0, "x must be positive")
+    return 0

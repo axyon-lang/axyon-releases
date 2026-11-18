@@ -1,0 +1,70 @@
+# Match Through a Reference Demo for AXYON (issue #954)
+#
+# `match p:` on a shared `ref[Enum]` matches the referent. Each payload
+# binding is a `ref[field]` pointing INTO the referent (never a copy and never
+# a move), so a droppable payload (the `Vec` below) is still owned, and freed
+# exactly once, by its owner. Read a scalar payload with `*x`; `match x`
+# works on an enum payload (this is what makes generic code over
+# `ref[Pair[T]]` work).
+#
+# Not supported (rejected with a spanned diagnostic): an exclusive
+# `ref_mut[..]` scrutinee, and tuple / nested variant sub-patterns through a
+# reference (bind the payload and `match` it in a nested `match`).
+# A user-written `match (*p)` is a different, by-value match.
+
+enum Opt[T]:
+    Nope
+    Has(v: T)
+
+enum Pair[T]:
+    Empty
+    Two(a: Opt[T], b: Opt[T])
+
+enum Many:
+    Nothing
+    Items(v: Vec[i32])
+
+def get(p: ref[Opt[i32]]) -> i32:
+    let mut r: i32 = 0
+    match p:
+        Opt.Has(x) => r = *x
+        Opt.Nope => r = -1
+    return r
+
+def first_is_some[T](p: ref[Pair[T]]) -> bool:
+    let mut r: bool = False
+    match p:
+        Pair.Two(a, b) =>
+            match a:
+                Opt.Has(x) => r = True
+                Opt.Nope => r = False
+        Pair.Empty => r = False
+    return r
+
+def has_items(p: ref[Many]) -> bool:
+    let mut r: bool = False
+    match p:
+        Many.Items(v) => r = True
+        Many.Nothing => r = False
+    return r
+
+@host
+def main() -> i32:
+    let some: Opt[i32] = Opt.Has(7)
+    let none: Opt[i32] = Opt.Nope
+    let a: i32 = get(&some)
+    let b: i32 = get(&none)
+    println!("get(some) = {a}, get(none) = {b}")
+
+    let p1: Opt[i32] = Opt.Has(1)
+    let p2: Opt[i32] = Opt.Nope
+    let pair: Pair[i32] = Pair.Two(p1, p2)
+    if first_is_some(&pair):
+        println!("first is some")
+
+    let mut v: Vec[i32] = Vec.new()
+    v.push(1)
+    let m: Many = Many.Items(v)
+    if has_items(&m):
+        println!("vec payload viewed through a reference, freed once by its owner")
+    return 0

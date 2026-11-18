@@ -1,0 +1,48 @@
+# Vector Module
+#
+# Provides 3D vector type and operations.
+#
+# Usage:
+#   from math.vector import Vec3, dot
+#   # or via re-export:
+#   from modules_demo import Vec3, dot
+
+# A 3D vector with public fields
+@public
+struct Vec3:
+    @public
+    x: f32
+    @public
+    y: f32
+    @public
+    z: f32
+
+# Compute dot product of two vectors
+@public
+def dot(a: Vec3, b: Vec3) -> f32:
+    return a.x * b.x + a.y * b.y + a.z * b.z
+
+# Compute squared length (magnitude squared)
+@public
+def length_squared(v: Vec3) -> f32:
+    return v.x * v.x + v.y * v.y + v.z * v.z
+
+# Add two vectors component-wise
+@public
+def add(a: Vec3, b: Vec3) -> Vec3:
+    return Vec3 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }
+
+# Subtract two vectors component-wise
+@public
+def sub(a: Vec3, b: Vec3) -> Vec3:
+    return Vec3 { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }
+
+# Scale a vector by a scalar
+@public
+def scale(v: Vec3, s: f32) -> Vec3:
+    return Vec3 { x: v.x * s, y: v.y * s, z: v.z * s }
+
+# Private helper - not exported
+def _zero_check(v: Vec3) -> bool:
+    let len_sq: f32 = length_squared(v)
+    return len_sq < 0.0001

@@ -1,0 +1,76 @@
+# std.concurrent thread spawn (#1361): OS threads through the runtime.
+#
+# `spawn(f)` runs a `fn() -> unit` on a new thread and returns a `JoinHandle`;
+# `spawn_with(f, data)` also hands the thread a raw data pointer. Three threads
+# bump a counter under a `Mutex`, then two producer threads feed a channel that
+# the main thread drains.
+from std.concurrent import (
+    spawn, spawn_with, JoinHandle, JoinResult, Mutex, mutex_lock,
+    Channel, Sender, Receiver, channel, CHANNEL_OK,
+)
+
+struct Shared:
+    lock: Mutex[i64]
+    counter: i64
+
+# Thread body: 1000 increments of `Shared.counter`, each under the lock.
+def count(data: ptr_mut[u8]) -> unit:
+    unsafe:
+        let sp: ptr_mut[Shared] = data as ptr_mut[Shared]
+        for i: i64 in range(1000):
+            let m: ref_mut[Mutex[i64]] = ref_mut((*sp).lock)
+            let _g = mutex_lock(m)
+            (*sp).counter = (*sp).counter + 1_i64
+
+# Thread body: send 0..9 on the channel behind `data`.
+def produce(data: ptr_mut[u8]) -> unit:
+    unsafe:
+        let tx: ptr_mut[Sender[i64]] = data as ptr_mut[Sender[i64]]
+        let s: Sender[i64] = *tx
+        for i: i64 in range(10):
+            let _rc: i64 = s.send(i)
+
+def hello() -> unit:
+    println!("hello from a spawned thread")
+
+@host
+def main() -> i32:
+    let h: JoinHandle[unit] = spawn(hello)
+    let _r: JoinResult = h.join()
+
+    unsafe:
+        let raw: ptr_mut[u8] = global_alloc_zeroed(size_of[Shared](), align_of[Shared]())
+        let sp: ptr_mut[Shared] = raw as ptr_mut[Shared]
+        *sp = Shared { lock: Mutex.new(0_i64), counter: 0_i64 }
+        let h1: JoinHandle[unit] = spawn_with(count, raw)
+        let h2: JoinHandle[unit] = spawn_with(count, raw)
+        let h3: JoinHandle[unit] = spawn_with(count, raw)
+        let _a: JoinResult = h1.join()
+        let _b: JoinResult = h2.join()
+        let _c: JoinResult = h3.join()
+        let total: i64 = (*sp).counter
+        println!("counter={total}")
+        global_dealloc(raw, size_of[Shared](), align_of[Shared]())
+
+        let ch: Channel[i64] = channel[i64]()
+        let rx: Receiver[i64] = ch.receiver()
+        # A `Sender` is one `i64` handle: 8 bytes, 8-aligned.
+        let cell: ptr_mut[u8] = global_alloc_zeroed(8, 8)
+        let cp: ptr_mut[Sender[i64]] = cell as ptr_mut[Sender[i64]]
+        *cp = ch.sender()
+        let p1: JoinHandle[unit] = spawn_with(produce, cell)
+        let p2: JoinHandle[unit] = spawn_with(produce, cell)
+        let out: ptr_mut[u8] = global_alloc_zeroed(8, 8)
+        let mut sum: i64 = 0_i64
+        for k: i64 in range(20):
+            let slot: ptr_mut[i64] = out as ptr_mut[i64]
+            let rc: i64 = rx.recv(slot)
+            if rc == CHANNEL_OK:
+                let got: i64 = *slot
+                sum = sum + got
+        let _d: JoinResult = p1.join()
+        let _e: JoinResult = p2.join()
+        println!("sum={sum}")
+        global_dealloc(out, 8, 8)
+        global_dealloc(cell, 8, 8)
+    return 0

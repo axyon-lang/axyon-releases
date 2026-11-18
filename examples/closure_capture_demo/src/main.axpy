@@ -1,0 +1,29 @@
+# Capturing closures passed to `spawn` (#171).
+# A zero-parameter lambda handed directly to `spawn` may capture variables from
+# the enclosing scope. Each capture is MOVED into the closure by value:
+#   * Copy values (i32, bool, ...) are simply copied;
+#   * owning values (String, ...) transfer ownership, so using them after the
+#     `spawn` call is a use-after-move error.
+# Captures must be parameters or `let` bindings with a known (annotated or inferred) type.
+
+@host
+def spawn[T](f: fn() -> T) -> T:
+    """Run a closure. (The stdlib `spawn` is still a stub; this one runs `f`.)"""
+    return f()
+
+@host
+def main() -> i32:
+    """Entry point demonstrating by-value capture."""
+    let base: i32 = 40
+    let bump: i32 = 2
+    # Captures `base` and `bump` by value.
+    let total: i32 = spawn[i32](lambda: base + bump)
+    println!("total = {total}")
+
+    # Capturing an owning value moves it into the closure.
+    let name: String = string_new()
+    let moved: String = spawn[String](lambda: name)
+    # Using `name` here would be rejected: it was moved into the closure.
+
+    assert!(total == 42, "40 + 2 should be 42")
+    return 0_i32

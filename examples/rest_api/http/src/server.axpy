@@ -1,0 +1,115 @@
+# A blocking HTTP/1.1 server on `std.net.TcpListener`: one connection at a
+# time, one request per connection (`Connection: close`).
+#
+# `read_request` reads until the head is complete, then until the
+# `Content-Length` body is, enforcing the size limits as bytes arrive.
+# `serve_one` accepts a single connection and answers it; `serve` loops over
+# `serve_one`. A request that cannot be parsed is answered with its error
+# status (400, 413, 431, 501, 505) and a JSON `{"error": ...}` body.
+#
+# Sockets have no timeouts yet (std.net), so a client that stops sending
+# mid-request blocks the server.
+
+from std.core import Result, Ok, Err, Option, Some, None_
+from std.io_core import IoError
+from std.net import TcpListener, TcpStream
+from .request import Limits, Request, Head, HttpError, http_error, empty_request, find_head_end, parse_head
+from .response import Response, error_response, serialize
+from .router import Router
+
+# Bytes read from the socket per `read` call.
+const CHUNK: usize = 4096
+
+# Read one request from `stream`.
+@public
+def read_request(stream: &TcpStream, limits: &Limits) -> Result[Request, HttpError]:
+    let mut buf: Vec[u8] = Vec.new()
+    let mut chunk: Vec[u8] = Vec.zeroed(CHUNK)
+    let mut head_end: usize = 0
+    let mut content_length: usize = 0
+    let mut head: Option[Head] = Option.None_
+    while True:
+        # Done once the head is parsed and the whole body has arrived.
+        if head_end > 0 and buf.len() >= head_end + content_length:
+            break
+        let mut n: usize = 0
+        match stream.read(chunk.as_mut_slice()):
+            Ok(k) => n = k
+            Err(e) => return Err(http_error(400, "failed to read the request"))
+        if n == 0:
+            return Err(http_error(400, "connection closed before the request was complete"))
+        for i: usize in range(0, n):
+            buf.push(chunk[i])
+        if head_end == 0:
+            match find_head_end(buf.as_slice()):
+                Some(e) => head_end = e
+                None_ => pass
+            if head_end == 0 and buf.len() > limits.max_head_bytes:
+                return Err(http_error(431, "request head too large"))
+            if head_end > limits.max_head_bytes:
+                return Err(http_error(431, "request head too large"))
+            if head_end > 0:
+                match parse_head(buf.as_slice(), head_end, limits):
+                    Ok(h) =>
+                        content_length = h.content_length
+                        head = Some(h)
+                    Err(e) => return Err(e)
+    match head:
+        Some(h) =>
+            let mut request: Request = h.request
+            for i: usize in range(head_end, head_end + content_length):
+                request.body.push(buf[i])
+            return Ok(request)
+        None_ => return Err(http_error(400, "incomplete request head"))
+
+# Write all of `bytes` to `stream`.
+# (Named `send_all`, not `write_all`: when a generic function of this
+# package is instantiated in a dependent package, a call to a `write_all`
+# here binds to std.io_core's generic `write_all` instead, an internal
+# compiler error, #3541.)
+@public
+def send_all(stream: &TcpStream, bytes: Slice[u8]) -> Result[unit, IoError]:
+    let mut sent: usize = 0
+    while sent < bytes.len():
+        match stream.write(bytes.slice(sent, bytes.len())):
+            Ok(n) => sent = sent + n
+            Err(e) => return Err(e)
+    return Ok(())
+
+# Read a request from `stream`, route it and write the response. Returns the
+# response status.
+@public
+def handle_connection[S](stream: &TcpStream, router: &Router[S], state: &mut S, limits: &Limits) -> Result[u16, IoError]:
+    # Workaround (#3540): a match-bound `request`
+    # passed to `router.dispatch` inside this generic body is rejected at
+    # monomorphization (AX0815), so the request is moved into a `let` first.
+    let mut request: Request = empty_request()
+    let mut failure: Option[HttpError] = Option.None_
+    match read_request(stream, limits):
+        Ok(r) => request = r
+        Err(e) => failure = Some(e)
+    let mut response: Response = Response.new(500)
+    match failure:
+        Some(e) => response = error_response(e.status, e.message)
+        None_ => response = router.dispatch(state, &request)
+    let bytes: Vec[u8] = serialize(&response)
+    send_all(stream, bytes.as_slice())?
+    return Ok(response.status)
+
+# Accept one connection on `listener`, answer it and close it. Returns the
+# response status.
+@public
+def serve_one[S](listener: &TcpListener, router: &Router[S], state: &mut S, limits: &Limits) -> Result[u16, IoError]:
+    let stream: TcpStream = listener.accept()?
+    let result: Result[u16, IoError] = handle_connection(&stream, router, state, limits)
+    let _closed: Result[unit, IoError] = stream.close()
+    return result
+
+# Serve connections forever, one at a time. A failed connection is logged to
+# stderr and does not stop the server.
+@public
+def serve[S](listener: &TcpListener, router: &Router[S], state: &mut S, limits: &Limits) -> unit:
+    while True:
+        match serve_one(listener, router, state, limits):
+            Ok(status) => pass
+            Err(e) => warn!("connection failed")

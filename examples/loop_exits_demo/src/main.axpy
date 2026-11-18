@@ -1,0 +1,46 @@
+# `break`, `continue` and early `return` inside `for`/`while` loops.
+
+def make() -> Vec[i64]:
+    let mut xs: Vec[i64] = Vec.new()
+    for i: i64 in range(6):
+        xs.push(i * 2 + 1)
+    return xs
+
+# Early `return` from a loop; the Vec parameter is dropped on both exits.
+def find(xs: Vec[i64], v: i64) -> i64:
+    for i: i64 in range(xs.len() as i64):
+        if xs[i as usize] == v:
+            return i
+    return -1
+
+def sum_odd_until(limit: i64) -> i64:
+    let mut s: i64 = 0
+    for i: i64 in range(100):
+        if i % 2 == 0:
+            continue
+        if i > limit:
+            break
+        s += i
+    return s
+
+# `break` only leaves the inner loop.
+def inner_break() -> i64:
+    let mut c: i64 = 0
+    for i: i64 in range(4):
+        for j: i64 in range(4):
+            if j == 2:
+                break
+            c += 1
+    return c
+
+def main() -> i32:
+    let a: i64 = find(make(), 7)
+    assert!(a == 3, "find hit")
+    let b: i64 = find(make(), 100)
+    assert!(b == -1, "find miss")
+    let s: i64 = sum_odd_until(7)
+    assert!(s == 16, "sum_odd_until")
+    let c: i64 = inner_break()
+    assert!(c == 8, "inner_break")
+    println!("loop exits ok")
+    return 0

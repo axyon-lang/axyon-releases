@@ -1,0 +1,10 @@
+[package]
+name = "tensor_extent_queries"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true

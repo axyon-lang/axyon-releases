@@ -1,0 +1,104 @@
+# Launch a dependency's CUDA kernels directly (issue #2663).
+#
+# `saxpy` and `square_plus` are `@gpu(entry)` kernels defined in the
+# workspace member `kernels`. This package imports them like any function
+# and launches them with `gpu_launch`; each launch runs the kernel from the
+# device image of `kernels` (`axyon_cuda_kernel_image__kernels`), which the
+# library's object defines and the executable links. `app` defines no kernel
+# of its own, so its module holds no `gpu.module` and no image.
+#
+# The host fills the inputs from a fixed-seed generator, copies them to the
+# device, launches, copies the results back and compares every element with
+# a host reference: exactly for i32 (two's-complement wrapping), and bit for
+# bit for f32 (round to nearest-even, no fused multiply-add). Lanes at and
+# past `n` must keep their sentinels.
+#
+# Without a CUDA device the first device allocation stops the program with
+# an AXYON panic: there is no CPU fallback.
+#
+# Limitation (#2737): dependency functions resolve by bare name, so launch
+# an imported kernel only through `from <its module> import <kernel>`; an
+# import alias (`from kernels import saxpy as s`) is refused with AX0629 at
+# the launch.
+
+from kernels import saxpy, square_plus
+
+const CAP: i64 = 1000
+const BLOCK: i64 = 128
+
+# A fixed-seed linear congruential generator: the same inputs every run.
+def next_seed(s: i64) -> i64:
+    return (s * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+
+def blocks_for(n: i64) -> i64:
+    return (n + BLOCK - 1) / BLOCK
+
+# `saxpy` over the first `n` elements; returns the mismatches.
+def check_saxpy(n: i64, a: f32, seed: i64) -> i64:
+    let mut s: i64 = seed
+    let mut x: Buffer[f32, (1000,)] = buffer_alloc([1000])
+    let mut y: Buffer[f32, (1000,)] = buffer_alloc([1000])
+    let mut want: Buffer[f32, (1000,)] = buffer_alloc([1000])
+    for i: i64 in range(CAP):
+        s = next_seed(s)
+        let xv: f32 = (((s >> 20) & 1048575) - 524288) as f32 / 256.0
+        s = next_seed(s)
+        let yv: f32 = (((s >> 20) & 1048575) - 524288) as f32 / 3.0
+        buffer_set(x, i, xv)
+        buffer_set(y, i, yv)
+        # Lanes past `n` keep their input value.
+        if i < n:
+            buffer_set(want, i, a * xv + yv)
+        else:
+            buffer_set(want, i, yv)
+    let dx: Buffer[f32, (1000,), device_global] = buffer_to_device(x)
+    let mut dy: Buffer[f32, (1000,), device_global] = buffer_to_device(y)
+    gpu_launch(saxpy, blocks_for(n), BLOCK, n, a, &dx, &mut dy)
+    let got: Buffer[f32, (1000,)] = buffer_to_host(dy)
+    let mut bad: i64 = 0
+    for i: i64 in range(CAP):
+        if buffer_get(got, i) != buffer_get(want, i):
+            bad = bad + 1
+    return bad
+
+# `square_plus` over the first `n` elements; returns the mismatches.
+def check_square_plus(n: i64, k: i32, seed: i64) -> i64:
+    let mut s: i64 = seed
+    let mut x: Buffer[i32, (1000,)] = buffer_alloc([1000])
+    let mut out: Buffer[i32, (1000,)] = buffer_alloc([1000])
+    let mut want: Buffer[i32, (1000,)] = buffer_alloc([1000])
+    for i: i64 in range(CAP):
+        s = next_seed(s)
+        let v: i32 = (s >> 17) as i32
+        buffer_set(x, i, v)
+        # A sentinel: lanes at and past `n` must keep it.
+        buffer_set(out, i, -7)
+        if i < n:
+            buffer_set(want, i, v * v + k)
+        else:
+            buffer_set(want, i, -7)
+    let dx: Buffer[i32, (1000,), device_global] = buffer_to_device(x)
+    let mut d_out: Buffer[i32, (1000,), device_global] = buffer_to_device(out)
+    gpu_launch(square_plus, blocks_for(n), BLOCK, n, k, &dx, &mut d_out)
+    let got: Buffer[i32, (1000,)] = buffer_to_host(d_out)
+    let mut bad: i64 = 0
+    for i: i64 in range(CAP):
+        if buffer_get(got, i) != buffer_get(want, i):
+            bad = bad + 1
+    return bad
+
+def main() -> i32:
+    # Zero, one, a non-divisible tail, one full block, and the whole
+    # capacity: 1000 = 7 * 128 + 104.
+    let lengths: Array[i64; 5] = [0, 1, 300, 128, 1000]
+    let mut total: i64 = 0
+    for k: i64 in range(5):
+        let n: i64 = lengths[k]
+        let bad: i64 = check_saxpy(n, 2.5, 2663 + k) + check_square_plus(n, 17, 5326 + k)
+        if bad != 0:
+            println!("n = {n}: {bad} mismatches")
+        total = total + bad
+    if total != 0:
+        return 1
+    println!("imported kernels saxpy and square_plus: all lengths match the host reference")
+    return 0

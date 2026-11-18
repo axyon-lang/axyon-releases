@@ -1,0 +1,41 @@
+# Buffer placement: `Buffer[T, (shape), space]` (issue #2102)
+#
+# A `Buffer` type takes an optional third argument naming where its storage
+# lives. `Buffer[f32, (4,)]` and `Buffer[f32, (4,), host]` are the same type.
+#
+# `device_global` buffers need a GPU target with a device runtime, and host
+# code only allocates, frees and copies them (see
+# examples/device_transfer_demo, #2301); `workgroup`, `private` and
+# `constant` buffers are rejected with AX0623 in every build. To pass device
+# data to a kernel, use a `ref[T, device_global]` parameter.
+#
+# The typed GPU buffer contract (#2236) fixes two more rules: host code
+# never reads or writes device-only storage (a `buffer_get` on a
+# `device_global` buffer is AX0623, "dereferences device-only storage"; copy
+# it back with `buffer_to_host` first), and a device buffer holds contiguous
+# fixed-width scalars (`Buffer[index, (4,), device_global]` is AX0622).
+
+def main() -> i32:
+    # Explicit host placement and the default spelling are interchangeable.
+    let mut placed: Buffer[f32, (4,), host] = buffer_alloc([4])
+    let mut plain: Buffer[f32, (4,)] = buffer_alloc([4])
+
+    buffer_fill(placed, 1.5)
+    buffer_set(placed, 2, 4.0)
+    buffer_fill(plain, 0.25)
+
+    let changed: f32 = buffer_get(placed, 2)
+    let kept: f32 = buffer_get(placed, 0)
+    let other: f32 = buffer_get(plain, 3)
+    println!("placed[2] = {changed}")
+    println!("placed[0] = {kept}")
+    println!("plain[3] = {other}")
+
+    # Both buffers are released when they go out of scope.
+    if changed != 4.0:
+        return 1
+    if kept != 1.5:
+        return 2
+    if other != 0.25:
+        return 3
+    return 0

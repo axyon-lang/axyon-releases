@@ -1,0 +1,69 @@
+# Host <-> device buffer transfers (issue #2301) and device-to-device
+# copies (#2385)
+#
+# With `nvptx-sm80` selected (see axyon.toml), a `Buffer[T, (shape),
+# device_global]` lives in GPU memory. Host code moves data with
+# `buffer_to_device` / `buffer_to_host` (or `buffer_copy`) and allocates or
+# frees device buffers with `buffer_alloc` / `buffer_free`; all of them go
+# through the CUDA device runtime. A device buffer that goes out of scope, or
+# that a transfer consumes, is released automatically (#2383), so
+# `buffer_free` is optional. Host code never reads or writes device memory
+# directly: copy it back first.
+#
+# Device buffers live on the GPU that `AXYON_CUDA_DEVICE` names (a visible
+# device number, default 0). Uploads and device-to-device copies are queued
+# in program order and return without waiting for the GPU; a download waits,
+# so its data is complete when it returns.
+#
+# Running it needs an NVIDIA GPU and driver; without one the first device
+# allocation stops the program with an AXYON panic. A CPU-only build
+# (`--no-gpu`) rejects the device buffers at compile time (AX0623).
+
+def value(i: i64) -> f32:
+    return (i as f32) * 0.5 + 1.0
+
+# A device buffer can be passed to and returned from functions like any
+# other buffer.
+def upload(h: Buffer[f32, (8,)]) -> Buffer[f32, (8,), device_global]:
+    return buffer_to_device(h)
+
+def download(d: Buffer[f32, (8,), device_global]) -> Buffer[f32, (8,)]:
+    return buffer_to_host(d)
+
+def main() -> i32:
+    let mut host: Buffer[f32, (8,)] = buffer_alloc([8])
+    buffer_fill(host, 0.0)
+    for i: i64 in range(8):
+        buffer_set(host, i, value(i))
+
+    # Host -> device -> host. `buffer_to_device` takes ownership of `host`.
+    let device: Buffer[f32, (8,), device_global] = upload(host)
+    let back: Buffer[f32, (8,)] = download(device)
+    for i: i64 in range(8):
+        let got: f32 = buffer_get(back, i)
+        if got != value(i):
+            return 1
+
+    # A device allocation, released explicitly.
+    let scratch: Buffer[f32, (8,), device_global] = buffer_alloc([8])
+    buffer_free(scratch)
+
+    # Device -> device (#2385): `buffer_copy` between two `device_global`
+    # buffers copies on the GPU, with no host round trip. It takes both
+    # buffers, so neither can be used afterwards; both are released right
+    # after the copy (#2383).
+    let mut more: Buffer[f32, (8,)] = buffer_alloc([8])
+    buffer_fill(more, 2.0)
+    let src: Buffer[f32, (8,), device_global] = buffer_to_device(more)
+    let mut dst: Buffer[f32, (8,), device_global] = buffer_alloc([8])
+    buffer_copy(src, dst)
+
+    # No `buffer_free` needed (#2383): each `_tmp` is released at the end of
+    # its iteration, so the loop holds at most one device buffer at a time.
+    # `download` above released the device copy it read, too.
+    for i: i64 in range(4):
+        let _tmp: Buffer[f32, (8,), device_global] = buffer_alloc([8])
+
+    let last: f32 = buffer_get(back, 7)
+    println!("round trip through device memory: back[7] = {last}")
+    return 0

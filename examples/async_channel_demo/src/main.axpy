@@ -1,0 +1,153 @@
+# Async MPSC channels (`std.async_channel`, #215) driven by a tiny scheduler.
+#
+# Two producer tasks send into a bounded channel of capacity 2 and one
+# consumer task receives. Each task has a flag; its waker sets the flag, and
+# the scheduler only polls tasks whose flag is set. A task that returns
+# `Pending` is therefore not polled again until the channel wakes it: a full
+# channel parks the producer until the consumer frees a slot, an empty one
+# parks the consumer until a value arrives. Nothing busy-spins.
+#
+# An `async def` can also `await` the channel futures under `block_on`, but
+# `block_on` runs a single future; tasks that wait on each other need a
+# scheduler that polls several, like this one (see
+# docs/known-limitations/215-async-channel.md).
+
+from core.option import Option
+from core.future import Poll
+from core.task import Context, Waker, RawWaker, RawWakerVTable
+from std.async_channel import async_channel, AsyncSender, AsyncReceiver, SendFuture, RecvFuture
+
+# The waker of a task: its data pointer is the task's ready flag.
+@unsafe
+def flag_clone(data: ptr[unit]) -> ptr[unit]:
+    return data
+
+@unsafe
+def flag_set(data: ptr[unit]) -> unit:
+    let f: ptr_mut[i64] = data as ptr_mut[i64]
+    *f = 1
+
+@unsafe
+def flag_noop(data: ptr[unit]) -> unit:
+    pass
+
+def adopt(data: ptr[unit], vt: ref[RawWakerVTable]) -> Waker:
+    unsafe:
+        return Waker.from_raw(RawWaker.new(data, vt))
+
+def new_flag() -> ptr_mut[i64]:
+    let mem: ptr_mut[u8] = global_alloc_zeroed(8, 8)
+    return mem as ptr_mut[i64]
+
+# Reads and clears a ready flag.
+def take_flag(f: ptr_mut[i64]) -> bool:
+    unsafe:
+        let set: bool = *f != 0
+        *f = 0
+        return set
+
+def set_flag(f: ptr_mut[i64]) -> unit:
+    unsafe:
+        *f = 1
+
+# True when the send completed (sent, or failed because the receiver left).
+def poll_send(f: ref_mut[SendFuture[i64]], w: ref[Waker]) -> bool:
+    let mut cx: Context = Context.from_waker(w)
+    match f.poll(&mut cx):
+        case Poll.Ready(r):
+            return True
+        case Poll.Pending:
+            return False
+
+# The received value, -1 once the channel is closed, -2 while pending.
+def poll_recv(f: ref_mut[RecvFuture[i64]], w: ref[Waker]) -> i64:
+    let mut cx: Context = Context.from_waker(w)
+    match f.poll(&mut cx):
+        case Poll.Ready(o):
+            match o:
+                case Option.Some(v):
+                    return v
+                case Option.None_:
+                    return -1
+        case Poll.Pending:
+            return -2
+
+# Runs both producers (3 values each) and the consumer until the consumer has
+# all 6 values; returns their sum. The senders are dropped when this function
+# returns, which closes the channel.
+def run(a: AsyncSender[i64], b: AsyncSender[i64], rx: ref_mut[AsyncReceiver[i64]], vt: ref[RawWakerVTable]) -> i64:
+    let fa: ptr_mut[i64] = new_flag()
+    let fb: ptr_mut[i64] = new_flag()
+    let fc: ptr_mut[i64] = new_flag()
+    let wa: Waker = adopt(fa as ptr[unit], vt)
+    let wb: Waker = adopt(fb as ptr[unit], vt)
+    let wc: Waker = adopt(fc as ptr[unit], vt)
+    set_flag(fa)
+    set_flag(fb)
+    set_flag(fc)
+    let mut next_a: i64 = 1
+    let mut next_b: i64 = 101
+    let mut sa: SendFuture[i64] = a.send(next_a)
+    let mut sb: SendFuture[i64] = b.send(next_b)
+    let mut a_done: bool = False
+    let mut b_done: bool = False
+    let mut r: RecvFuture[i64] = rx.recv()
+    let mut received: i64 = 0
+    let mut sum: i64 = 0
+    let mut polls: i64 = 0
+    while received < 6:
+        if not a_done and take_flag(fa):
+            polls = polls + 1
+            if poll_send(&mut sa, ref(wa)):
+                println!("producer A sent {next_a}")
+                next_a = next_a + 1
+                if next_a > 3:
+                    a_done = True
+                else:
+                    sa = a.send(next_a)
+                    set_flag(fa)
+            else:
+                println!("producer A parked: channel full")
+        if not b_done and take_flag(fb):
+            polls = polls + 1
+            if poll_send(&mut sb, ref(wb)):
+                println!("producer B sent {next_b}")
+                next_b = next_b + 1
+                if next_b > 103:
+                    b_done = True
+                else:
+                    sb = b.send(next_b)
+                    set_flag(fb)
+            else:
+                println!("producer B parked: channel full")
+        if take_flag(fc):
+            polls = polls + 1
+            let v: i64 = poll_recv(&mut r, ref(wc))
+            if v >= 0:
+                println!("consumer got {v}")
+                received = received + 1
+                sum = sum + v
+                r = rx.recv()
+                set_flag(fc)
+            else:
+                println!("consumer parked: channel empty")
+    println!("{polls} polls in total")
+    return sum
+
+def main() -> i32:
+    let vt: RawWakerVTable = RawWakerVTable.new(flag_clone, flag_set, flag_set, flag_noop)
+    let (tx, rx0) = async_channel[i64](2)
+    let mut rx: AsyncReceiver[i64] = rx0
+    let tx_b: AsyncSender[i64] = tx.clone()
+    let sum: i64 = run(tx, tx_b, &mut rx, ref(vt))
+    println!("sum = {sum}")
+    # Every sender is gone: the receiver sees the close.
+    let fc: ptr_mut[i64] = new_flag()
+    let wc: Waker = adopt(fc as ptr[unit], ref(vt))
+    let mut last: RecvFuture[i64] = rx.recv()
+    if poll_recv(&mut last, ref(wc)) != -1:
+        return 1
+    println!("channel closed")
+    if sum != 312:
+        return 2
+    return 0

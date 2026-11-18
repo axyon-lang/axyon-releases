@@ -1,0 +1,219 @@
+# Standard Library Demo
+#
+# Demonstrates AXYON stdlib imports and collection types.
+# Shows how the new Array, Vec, Slice types integrate with stdlib functions.
+
+# Import from standard library
+from std.simple import abs_i64, max_i64, min_i64, square_i64
+
+# =============================================================================
+# Math Functions
+# =============================================================================
+
+def abs_val(x: i64) -> i64:
+    if x < 0:
+        return 0 - x
+    return x
+
+def fib(n: i64) -> i64:
+    # Fibonacci using variable reassignment
+    if n <= 1:
+        return n
+    let mut a: i64 = 0
+    let mut b: i64 = 1
+    for i in range(2, n + 1):
+        let temp: i64 = a + b
+        a = b
+        b = temp
+    return b
+
+def factorial(n: i64) -> i64:
+    let mut result: i64 = 1
+    for i: i64 in range(1, n + 1):
+        result *= i
+    return result
+
+def sum_to_n(n: i64) -> i64:
+    let mut total: i64 = 0
+    for i: i64 in range(1, n + 1):
+        total += i
+    return total
+
+def is_even(n: i64) -> bool:
+    if n % 2 == 0:
+        return True
+    return False
+
+def check_positive(n: i64) -> bool:
+    return n > 0
+
+# =============================================================================
+# Collection Type Examples (Type Syntax Demo)
+# =============================================================================
+
+def collection_types_demo() -> i32:
+    """Demonstrate collection type syntax and ownership."""
+    println!("Collection Types:")
+    println!("-----------------")
+    println!("")
+
+    # Array types - fixed size, stack allocated
+    # In the future: let arr: Array[i64; 5] = [1, 2, 3, 4, 5]
+    println!("Array[T; N] - Fixed-size stack arrays")
+    println!("  Syntax: Array[i64; 5]")
+    println!("  Copy if element type is Copy")
+    println!("")
+
+    # Vec/List types - dynamic, heap allocated
+    # In the future: let v: Vec[i64] = vec_new()
+    println!("Vec[T] / List[T] - Dynamic heap arrays")
+    println!("  Syntax: Vec[i64] or List[i64]")
+    println!("  NOT Copy (owns heap memory)")
+    println!("")
+
+    # Slice types - borrowed views
+    # In the future: let s: Slice[i64] = arr[1:4]
+    println!("Slice[T] - Borrowed contiguous view")
+    println!("  Syntax: Slice[i64]")
+    println!("  Always Copy (fat pointer)")
+    println!("")
+
+    # View types - N-D strided views
+    println!("View[T, rank] - N-dimensional strided view")
+    println!("  Syntax: View[f32, 2]")
+    println!("  Always Copy (borrowed)")
+    println!("")
+
+    # Buffer types - owned memory
+    println!("Buffer[dtype, shape] - Owned memory buffer")
+    println!("  Syntax: Buffer[f32, (100, 100)]")
+    println!("  NOT Copy (owns memory)")
+    println!("")
+
+    return 0
+
+# =============================================================================
+# Working with Sequences
+# =============================================================================
+
+def sequence_operations_demo() -> i32:
+    """Demonstrate operations that work with sequences."""
+    println!("Sequence Operations:")
+    println!("--------------------")
+    println!("")
+
+    # Sum of first N numbers (simulating array sum)
+    let n: i64 = 10
+    let sum: i64 = sum_to_n(n)
+    println!("Sum of 1 to {n}: {sum}")
+    println!("")
+
+    # Finding max/min (simulating array operations)
+    let a: i64 = 42
+    let b: i64 = 17
+    let c: i64 = 93
+    let max_ab: i64 = max_i64(a, b)
+    let max_abc: i64 = max_i64(max_ab, c)
+    let min_ab: i64 = min_i64(a, b)
+    let min_abc: i64 = min_i64(min_ab, c)
+    println!("Values: {a}, {b}, {c}")
+    println!("  max = {max_abc}")
+    println!("  min = {min_abc}")
+    println!("")
+
+    return 0
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main() -> i32:
+    println!("AXYON Standard Library Demo")
+    println!("===========================")
+    println!("")
+
+    # Absolute value - using stdlib import!
+    let x: i64 = -42
+    let abs_x: i64 = abs_i64(x)
+    println!("Absolute value (from stdlib):")
+    println!("  abs_i64(-42) = {abs_x}")
+    println!("")
+
+    # Max/min - using stdlib imports!
+    let a: i64 = 10
+    let b: i64 = 20
+    let mx: i64 = max_i64(a, b)
+    let mn: i64 = min_i64(a, b)
+    println!("Max/Min (from stdlib):")
+    println!("  max_i64(10, 20) = {mx}")
+    println!("  min_i64(10, 20) = {mn}")
+    println!("")
+
+    # Square - using stdlib import!
+    let n: i64 = 7
+    let sq: i64 = square_i64(n)
+    println!("Square (from stdlib):")
+    println!("  square_i64(7) = {sq}")
+    println!("")
+
+    # Sum demonstration
+    let s: i64 = sum_to_n(10)
+    println!("Sum of 1 to 10:")
+    println!("  sum = {s}")
+    println!("")
+
+    # Factorial
+    println!("Factorials:")
+    let f0: i64 = factorial(0)
+    let f1: i64 = factorial(1)
+    let f2: i64 = factorial(2)
+    let f3: i64 = factorial(3)
+    let f4: i64 = factorial(4)
+    let f5: i64 = factorial(5)
+    let f6: i64 = factorial(6)
+    let f7: i64 = factorial(7)
+    println!("  0! = {f0}")
+    println!("  1! = {f1}")
+    println!("  2! = {f2}")
+    println!("  3! = {f3}")
+    println!("  4! = {f4}")
+    println!("  5! = {f5}")
+    println!("  6! = {f6}")
+    println!("  7! = {f7}")
+    println!("")
+
+    # Fibonacci (tests variable reassignment)
+    println!("Fibonacci:")
+    let fib5: i64 = fib(5)
+    let fib10: i64 = fib(10)
+    println!("  fib(5) = {fib5}")
+    println!("  fib(10) = {fib10}")
+    println!("")
+
+    # Type casting demo
+    println!("Type casting:")
+    let big: i64 = 12345
+    let small: i32 = big as i32
+    println!("  i64 to i32: {small}")
+    println!("")
+
+    # Bool return function demo
+    println!("Bool functions:")
+    let even4: bool = is_even(4)
+    let even5: bool = is_even(5)
+    println!("  is_even(4) = {even4}")
+    println!("  is_even(5) = {even5}")
+    let pos5: bool = check_positive(5)
+    let negpos: bool = check_positive(-3)
+    println!("  check_positive(5) = {pos5}")
+    println!("  check_positive(-3) = {negpos}")
+    println!("")
+
+    # New: Collection types demo
+    let r1: i32 = collection_types_demo()
+
+    # New: Sequence operations demo
+    let r2: i32 = sequence_operations_demo()
+
+    println!("Demo complete!")
+    return 0

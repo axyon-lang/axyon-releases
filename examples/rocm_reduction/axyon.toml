@@ -1,0 +1,14 @@
+[package]
+name = "rocm_reduction"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# Workgroup reductions and atomics run on an AMD GPU through ROCm (#2657).
+[target]
+gpu = ["rocdl-gfx942"]

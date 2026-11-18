@@ -1,0 +1,37 @@
+# String comparison and println! only read their operands (issue #896).
+struct Inventory:
+    error: string
+
+def describe(n: i64) -> string:
+    if n == 0:
+        return "ok"
+    return "error"
+
+def same(a: &string, b: &string) -> bool:
+    return a == b
+
+def less(a: &string, b: &string) -> bool:
+    return a < b
+
+def main() -> i32:
+    let d: string = describe(0)
+    if d == "ok":
+        println!("fine")
+    println!("{d}")
+    println!("{d}")
+
+    let inv: Inventory = Inventory { error: "" }
+    assert!(inv.error == "", "error must be empty")
+
+    let e: string = describe(1)
+    assert!(same(&d, &d), "a string equals itself")
+    assert!(d != e, "different contents differ")
+    # Ordering is lexicographic by bytes (issue #1036).
+    let lo: string = "apple"
+    let hi: string = "apricot"
+    assert!(less(&lo, &hi), "apple < apricot")
+    assert!(not less(&hi, &lo), "apricot is not < apple")
+    assert!(lo <= lo and lo >= lo, "<= and >= hold for equal strings")
+    assert!(hi > lo and not (lo > hi), "> follows <")
+    assert!(lo < "apple pie", "a prefix orders before the longer string")
+    return 0

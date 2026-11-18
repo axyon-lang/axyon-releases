@@ -1,0 +1,80 @@
+# `await` on a non-blocking RDMA barrier (#2098). `PendingBarrier` implements
+# `Future`, so an `async def` can `await` it; the result is exactly what
+# `PendingBarrier.wait` returns, bounded by the barrier's own timeout. This
+# single-rank run needs no peer. It is driven by hand with a waker that counts
+# `wake_by_ref` calls (an unfinished barrier re-wakes its task at once); an
+# awaited `Pending[T]` can instead be driven by `std.async_runtime.block_on`
+# or, without spinning, `std.rdma.block_on_reactor` on a context made by
+# `RdmaContext.new_with_wakeup()` (see docs/src/reference/runtime-rdma.md).
+#
+#   UCX_TLS=self ./rdma_await_barrier     prints `RESULT awaited ok`
+#   (with AXYON_RDMA_TRANSPORT=ucx and no UCX it prints
+#   `RESULT skipped: UCX unavailable` and exits 0; otherwise without UCX it
+#   runs on the native TCP fallback, #2818)
+
+from std.rdma import RdmaContext, Comm, PendingBarrier, RdmaError, RdmaErrorKind
+from std.core.future import Future, Poll
+from std.core.task import RawWakerVTable, RawWaker, Waker, Context
+from std.core import i32, i64, bool, unit, Result, Ok, Err
+
+@unsafe
+def w_clone(data: ptr[unit]) -> ptr[unit]:
+    return data
+
+@unsafe
+def w_wake(data: ptr[unit]) -> unit:
+    pass
+
+@unsafe
+def w_wake_by_ref(data: ptr[unit]) -> unit:
+    let n: ptr_mut[i64] = data as ptr_mut[i64]
+    (*n) = (*n) + 1
+
+async def finish(bar: PendingBarrier) -> i64:
+    let r: Result[i64, RdmaError] = await bar
+    match r:
+        Ok(v) => return 0
+        Err(e) => return 1
+
+def poll_once(future: ref_mut[__Future_finish], waker: ref[Waker]) -> i64:
+    let mut cx: Context = Context.from_waker(waker)
+    match future.poll(&mut cx):
+        case Poll.Ready(value):
+            return value
+        case Poll.Pending:
+            return -1
+
+def run() -> Result[i32, RdmaError]:
+    let ctx: RdmaContext = RdmaContext.new()?
+    let comm: Comm = Comm.new(&ctx, 0 as u32, 1 as u32)?
+    let c: unsafe fn(ptr[unit]) -> ptr[unit] = w_clone
+    let w: unsafe fn(ptr[unit]) -> unit = w_wake
+    let br: unsafe fn(ptr[unit]) -> unit = w_wake_by_ref
+    let vt: RawWakerVTable = RawWakerVTable.new(c, w, br, w)
+    unsafe:
+        let counter: ptr_mut[i64] = global_alloc_zeroed_checked(8, 8) as ptr_mut[i64]
+    unsafe:
+        let waker: Waker = Waker.from_raw(RawWaker.new(counter as ptr[unit], ref(vt)))
+    let mut task = finish(comm.ibarrier(5000)?)
+    let mut polls: i64 = 0
+    while polls < 2000000:
+        let code: i64 = poll_once(&mut task, ref(waker))
+        polls = polls + 1
+        if code == 0:
+            println!("RESULT awaited ok")
+            return Result.Ok(0)
+        if code > 0:
+            return Result.Ok(3)
+    return Result.Ok(4)
+
+def main() -> i32:
+    match run():
+        Ok(c) => return c
+        Err(e) =>
+            # No UCX on this host: skip successfully, so example sweeps pass.
+            # The UCX-required check is the `rdma_runtime` integration test,
+            # which looks for `RESULT awaited ok`.
+            if e.kind == RdmaErrorKind.Unavailable:
+                println!("RESULT skipped: UCX unavailable")
+                return 0
+            return 2

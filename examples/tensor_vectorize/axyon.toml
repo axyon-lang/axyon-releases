@@ -1,0 +1,10 @@
+[package]
+name = "tensor_vectorize"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+# The Transform-dialect tile + vectorize stage runs at opt_level >= 2 (#1702).
+opt_level = 2

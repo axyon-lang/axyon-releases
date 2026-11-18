@@ -1,0 +1,105 @@
+# Function pointers and lambdas example for AXYON
+# Demonstrates `fn(...) -> ...` values: named functions passed as arguments,
+# indirect calls through a function-pointer parameter, lambda bindings, and
+# the `unsafe fn` callable qualifier with the safe -> unsafe coercion. (ABIs
+# never coerce: an `extern fn` is a distinct type; see docs/src/guide/ffi.md.)
+
+@host
+def identity(v: i32) -> i32:
+    """Return the argument unchanged."""
+    return v
+
+@host
+def increment(v: i32) -> i32:
+    """Add one to the argument."""
+    return v + 1
+
+struct Mapper:
+    f: fn(i32) -> i32
+
+# `f` is a function pointer; `f(x)` is an indirect call through it. A
+# function-pointer parameter shadows any global of the same name.
+@host
+def apply(f: fn(i32) -> i32, x: i32) -> i32:
+    """Apply a function pointer to a value."""
+    return f(x)
+
+# SAFETY: none required — `@unsafe` here only demonstrates that the
+# qualifier travels with the function's pointer type.
+@unsafe
+@host
+def raw_triple(v: i64) -> i64:
+    """Triple the argument (declared unsafe for demonstration)."""
+    return v * 3
+
+@host
+def safe_square(v: i64) -> i64:
+    """Square the argument."""
+    return v * v
+
+# An `unsafe fn` parameter accepts both unsafe and safe functions: the only
+# callable coercion is safe -> unsafe. A call through an `unsafe fn` pointer
+# must sit in an `unsafe:` block (AX0538).
+@host
+def apply_unsafe(f: unsafe fn(i64) -> i64, x: i64) -> i64:
+    """Apply a possibly-unsafe function pointer to a value."""
+    # SAFETY: every function this demo passes has no preconditions.
+    unsafe:
+        return f(x)
+
+# Returning a safe pointer where an `unsafe fn` is declared is the same
+# safe -> unsafe coercion; the reverse (erasing `unsafe`) is rejected.
+@host
+def as_unsafe(f: fn(i64) -> i64) -> unsafe fn(i64) -> i64:
+    """Widen a safe function pointer to an unsafe one."""
+    return f
+
+@host
+def main() -> i32:
+    """Entry point demonstrating function pointers and lambdas."""
+    # Pass a named function where a fn(i32) -> i32 value is expected.
+    let a: i32 = apply(identity, 5_i32)
+    println!("apply(identity, 5) = {a}")
+
+    let b: i32 = apply(increment, 5_i32)
+    println!("apply(increment, 5) = {b}")
+
+    # A function-pointer struct field is called through the receiver.
+    let mapper: Mapper = Mapper { f: increment }
+    let mapped: i32 = mapper.f(7_i32)
+    println!("mapper.f(7) = {mapped}")
+
+    # A lambda bound through a function-pointer annotation.
+    let doubler: fn(i32) -> i32 = lambda x: x + x
+    let c: i32 = doubler(21_i32)
+    println!("doubler(21) = {c}")
+
+    # A pointer to an `@unsafe` function has type `unsafe fn(..)`; binding it
+    # to a plain `fn(..)` would be a type error.
+    let t: unsafe fn(i64) -> i64 = raw_triple
+    let d: i64 = apply_unsafe(t, 4)
+    println!("apply_unsafe(raw_triple, 4) = {d}")
+
+    # Safe -> unsafe coercion at a binding, a call argument and a return.
+    let s: unsafe fn(i64) -> i64 = safe_square
+    let mut e: i64 = apply_unsafe(safe_square, 5)
+    # SAFETY: `s` points to `safe_square`, which has no preconditions.
+    unsafe:
+        e = e + s(1)
+    println!("apply_unsafe(safe_square, 5) + s(1) = {e}")
+    let w: unsafe fn(i64) -> i64 = as_unsafe(safe_square)
+    let mut g: i64 = 0
+    # SAFETY: `w` points to `safe_square`.
+    unsafe:
+        g = w(6)
+    println!("as_unsafe(safe_square)(6) = {g}")
+
+    assert!(a == 5, "identity(5) should be 5")
+    assert!(b == 6, "increment(5) should be 6")
+    assert!(mapped == 8, "mapper.f(7) should be 8")
+    assert!(c == 42, "doubler(21) should be 42")
+    assert!(d == 12, "raw_triple(4) should be 12")
+    assert!(e == 26, "safe_square(5) + safe_square(1) should be 26")
+    assert!(g == 36, "safe_square(6) should be 36")
+
+    return 0_i32

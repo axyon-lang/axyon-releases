@@ -1,0 +1,25 @@
+# `core.cell.UnsafeCell` (#575): the interior-mutability lang item.
+#
+# Every access to a cell's contents needs an `unsafe:` block (AX0539).
+# Creating a cell, moving it and unwrapping an owned cell are safe.
+from core.cell import UnsafeCell
+
+struct Counter:
+    hits: UnsafeCell[i64]
+
+# Reads the contents through a shared reference.
+def hits(c: ref[Counter]) -> i64:
+    # SAFETY: nothing writes `hits` while this shared borrow is live.
+    unsafe:
+        return c.hits.value
+
+def main() -> i32:
+    let mut c: Counter = Counter { hits: UnsafeCell.new(1) }
+    # SAFETY: `c` is owned here and no reference to it is live.
+    unsafe:
+        c.hits.value = c.hits.value + 2
+    let seen: i64 = hits(ref(c))
+    println!("hits = {seen}")
+    let total: i64 = c.hits.into_inner()
+    assert!(total == 3, "the store through `unsafe:` is visible")
+    return 0

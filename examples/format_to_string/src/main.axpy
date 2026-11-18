@@ -1,0 +1,36 @@
+# format! and std.strconv formatters (#2810): build the text of a probe
+# time-series line and a snapshot header as `String`s, then check that the
+# round-trip formatter parses back to the same doubles. A Python f-string
+# (#2985) lowers onto `format!` and builds the same text.
+from std.strconv import format_f64, format_i64, parse_f64
+
+def probe_line(step: i64, t: f64, p: f64, u: f64) -> String:
+    return format!("{step:>6} {t:.6e} {p:.6e} {u:+.3f}")
+
+@host
+def main() -> i32:
+    let nx: i64 = 64
+    let ny: i64 = 32
+    let time: f64 = 0.125
+    let header: String = format!("{nx} {ny} time={time}")
+    println!("{header}")
+    let fheader: String = f"{nx} {ny} time={time}"
+    assert!(fheader == header, "an f-string builds what format! builds")
+
+    let mut step: i64 = 0
+    while step < 3:
+        let t: f64 = (step as f64) * 0.001
+        let line: String = probe_line(step, t, 101325.0, -0.5)
+        println!("{line}")
+        step = step + 1
+
+    let x: f64 = 0.1
+    let s: String = format_f64(x)
+    let n: String = format_i64(nx)
+    println!("{s} {n}")
+    match parse_f64(s.as_bytes()):
+        Ok(v) =>
+            assert!(v == x, "format_f64 must round-trip")
+        Err(e) =>
+            assert!(False, "format_f64 output must parse")
+    return 0

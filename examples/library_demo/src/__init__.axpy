@@ -1,0 +1,41 @@
+# Library Demo — AXYON library with C-ABI exports
+#
+# This example demonstrates:
+#   - Library packages with [lib] and crate_type
+#   - @export_c for C-ABI function exports
+#   - Internal (non-exported) helper functions
+#
+# Build:
+#   axyon build
+#
+# Produces:
+#   target/debug/library_demo.axc   (AXYON crate bundle)
+#   target/debug/liblibrary_demo.a   (native static archive)
+
+@export_c
+def add_i32(a: i32, b: i32) -> i32:
+    """Add two 32-bit integers. Exported with C ABI."""
+    return a + b
+
+@export_c
+def sub_i32(a: i32, b: i32) -> i32:
+    """Subtract two 32-bit integers. Exported with C ABI."""
+    return a - b
+
+@export_c
+def mul_i32(a: i32, b: i32) -> i32:
+    """Multiply two 32-bit integers. Exported with C ABI."""
+    return a * b
+
+@export_c
+def square_i32(x: i32) -> i32:
+    """Return x squared. Exported with C ABI."""
+    return x * x
+
+# Internal helper — not exported, not visible from C
+def clamp(x: i32, lo: i32, hi: i32) -> i32:
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x

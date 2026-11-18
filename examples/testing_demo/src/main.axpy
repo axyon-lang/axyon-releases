@@ -1,0 +1,458 @@
+# Testing Demo Example for AXYON
+# Demonstrates the @test decorator for unit testing.
+#
+# Run tests with: axyon test
+# Run with filters: axyon test --filter add
+# Run with verbose output: axyon test --verbose
+
+# ============================================================================
+# Code Under Test
+# ============================================================================
+
+def add(a: i64, b: i64) -> i64:
+    """Add two integers."""
+    return a + b
+
+def subtract(a: i64, b: i64) -> i64:
+    """Subtract b from a."""
+    return a - b
+
+def multiply(a: i64, b: i64) -> i64:
+    """Multiply two integers."""
+    return a * b
+
+def divide(a: i64, b: i64) -> i64:
+    """Integer division of a by b."""
+    return a / b
+
+def floor_divide(a: i64, b: i64) -> i64:
+    """Floor division of a by b (rounds toward negative infinity)."""
+    return a // b
+
+def floor_divide_unsigned(a: u32, b: u32) -> u32:
+    """Unsigned floor division of a by b."""
+    return a // b
+
+def floor_divide_unsigned_array(xs: Array[u32; 2]) -> u32:
+    """Unsigned floor division of array elements (high bit set)."""
+    return xs[0] // xs[1]
+
+def floor_divide_max(a: i64, b: i64) -> i64:
+    """Floor division of a builtin call result (max) by 2."""
+    return max(a, b) // 2
+
+def arm_floor_divide(s: Signal) -> i32:
+    """Arm-local typed lets must keep their unsigned signedness for `//`."""
+    match s:
+        case Signal.Go:
+            let a: u32 = 4294967295
+            let b: u32 = 2
+            let q: u32 = a // b
+            return q as i32
+        case Signal.Stop:
+            return 0
+        case Signal.Wait(seconds=n):
+            return 0
+
+def floor_divide_negated_literal(b: i64) -> i8:
+    """`-(-128)` adopts `b`'s type (i64) before dividing; it must not wrap in i8."""
+    let q: i8 = (-(-128) // b) as i8
+    return q
+
+def floor_divide_i128_wide(a: i128) -> i128:
+    """A literal beyond i64 keeps its value when adopting i128 (2**63)."""
+    return a // -(-9223372036854775808)
+
+def floor_divide_max_literal(a: u32) -> u32:
+    """`max(0, a)` is `u32` (the literal adopts `a`'s type) before `//`."""
+    return max(0, a) // 2
+
+def floor_divide_conditional_max(a: u32, b: u32, c: bool) -> u32:
+    """A same-type `max` inside a conditional `//` operand stays unsigned."""
+    return (max(a, b) if c else a) // 2
+
+def floor_divide_float(a: f64, b: f64) -> f64:
+    """Floating-point floor division of a by b."""
+    return a // b
+
+def power(a: i64, b: i64) -> i64:
+    """Integer power a ** b (b must be non-negative)."""
+    return a ** b
+
+def power_unsigned(a: u32, b: u32) -> u32:
+    """Unsigned integer power a ** b."""
+    return a ** b
+
+def power_float(a: f64, b: f64) -> f64:
+    """Floating-point power a ** b."""
+    return a ** b
+
+def abs_value(n: i64) -> i64:
+    """Return absolute value of n."""
+    if n < 0:
+        return -n
+    return n
+
+def clamp(value: i64, min_val: i64, max_val: i64) -> i64:
+    """Clamp value to range [min_val, max_val]."""
+    if value < min_val:
+        return min_val
+    if value > max_val:
+        return max_val
+    return value
+
+def sum_to_n(n: i64) -> i64:
+    """Sum integers from 0 to n-1 using iteration."""
+    let mut total: i64 = 0
+    for i in range(n):
+        total += i
+    return total
+
+# Enum used to regression-test the cf-path match lowering: a statement-position
+# `match` whose arms ALL return leaves an unreachable merge block in the emitted
+# MLIR, which must survive the mlir-opt lowering pipeline (unreachable blocks
+# break --convert-func-to-llvm unless erased first — see driver toolchain.rs).
+# This test runs through the full toolchain in PR CI (test-axyon-projects),
+# unlike examples/, which are only compiled on pushes to main.
+enum Signal:
+    Stop
+    Go
+    Wait(seconds: i32)
+
+def signal_code(s: Signal) -> i32:
+    """Statement-position match where every arm returns (no fall-through)."""
+    match s:
+        case Signal.Stop:
+            return 0
+        case Signal.Go:
+            return 1
+        case Signal.Wait(seconds=n):
+            return 100 + n
+
+def change_first(x: &mut Array[i64; 2]) -> i64:
+    x[0] = 7
+    return 0
+
+def read_after_call(x: &mut Array[i64; 2]) -> i64:
+    return x[change_first(x)]
+
+# ============================================================================
+# Basic Tests - Simple @test decorator
+# ============================================================================
+
+@test
+def test_array_ref_index_evaluated_before_load() -> i32:
+    """x[change(x)] must read the element after the index call mutates it (#639)."""
+    let mut a: Array[i64; 2] = [1, 2]
+    assert!(read_after_call(&mut a) == 7, "element must be read after the index call")
+    return 0
+
+@test
+def test_add() -> i32:
+    """Test basic addition operations."""
+    assert!(add(2, 3) == 5, "2 + 3 should equal 5")
+    assert!(add(-5, -3) == -8, "-5 + -3 should equal -8")
+    assert!(add(10, -3) == 7, "10 + -3 should equal 7")
+    assert!(add(42, 0) == 42, "adding zero should be identity")
+    return 0
+
+@test
+def test_subtract() -> i32:
+    """Test subtraction operations."""
+    assert!(subtract(10, 3) == 7, "10 - 3 should equal 7")
+    assert!(subtract(3, 10) == -7, "3 - 10 should equal -7")
+    assert!(subtract(5, 5) == 0, "5 - 5 should equal 0")
+    return 0
+
+@test
+def test_enum_match_all_arms_return() -> i32:
+    """All-arms-return statement match must survive the MLIR lowering pipeline."""
+    let stop: Signal = Signal.Stop
+    let go: Signal = Signal.Go
+    let wait: Signal = Signal.Wait(5)
+    assert!(signal_code(stop) == 0, "Stop should map to 0")
+    assert!(signal_code(go) == 1, "Go should map to 1")
+    assert!(signal_code(wait) == 105, "Wait(5) should map to 105")
+    return 0
+
+@test
+def test_multiply() -> i32:
+    """Test multiplication operations."""
+    assert!(multiply(3, 4) == 12, "3 * 4 should equal 12")
+    assert!(multiply(-3, 4) == -12, "-3 * 4 should equal -12")
+    assert!(multiply(-3, -4) == 12, "-3 * -4 should equal 12")
+    assert!(multiply(0, 100) == 0, "0 * 100 should equal 0")
+    return 0
+
+@test
+def test_divide() -> i32:
+    """Test integer division operations."""
+    assert!(divide(10, 2) == 5, "10 / 2 should equal 5")
+    assert!(divide(7, 2) == 3, "7 / 2 should equal 3 (truncated)")
+    assert!(divide(-10, 2) == -5, "-10 / 2 should equal -5")
+    return 0
+
+@test
+def test_floor_divide() -> i32:
+    """Floor division rounds toward negative infinity (issue #561)."""
+    assert!(floor_divide(7, 2) == 3, "7 // 2 should equal 3")
+    assert!(floor_divide(-7, 2) == -4, "-7 // 2 should equal -4")
+    assert!(floor_divide(7, -2) == -4, "7 // -2 should equal -4")
+    assert!(floor_divide(-7, -2) == 3, "-7 // -2 should equal 3")
+    assert!(floor_divide_max(-7, -9) == -4, "max(-7, -9) // 2 should equal -4")
+    assert!(floor_divide_negated_literal(2) == 64, "-(-128) // 2 should equal 64")
+    assert!(floor_divide_i128_wide(1) == 0, "1 // 2**63 should equal 0")
+    assert!(floor_divide_i128_wide(-1) == -1, "-1 // 2**63 should equal -1")
+    assert!(floor_divide_max_literal(4294967295) == 2147483647, "max(0, u32::MAX) // 2")
+    assert!(max(0_i8 as i64, 1000_i64) // 2 == 500, "max(0_i8 as i64, 1000_i64) // 2 should equal 500")
+    assert!(min(1000_i64, 0_i8 as i64) // 2 == 0, "min(1000_i64, 0_i8 as i64) // 2 should equal 0")
+    assert!(max(0_i8 as u16, 200_u16) // 2 == 100, "max(0_i8 as u16, 200_u16) // 2 should equal 100")
+    assert!(floor_divide_conditional_max(4294967295, 1, True) == 2147483647, "conditional max // 2")
+    assert!(floor_divide_unsigned(7, 2) == 3, "7 // 2 (u32) should equal 3")
+    let big: Array[u32; 2] = [4294967295, 2]
+    assert!(floor_divide_unsigned_array(big) == 2147483647, "u32::MAX // 2 (array) should equal 2147483647")
+    assert!(floor_divide_float(7.5, 2.0) == 3.0, "7.5 // 2.0 should equal 3.0")
+    assert!(floor_divide_float(-7.5, 2.0) == -4.0, "-7.5 // 2.0 should equal -4.0")
+    return 0
+
+@test
+def test_floor_divide_match_arm_unsigned() -> i32:
+    """Unsigned arm-local `//` with the high bit set is unsigned division (#561)."""
+    assert!(arm_floor_divide(Signal.Go) == 2147483647, "arm-local u32 floor division")
+    return 0
+
+@test
+def test_power() -> i32:
+    """Power operator computes exponentiation (issue #561)."""
+    assert!(power(2, 10) == 1024, "2 ** 10 should equal 1024")
+    assert!(power(-3, 3) == -27, "(-3) ** 3 should equal -27")
+    assert!(power(5, 0) == 1, "5 ** 0 should equal 1")
+    assert!(power_unsigned(3, 4) == 81, "3 ** 4 (u32) should equal 81")
+    assert!(power_float(2.0, 3.0) == 8.0, "2.0 ** 3.0 should equal 8.0")
+    let root: f64 = power_float(2.0, 0.5)
+    assert!(root > 1.4142 and root < 1.4143, "2.0 ** 0.5 should be sqrt(2)")
+    # Integer `**` is an inline square-and-multiply loop (#2276).
+    assert!(power(7, 1) == 7, "7 ** 1 should equal 7")
+    assert!(power(2, 63) == -9223372036854775807 - 1, "2 ** 63 wraps to i64 MIN")
+    # A negative signed exponent traps (#607); an unsigned one is never negative.
+    assert!(power_unsigned(2, 32) == 0, "2 ** 32 (u32) wraps to 0")
+    return 0
+
+@test
+def test_modulo() -> i32:
+    """Test modulo operations."""
+    assert!(0 % 2 == 0, "0 mod 2 should be 0")
+    assert!(2 % 2 == 0, "2 mod 2 should be 0")
+    assert!(100 % 2 == 0, "100 mod 2 should be 0")
+    assert!(1 % 2 == 1, "1 mod 2 should be 1")
+    assert!(99 % 2 == 1, "99 mod 2 should be 1")
+    assert!(17 % 5 == 2, "17 mod 5 should be 2")
+    return 0
+
+@test
+def test_abs_value() -> i32:
+    """Test absolute value function."""
+    assert!(abs_value(5) == 5, "abs(5) should equal 5")
+    assert!(abs_value(-5) == 5, "abs(-5) should equal 5")
+    assert!(abs_value(0) == 0, "abs(0) should equal 0")
+    return 0
+
+@test
+def test_clamp() -> i32:
+    """Test value clamping."""
+    assert!(clamp(5, 0, 10) == 5, "5 in [0,10] stays 5")
+    assert!(clamp(-5, 0, 10) == 0, "-5 clamped to [0,10] is 0")
+    assert!(clamp(15, 0, 10) == 10, "15 clamped to [0,10] is 10")
+    assert!(clamp(0, 0, 10) == 0, "boundary value 0")
+    assert!(clamp(10, 0, 10) == 10, "boundary value 10")
+    return 0
+
+# ============================================================================
+# Tests with Timeout - @test(timeout=<ms>)
+# ============================================================================
+
+@test(timeout=1000)
+def test_sum_with_timeout() -> i32:
+    """Test with 1 second timeout."""
+    let result: i64 = sum_to_n(100)
+    assert!(result == 4950, "sum of 0..100 should equal 4950")
+    return 0
+
+# ============================================================================
+# Device-Specific Tests - @test(device="<device>")
+# ============================================================================
+
+@test(device="cpu")
+def test_cpu_only() -> i32:
+    """Test that only runs on CPU."""
+    let result: i64 = add(100, 200)
+    assert!(result == 300, "100 + 200 should equal 300")
+    return 0
+
+@test(device="cuda")
+def test_cuda_only() -> i32:
+    """Test that only runs on CUDA devices (skipped if no CUDA)."""
+    let result: i64 = multiply(50, 50)
+    assert!(result == 2500, "50 * 50 should equal 2500")
+    return 0
+
+# ============================================================================
+# Skipped Tests - @test(skip=True) or @test(skip="reason")
+# ============================================================================
+
+@test(skip=True)
+def test_skipped_no_reason() -> i32:
+    """This test is skipped without a reason."""
+    assert!(1 == 2, "this should not run")
+    return 0
+
+@test(skip="Feature not yet implemented")
+def test_skipped_with_reason() -> i32:
+    """Skipped test with a descriptive reason."""
+    assert!(1 == 1, "this should not run either")
+    return 0
+
+# ============================================================================
+# Expected Failure Tests
+# ============================================================================
+
+#@test
+#def test_expected_failure_assert() -> i32:
+#    """Intentional failure to demonstrate failing assertions."""
+#    assert!(1 == 2, "intentional failure to show test reporting")
+#    return 0
+
+# ============================================================================
+# Combined Options - Multiple decorator arguments
+# ============================================================================
+
+@test(device="cpu", timeout=2000)
+def test_combined_options() -> i32:
+    """Test with both device filter and timeout."""
+    let mut sum: i64 = 0
+    for i in range(1000):
+        sum += i
+    assert!(sum == 499500, "sum of 0..1000 should equal 499500")
+    return 0
+
+# ============================================================================
+# Address-preserving borrows (issue #573)
+# ============================================================================
+# A borrow lowers to the borrowed place's address, so a write through the
+# reference must be visible in the original storage. These run through the full
+# MLIR/LLVM toolchain in PR CI (test-axyon-projects).
+
+struct BorrowPoint:
+    x: i32
+    y: i32
+
+def borrow_set(r: ref_mut[i32], v: i32) -> unit:
+    *r = v
+
+def borrow_bump(r: ref_mut[i32]) -> unit:
+    let cur: i32 = *r
+    borrow_set(ref_mut(*r), cur + 1)
+
+def borrow_read(r: ref[i32]) -> i32:
+    let v: i32 = *r
+    return v
+
+@test
+def test_field_borrow_of_local_mutates_the_local() -> i32:
+    """`ref_mut(p.y)` aliases the field inside `p`'s storage."""
+    let mut p: BorrowPoint = BorrowPoint { x: 1, y: 2 }
+    borrow_set(ref_mut(p.y), 40)
+    assert!(p.y == 40, "write through a field borrow must reach p.y")
+    assert!(p.x == 1, "sibling field must be untouched")
+    return 0
+
+@test
+def test_deref_borrow_of_parameter_mutates_the_original() -> i32:
+    """`ref_mut(*r)` re-borrows the pointer `r` holds, not a copy."""
+    let mut n: i32 = 7
+    borrow_bump(ref_mut(n))
+    assert!(n == 8, "bump through a re-borrowed parameter must reach n")
+    return 0
+
+@test
+def test_shared_borrow_observes_the_local() -> i32:
+    """A shared field borrow reads the field's current storage, not a stale copy."""
+    let mut p: BorrowPoint = BorrowPoint { x: 3, y: 4 }
+    let thirty: i32 = 30
+    p.x = thirty
+    assert!(borrow_read(ref(p.x)) == 30, "shared field borrow sees the write")
+    return 0
+
+@test
+def test_borrows_retained_across_iterations_stay_distinct() -> i32:
+    """One reference retained per loop iteration keeps its own value.
+
+    Each iteration borrows a distinct Vec element (a place), so the three
+    retained references must read 0, 10, 20. A borrow of a *temporary* inside
+    the loop (`refs.push(ref(i * 10))`) is rejected at compile time: it would
+    reuse one spill slot and every reference would read the last value.
+    """
+    let mut vals: Vec[i32] = Vec.new()
+    for i: i32 in range(3):
+        vals.push(i * 10)
+    let mut refs: Vec[ref[i32]] = Vec.new()
+    for k: i64 in range(3):
+        refs.push(ref(vals[k]))
+    let r0: ref[i32] = refs[0]
+    let r1: ref[i32] = refs[1]
+    let r2: ref[i32] = refs[2]
+    assert!(borrow_read(r0) == 0, "first retained reference keeps iteration 0")
+    assert!(borrow_read(r1) == 10, "second retained reference keeps iteration 1")
+    assert!(borrow_read(r2) == 20, "third retained reference keeps iteration 2")
+    return 0
+
+# A reference to a loop variable kept in an outer collection
+# (`refs.push(ref(i))`) is rejected with AX0524 (#1077): the variable is
+# re-bound every iteration, so the reference would outlive its own iteration.
+# The earlier tests that retained such references (#573) were removed with that
+# rule; borrows of distinct Vec elements (above) are still retained.
+
+@test
+def test_vec_element_borrow_mutates_the_element() -> i32:
+    """`ref_mut(v[i])` points into the Vec's heap buffer, not a copy."""
+    let mut v: Vec[i32] = Vec.new()
+    v.push(1)
+    v.push(2)
+    borrow_set(ref_mut(v[1]), 9)
+    assert!(v[1] == 9, "write through a Vec element borrow must reach v[1]")
+    assert!(v[0] == 1, "sibling element must be untouched")
+    return 0
+
+@test
+def test_array_element_borrow_mutates_the_element() -> i32:
+    """`ref_mut(a[i])` points into the array's storage."""
+    let mut a: Array[i32; 3] = [1, 2, 3]
+    let i: i64 = 2
+    borrow_set(ref_mut(a[i]), 30)
+    assert!(a[2] == 30, "write through an array element borrow must reach a[2]")
+    return 0
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+def main() -> i32:
+    """Main function - run 'axyon test' to execute tests."""
+    println!("Testing Demo")
+    println!("============")
+    println!("")
+    println!("Run tests with: axyon test")
+    println!("")
+    println!("Options:")
+    println!("  --verbose    Show detailed output")
+    println!("  --filter X   Run tests matching X")
+    println!("  --device X   Run only tests for device X")
+    println!("  --fail-fast  Stop on first failure")
+    println!("")
+    println!("Decorators:")
+    println!("  @test                    Basic test")
+    println!("  @test(timeout=1000)      1s timeout")
+    println!("  @test(device=\"cpu\")      CPU-only")
+    println!("  @test(skip=True)         Skip test")
+    println!("  @test(should_panic=True) Expect panic")
+    return 0

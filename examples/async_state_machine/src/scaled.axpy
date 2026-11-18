@@ -1,0 +1,13 @@
+# A sibling module with its own private `async def pair`: same-named private
+# async functions of different modules each get a module-qualified `poll`
+# (#2235).
+
+from core.future import Future, Poll
+from core.task import Context
+
+async def pair(x: i64) -> i64:
+    return x * 10
+
+@public
+async def scaled(x: i64) -> i64:
+    return await pair(x)

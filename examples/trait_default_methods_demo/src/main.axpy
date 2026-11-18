@@ -1,0 +1,43 @@
+# Trait default methods (#571): a trait method with a body is a default that
+# impls inherit unless they override it.
+
+trait Shape:
+    # required
+    def area(self: ref[Self]) -> i32
+
+    # defaults: may call required methods and other defaults
+    def double_area(self: ref[Self]) -> i32:
+        return self.area() + self.area()
+
+    def describe(self: ref[Self]) -> i32:
+        return self.double_area() + 1
+
+struct Square:
+    side: i32
+
+struct Rect:
+    w: i32
+    h: i32
+
+impl Shape for Square:
+    def area(self: ref[Self]) -> i32:
+        return self.side * self.side
+
+impl Shape for Rect:
+    def area(self: ref[Self]) -> i32:
+        return self.w * self.h
+
+    # override one default
+    def describe(self: ref[Self]) -> i32:
+        return 100
+
+def main() -> i32:
+    let s: Square = Square { side: 3 }
+    let r: Rect = Rect { w: 2, h: 5 }
+    let sd: i32 = s.double_area()
+    let rd: i32 = r.double_area()
+    println!("square double area: {sd}")
+    println!("rect double area: {rd}")
+    assert!(s.describe() == 19, "inherited default")
+    assert!(r.describe() == 100, "overridden default")
+    return 0

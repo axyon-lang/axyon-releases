@@ -1,0 +1,40 @@
+# Per-function floating-point mode (issue #1925). The package-wide
+# `[build] fast_math` stays "off" (strict IEEE); `@fast_math("...")` replaces
+# it for one function. Modes: "off", "contract" (fused multiply-add),
+# "reassoc" (reorders float reductions so they vectorize; results may differ
+# in the last bits). "fast" is package-wide only.
+
+@fast_math("reassoc")
+def sum_squares_marked(x: f64, n: i64) -> f64:
+    let mut s: f64 = 0.0
+    for i: i64 in range(n):
+        s = s + x * x
+    return s
+
+# Unmarked: keeps the package mode (strict here).
+def sum_squares_plain(x: f64, n: i64) -> f64:
+    let mut s: f64 = 0.0
+    for i: i64 in range(n):
+        s = s + x * x
+    return s
+
+# Pins strict order even if the package later enables fast math.
+@fast_math("off")
+def sum_squares_strict(x: f64, n: i64) -> f64:
+    let mut s: f64 = 0.0
+    for i: i64 in range(n):
+        s = s + x * x
+    return s
+
+@fast_math("contract")
+def fma(a: f64, b: f64, c: f64) -> f64:
+    return a * b + c
+
+def main() -> i32:
+    # 0.5 * 0.5 is exact in binary, so every ordering gives the same sum.
+    assert!(sum_squares_marked(0.5, 8) == 2.0, "marked")
+    assert!(sum_squares_plain(0.5, 8) == 2.0, "plain")
+    assert!(sum_squares_strict(0.5, 8) == 2.0, "strict")
+    assert!(fma(2.0, 3.0, 1.0) == 7.0, "fma")
+    println!("fast_math_demo ok")
+    return 0

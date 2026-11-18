@@ -1,0 +1,46 @@
+# Interior mutability with std.core.cell (#181).
+#
+# `Cell[T]` and `RefCell[T]` are mutated through a *shared* reference: the
+# store goes to the caller's value, not to a copy. `RefCell` checks its borrow
+# rules at run time; a conflicting acquisition panics in every build profile.
+
+from std.core.cell import Cell, RefCell
+
+struct Counter:
+    hits: Cell[i64]
+    name_len: i64
+
+# `k` is a shared reference, yet the hit count changes.
+def record(k: ref[Counter]) -> unit:
+    k.hits.set(k.hits.get() + 1)
+
+def bump(c: ref[Cell[i64]]) -> unit:
+    c.set(c.get() * 2)
+
+def write_twice(r: ref[RefCell[i64]], v: i64) -> unit:
+    r.borrow_mut()
+    r.release_borrow_mut()
+    r.set(v)
+    # A second exclusive loan while the first is outstanding would panic:
+    #     r.borrow_mut(); r.borrow_mut()
+
+def main() -> i32:
+    let c: Cell[i64] = Cell.new(3)
+    bump(ref(c))
+    let doubled: i64 = c.get()
+    println!("cell after bump: {doubled}")
+    assert!(c.get() == 6, "the store reached the caller's cell")
+
+    let k: Counter = Counter { hits: Cell.new(0), name_len: 7 }
+    record(ref(k))
+    record(ref(k))
+    assert!(k.hits.get() == 2, "two hits recorded through shared references")
+
+    let rc: RefCell[i64] = RefCell.new(0)
+    write_twice(ref(rc), 42)
+    assert!(rc.borrow_state() == 0, "every loan was released")
+    assert!(rc.try_borrow_mut(), "the cell is free again")
+    rc.release_borrow_mut()
+    let value: i64 = rc.get()
+    println!("refcell value: {value}")
+    return 0

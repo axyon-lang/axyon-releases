@@ -1,0 +1,15 @@
+[package]
+name = "cuda_complex"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# Generated kernels run on CUDA (#2827): exactly one GPU target with a
+# device runtime.
+[target]
+gpu = ["nvptx-sm80"]

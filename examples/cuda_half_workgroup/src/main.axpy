@@ -1,0 +1,635 @@
+# Half-precision workgroup memory and workgroup collectives on an NVIDIA GPU
+# (issue #2828)
+#
+# Every kernel runs on the device and every result is compared bit for bit
+# (any NaN matches any NaN) with the strict host computation of the same
+# values in the same order:
+#
+# 1. Half tiles. `f16`/`bf16` workgroup buffers hold the 16-bit patterns
+#    themselves (2 bytes per element, half the shared memory of an `f32`
+#    tile): a round trip of zeros of both signs, subnormals, the largest
+#    finite values, infinities and NaN through a tile of odd length, the
+#    zero-fill of tiles nobody writes, and a 64 x 64 tiled matmul whose
+#    16 x 16 tiles are staged in the half type. The matmul accumulates twice:
+#    in an explicit f32 accumulator (`acc + (x as f32) * (w as f32)`) and in
+#    the half type (`acc16 + x * w`, each operation rounded once).
+# 2. Half collectives. `gpu_workgroup_sum`/`_min`/`_max` of an `f16`/`bf16`
+#    value combine in the half type, each step rounded once to nearest even
+#    (numeric contract §5.3b): no hidden f32 accumulator. The strict sum is
+#    the host's left-to-right fold in thread order; the `reassociate` sum is
+#    the fixed subgroup tree, emulated on the host. A half sum of one large
+#    value and 255 ones stalls where an f32 accumulator would not (an
+#    explicit `x as f32` operand is the way to ask for that). Min/max are
+#    IEEE minimumNumber/maximumNumber, with NaN as the tail-lane identity.
+#
+# Strict math only: no fast math, no `.ftz`, no `.approx`, no contraction.
+
+const BLOCK: i64 = 256
+
+# The same value: equal bit patterns, or both NaN (payloads are not part of
+# the contract). Widening a half value to f64 is exact, so the bits of the
+# f64 keep the sign of zero and every finite value.
+def same(x: f64, y: f64) -> bool:
+    if x != x:
+        return y != y
+    return x.to_bits() == y.to_bits()
+
+# Print one mismatch; returns 1.
+def report(what: &str, i: i64, got: f64, want: f64) -> i64:
+    println!("{what} mismatch: lane {i}: got {got}, want {want}")
+    return 1
+
+def next_seed(s: i64) -> i64:
+    return (s * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+
+# A value in [-4, 4) with 1/256 steps.
+def small(s: i64) -> f64:
+    return (((s >> 33) & 2047) - 1024) as f64 / 256.0
+
+# 2^-k, exact in f64 for the k used here.
+def pow2_neg(k: i64) -> f64:
+    let mut v: f64 = 1.0
+    for i: i64 in range(k):
+        v = v / 2.0
+    return v
+
+# 256 test values: the boundary cases of the format first, then
+# pseudo-random ones. `tiny`/`sub_max`/`norm_min`/`big` are the format's
+# smallest subnormal, largest subnormal, smallest normal and largest finite
+# value (as f64, exact).
+def table(seed: i64, tiny: f64, sub_max: f64, norm_min: f64, big: f64) -> Buffer[f64, (256,)]:
+    let mut t: Buffer[f64, (256,)] = buffer_alloc([256])
+    let zero: f64 = 0.0
+    let specials: Array[f64; 16] = [0.0, -0.0, tiny, -tiny, sub_max, norm_min, 1.0, -1.0, big, -big, 1.0 / zero, -1.0 / zero, zero / zero, 0.5, -0.25, 3.0]
+    for i: i64 in range(16):
+        buffer_set(t, i, specials[i])
+    let mut s: i64 = seed
+    for i: i64 in range(16, 256):
+        s = next_seed(s)
+        buffer_set(t, i, small(s))
+    return t
+
+# ---- Section 1: half tiles ----
+
+# Thread `i` stores its value in slot `i` of a 257-element tile, and after
+# the barrier reads slot `255 - i` (another thread's store). Slot 256 and
+# the whole of `u` are never written: they read the zero-fill (+0.0).
+@gpu(entry)
+def tile_roundtrip_f16(x: &Buffer[f16, (256,), device_global], y: &mut Buffer[f16, (256,), device_global], z: &mut Buffer[f16, (512,), device_global]) -> None:
+    let t: &mut Buffer[f16, (257,), workgroup] = gpu_workgroup_buffer()
+    let u: &mut Buffer[f16, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let i: i64 = gpu_thread_id(0)
+    buffer_set(t, i, buffer_get(x, i))
+    gpu_barrier()
+    buffer_set(y, i, buffer_get(t, 255 - i))
+    buffer_set(z, i, buffer_get(u, i / 16, i % 16))
+    buffer_set(z, 256 + i, buffer_get(t, 256))
+
+@gpu(entry)
+def tile_roundtrip_bf16(x: &Buffer[bf16, (256,), device_global], y: &mut Buffer[bf16, (256,), device_global], z: &mut Buffer[bf16, (512,), device_global]) -> None:
+    let t: &mut Buffer[bf16, (257,), workgroup] = gpu_workgroup_buffer()
+    let u: &mut Buffer[bf16, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let i: i64 = gpu_thread_id(0)
+    buffer_set(t, i, buffer_get(x, i))
+    gpu_barrier()
+    buffer_set(y, i, buffer_get(t, 255 - i))
+    buffer_set(z, i, buffer_get(u, i / 16, i % 16))
+    buffer_set(z, 256 + i, buffer_get(t, 256))
+
+# c = a x b for 64 x 64 matrices through 16 x 16 half tiles (block `g`
+# computes tile row `g >> 2`, tile column `g & 3`), in the `p = 16 t + q`
+# order of the host loop. `acc` widens each operand explicitly; `acc16`
+# stays in the half type.
+@gpu(entry)
+def matmul_f16_tiles(a: &Buffer[f16, (4096,), device_global], b: &Buffer[f16, (4096,), device_global], c32: &mut Buffer[f32, (4096,), device_global], c16: &mut Buffer[f16, (4096,), device_global]) -> None:
+    let ta: &mut Buffer[f16, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let tb: &mut Buffer[f16, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let ty: i64 = gpu_thread_id(0) / 16
+    let tx: i64 = gpu_thread_id(0) % 16
+    let row: i64 = (gpu_block_id(0) >> 2) * 16 + ty
+    let col: i64 = (gpu_block_id(0) & 3) * 16 + tx
+    let mut acc: f32 = 0.0
+    let mut acc16: f16 = 0.0
+    for t: i64 in range(4):
+        buffer_set(ta, ty, tx, buffer_get(a, row * 64 + t * 16 + tx))
+        buffer_set(tb, ty, tx, buffer_get(b, (t * 16 + ty) * 64 + col))
+        gpu_barrier()
+        for q: i64 in range(16):
+            let x: f16 = buffer_get(ta, ty, q)
+            let w: f16 = buffer_get(tb, q, tx)
+            acc = acc + (x as f32) * (w as f32)
+            acc16 = acc16 + x * w
+        gpu_barrier()
+    buffer_set(c32, row * 64 + col, acc)
+    buffer_set(c16, row * 64 + col, acc16)
+
+@gpu(entry)
+def matmul_bf16_tiles(a: &Buffer[bf16, (4096,), device_global], b: &Buffer[bf16, (4096,), device_global], c32: &mut Buffer[f32, (4096,), device_global], c16: &mut Buffer[bf16, (4096,), device_global]) -> None:
+    let ta: &mut Buffer[bf16, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let tb: &mut Buffer[bf16, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let ty: i64 = gpu_thread_id(0) / 16
+    let tx: i64 = gpu_thread_id(0) % 16
+    let row: i64 = (gpu_block_id(0) >> 2) * 16 + ty
+    let col: i64 = (gpu_block_id(0) & 3) * 16 + tx
+    let mut acc: f32 = 0.0
+    let mut acc16: bf16 = 0.0
+    for t: i64 in range(4):
+        buffer_set(ta, ty, tx, buffer_get(a, row * 64 + t * 16 + tx))
+        buffer_set(tb, ty, tx, buffer_get(b, (t * 16 + ty) * 64 + col))
+        gpu_barrier()
+        for q: i64 in range(16):
+            let x: bf16 = buffer_get(ta, ty, q)
+            let w: bf16 = buffer_get(tb, q, tx)
+            acc = acc + (x as f32) * (w as f32)
+            acc16 = acc16 + x * w
+        gpu_barrier()
+    buffer_set(c32, row * 64 + col, acc)
+    buffer_set(c16, row * 64 + col, acc16)
+
+def check_tiles_f16() -> i64:
+    let src: Buffer[f64, (256,)] = table(2828, pow2_neg(24), pow2_neg(14) - pow2_neg(24), pow2_neg(14), 65504.0)
+    let mut x: Buffer[f16, (256,)] = buffer_alloc([256])
+    for i: i64 in range(256):
+        buffer_set(x, i, buffer_get(src, i) as f16)
+    let mut y0: Buffer[f16, (256,)] = buffer_alloc([256])
+    let mut z0: Buffer[f16, (512,)] = buffer_alloc([512])
+    for i: i64 in range(256):
+        buffer_set(y0, i, 7.0)
+    for i: i64 in range(512):
+        buffer_set(z0, i, 7.0)
+    let dx: Buffer[f16, (256,), device_global] = buffer_to_device(x)
+    let mut dy: Buffer[f16, (256,), device_global] = buffer_to_device(y0)
+    let mut dz: Buffer[f16, (512,), device_global] = buffer_to_device(z0)
+    gpu_launch(tile_roundtrip_f16, 1, BLOCK, &dx, &mut dy, &mut dz)
+    let y: Buffer[f16, (256,)] = buffer_to_host(dy)
+    let z: Buffer[f16, (512,)] = buffer_to_host(dz)
+    let mut bad: i64 = 0
+    for i: i64 in range(256):
+        let got: f64 = buffer_get(y, i) as f64
+        let want: f64 = (buffer_get(src, 255 - i) as f16) as f64
+        if not same(got, want):
+            bad = bad + report("f16 tile round trip", i, got, want)
+    for i: i64 in range(512):
+        let got: f64 = buffer_get(z, i) as f64
+        if not same(got, 0.0):
+            bad = bad + report("f16 tile zero-fill", i, got, 0.0)
+    return bad
+
+def check_tiles_bf16() -> i64:
+    let big: f64 = (2.0 - pow2_neg(7)) * 170141183460469231731687303715884105728.0
+    let src: Buffer[f64, (256,)] = table(2829, pow2_neg(133), pow2_neg(126) - pow2_neg(133), pow2_neg(126), big)
+    let mut x: Buffer[bf16, (256,)] = buffer_alloc([256])
+    for i: i64 in range(256):
+        buffer_set(x, i, buffer_get(src, i) as bf16)
+    let mut y0: Buffer[bf16, (256,)] = buffer_alloc([256])
+    let mut z0: Buffer[bf16, (512,)] = buffer_alloc([512])
+    for i: i64 in range(256):
+        buffer_set(y0, i, 7.0 as bf16)
+    for i: i64 in range(512):
+        buffer_set(z0, i, 7.0 as bf16)
+    let dx: Buffer[bf16, (256,), device_global] = buffer_to_device(x)
+    let mut dy: Buffer[bf16, (256,), device_global] = buffer_to_device(y0)
+    let mut dz: Buffer[bf16, (512,), device_global] = buffer_to_device(z0)
+    gpu_launch(tile_roundtrip_bf16, 1, BLOCK, &dx, &mut dy, &mut dz)
+    let y: Buffer[bf16, (256,)] = buffer_to_host(dy)
+    let z: Buffer[bf16, (512,)] = buffer_to_host(dz)
+    let mut bad: i64 = 0
+    for i: i64 in range(256):
+        let got: f64 = buffer_get(y, i) as f64
+        let want: f64 = (buffer_get(src, 255 - i) as bf16) as f64
+        if not same(got, want):
+            bad = bad + report("bf16 tile round trip", i, got, want)
+    for i: i64 in range(512):
+        let got: f64 = buffer_get(z, i) as f64
+        if not same(got, 0.0):
+            bad = bad + report("bf16 tile zero-fill", i, got, 0.0)
+    return bad
+
+def check_matmul_f16() -> i64:
+    let mut s: i64 = 5656
+    let mut a: Buffer[f16, (4096,)] = buffer_alloc([4096])
+    let mut b: Buffer[f16, (4096,)] = buffer_alloc([4096])
+    for t: i64 in range(4096):
+        s = next_seed(s)
+        buffer_set(a, t, small(s) as f16)
+        s = next_seed(s)
+        buffer_set(b, t, small(s) as f16)
+    let mut w32: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut w16: Buffer[f16, (4096,)] = buffer_alloc([4096])
+    for t: i64 in range(4096):
+        let i: i64 = t >> 6
+        let j: i64 = t & 63
+        let mut acc: f32 = 0.0
+        let mut acc16: f16 = 0.0
+        for p: i64 in range(64):
+            let x: f16 = buffer_get(a, i * 64 + p)
+            let w: f16 = buffer_get(b, p * 64 + j)
+            acc = acc + (x as f32) * (w as f32)
+            acc16 = acc16 + x * w
+        buffer_set(w32, t, acc)
+        buffer_set(w16, t, acc16)
+    let mut z32: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut z16: Buffer[f16, (4096,)] = buffer_alloc([4096])
+    let da: Buffer[f16, (4096,), device_global] = buffer_to_device(a)
+    let db: Buffer[f16, (4096,), device_global] = buffer_to_device(b)
+    let mut d32: Buffer[f32, (4096,), device_global] = buffer_to_device(z32)
+    let mut d16: Buffer[f16, (4096,), device_global] = buffer_to_device(z16)
+    gpu_launch(matmul_f16_tiles, 16, BLOCK, &da, &db, &mut d32, &mut d16)
+    let g32: Buffer[f32, (4096,)] = buffer_to_host(d32)
+    let g16: Buffer[f16, (4096,)] = buffer_to_host(d16)
+    let mut bad: i64 = 0
+    for t: i64 in range(4096):
+        let g: f64 = buffer_get(g32, t) as f64
+        let w: f64 = buffer_get(w32, t) as f64
+        if not same(g, w):
+            bad = bad + report("f16-tile matmul (f32 acc)", t, g, w)
+        let h: f64 = buffer_get(g16, t) as f64
+        let v: f64 = buffer_get(w16, t) as f64
+        if not same(h, v):
+            bad = bad + report("f16-tile matmul (f16 acc)", t, h, v)
+    return bad
+
+def check_matmul_bf16() -> i64:
+    let mut s: i64 = 6767
+    let mut a: Buffer[bf16, (4096,)] = buffer_alloc([4096])
+    let mut b: Buffer[bf16, (4096,)] = buffer_alloc([4096])
+    for t: i64 in range(4096):
+        s = next_seed(s)
+        buffer_set(a, t, small(s) as bf16)
+        s = next_seed(s)
+        buffer_set(b, t, small(s) as bf16)
+    let mut w32: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut w16: Buffer[bf16, (4096,)] = buffer_alloc([4096])
+    for t: i64 in range(4096):
+        let i: i64 = t >> 6
+        let j: i64 = t & 63
+        let mut acc: f32 = 0.0
+        let mut acc16: bf16 = 0.0
+        for p: i64 in range(64):
+            let x: bf16 = buffer_get(a, i * 64 + p)
+            let w: bf16 = buffer_get(b, p * 64 + j)
+            acc = acc + (x as f32) * (w as f32)
+            acc16 = acc16 + x * w
+        buffer_set(w32, t, acc)
+        buffer_set(w16, t, acc16)
+    let mut z32: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut z16: Buffer[bf16, (4096,)] = buffer_alloc([4096])
+    let da: Buffer[bf16, (4096,), device_global] = buffer_to_device(a)
+    let db: Buffer[bf16, (4096,), device_global] = buffer_to_device(b)
+    let mut d32: Buffer[f32, (4096,), device_global] = buffer_to_device(z32)
+    let mut d16: Buffer[bf16, (4096,), device_global] = buffer_to_device(z16)
+    gpu_launch(matmul_bf16_tiles, 16, BLOCK, &da, &db, &mut d32, &mut d16)
+    let g32: Buffer[f32, (4096,)] = buffer_to_host(d32)
+    let g16: Buffer[bf16, (4096,)] = buffer_to_host(d16)
+    let mut bad: i64 = 0
+    for t: i64 in range(4096):
+        let g: f64 = buffer_get(g32, t) as f64
+        let w: f64 = buffer_get(w32, t) as f64
+        if not same(g, w):
+            bad = bad + report("bf16-tile matmul (f32 acc)", t, g, w)
+        let h: f64 = buffer_get(g16, t) as f64
+        let v: f64 = buffer_get(w16, t) as f64
+        if not same(h, v):
+            bad = bad + report("bf16-tile matmul (bf16 acc)", t, h, v)
+    return bad
+
+# ---- Section 2: half collectives ----
+
+# Every thread stores the collective's result, so the host also checks
+# that all 256 threads received the same value.
+@gpu(entry)
+@schedule(subgroup=32, max_threads=256)
+def sum_f16(x: &Buffer[f16, (256,), device_global], out: &mut Buffer[f16, (256,), device_global]) -> None:
+    let s: f16 = gpu_workgroup_sum(buffer_get(x, gpu_thread_id(0)))
+    buffer_set(out, gpu_thread_id(0), s)
+
+@gpu(entry)
+@schedule(subgroup=32, max_threads=256, reduction="reassociate")
+def sum_f16_tree(x: &Buffer[f16, (256,), device_global], out: &mut Buffer[f16, (256,), device_global]) -> None:
+    let s: f16 = gpu_workgroup_sum(buffer_get(x, gpu_thread_id(0)))
+    buffer_set(out, gpu_thread_id(0), s)
+
+@gpu(entry)
+@schedule(subgroup=32, max_threads=256)
+def sum_bf16(x: &Buffer[bf16, (256,), device_global], out: &mut Buffer[bf16, (256,), device_global]) -> None:
+    let s: bf16 = gpu_workgroup_sum(buffer_get(x, gpu_thread_id(0)))
+    buffer_set(out, gpu_thread_id(0), s)
+
+@gpu(entry)
+@schedule(subgroup=32, max_threads=256, reduction="reassociate")
+def sum_bf16_tree(x: &Buffer[bf16, (256,), device_global], out: &mut Buffer[bf16, (256,), device_global]) -> None:
+    let s: bf16 = gpu_workgroup_sum(buffer_get(x, gpu_thread_id(0)))
+    buffer_set(out, gpu_thread_id(0), s)
+
+# Lanes at or past `n` contribute `pad` (NaN: the min/max identity).
+@gpu(entry)
+@schedule(subgroup=32, max_threads=256)
+def minmax_f16(n: i64, pad: f16, x: &Buffer[f16, (256,), device_global], out: &mut Buffer[f16, (512,), device_global]) -> None:
+    let i: i64 = gpu_thread_id(0)
+    let mut v: f16 = pad
+    if i < n:
+        v = buffer_get(x, i)
+    let lo: f16 = gpu_workgroup_min(v)
+    let hi: f16 = gpu_workgroup_max(v)
+    buffer_set(out, i, lo)
+    buffer_set(out, 256 + i, hi)
+
+@gpu(entry)
+@schedule(subgroup=32, max_threads=256)
+def minmax_bf16(n: i64, pad: bf16, x: &Buffer[bf16, (256,), device_global], out: &mut Buffer[bf16, (512,), device_global]) -> None:
+    let i: i64 = gpu_thread_id(0)
+    let mut v: bf16 = pad
+    if i < n:
+        v = buffer_get(x, i)
+    let lo: bf16 = gpu_workgroup_min(v)
+    let hi: bf16 = gpu_workgroup_max(v)
+    buffer_set(out, i, lo)
+    buffer_set(out, 256 + i, hi)
+
+# Check that every lane of `got` (as f64) is `want`.
+def check_lanes(what: &str, got: Buffer[f64, (512,)], lo: i64, hi: i64, want: f64) -> i64:
+    let mut bad: i64 = 0
+    for i: i64 in range(lo, hi):
+        let g: f64 = buffer_get(got, i)
+        if not same(g, want):
+            bad = bad + report(what, i, g, want)
+    return bad
+
+# Lanes 0..255 of `got` are the minimum, 256..511 the maximum.
+def check_minmax_lanes(what: &str, case: i64, got: Buffer[f64, (512,)], lo: f64, hi: f64) -> i64:
+    let mut bad: i64 = 0
+    for i: i64 in range(512):
+        let g: f64 = buffer_get(got, i)
+        let mut want: f64 = lo
+        if i >= 256:
+            want = hi
+        if not same(g, want):
+            bad = bad + report(what, case * 1000 + i, g, want)
+    return bad
+
+def device_sum_f16(x: Buffer[f16, (256,)], tree: bool) -> Buffer[f64, (512,)]:
+    let mut z: Buffer[f16, (256,)] = buffer_alloc([256])
+    let dx: Buffer[f16, (256,), device_global] = buffer_to_device(x)
+    let mut d: Buffer[f16, (256,), device_global] = buffer_to_device(z)
+    if tree:
+        gpu_launch(sum_f16_tree, 1, BLOCK, &dx, &mut d)
+    else:
+        gpu_launch(sum_f16, 1, BLOCK, &dx, &mut d)
+    let g: Buffer[f16, (256,)] = buffer_to_host(d)
+    let mut out: Buffer[f64, (512,)] = buffer_alloc([512])
+    for i: i64 in range(256):
+        buffer_set(out, i, buffer_get(g, i) as f64)
+    return out
+
+def device_sum_bf16(x: Buffer[bf16, (256,)], tree: bool) -> Buffer[f64, (512,)]:
+    let mut z: Buffer[bf16, (256,)] = buffer_alloc([256])
+    let dx: Buffer[bf16, (256,), device_global] = buffer_to_device(x)
+    let mut d: Buffer[bf16, (256,), device_global] = buffer_to_device(z)
+    if tree:
+        gpu_launch(sum_bf16_tree, 1, BLOCK, &dx, &mut d)
+    else:
+        gpu_launch(sum_bf16, 1, BLOCK, &dx, &mut d)
+    let g: Buffer[bf16, (256,)] = buffer_to_host(d)
+    let mut out: Buffer[f64, (512,)] = buffer_alloc([512])
+    for i: i64 in range(256):
+        buffer_set(out, i, buffer_get(g, i) as f64)
+    return out
+
+# The host's strict fold: slot 0, then slots 1, 2, .., 255 left to right,
+# each `+` rounded to f16.
+def seq_f16(x: Buffer[f16, (256,)]) -> f16:
+    let mut acc: f16 = buffer_get(x, 0)
+    for i: i64 in range(1, 256):
+        acc = acc + buffer_get(x, i)
+    return acc
+
+# The `reassociate` tier's fixed tree: a pairwise tree (strides 16 .. 1)
+# within each 32-lane subgroup, then the subgroup leaders folded left to
+# right, each `+` rounded to f16.
+def tree_f16(x: Buffer[f16, (256,)]) -> f16:
+    let mut w: Buffer[f16, (256,)] = buffer_alloc([256])
+    for i: i64 in range(256):
+        buffer_set(w, i, buffer_get(x, i))
+    let mut stride: i64 = 16
+    while stride >= 1:
+        for t: i64 in range(256):
+            if t % 32 < stride:
+                buffer_set(w, t, buffer_get(w, t) + buffer_get(w, t + stride))
+        stride = stride / 2
+    let mut acc: f16 = buffer_get(w, 0)
+    for j: i64 in range(1, 8):
+        acc = acc + buffer_get(w, 32 * j)
+    return acc
+
+def seq_bf16(x: Buffer[bf16, (256,)]) -> bf16:
+    let mut acc: bf16 = buffer_get(x, 0)
+    for i: i64 in range(1, 256):
+        acc = acc + buffer_get(x, i)
+    return acc
+
+def tree_bf16(x: Buffer[bf16, (256,)]) -> bf16:
+    let mut w: Buffer[bf16, (256,)] = buffer_alloc([256])
+    for i: i64 in range(256):
+        buffer_set(w, i, buffer_get(x, i))
+    let mut stride: i64 = 16
+    while stride >= 1:
+        for t: i64 in range(256):
+            if t % 32 < stride:
+                buffer_set(w, t, buffer_get(w, t) + buffer_get(w, t + stride))
+        stride = stride / 2
+    let mut acc: bf16 = buffer_get(w, 0)
+    for j: i64 in range(1, 8):
+        acc = acc + buffer_get(w, 32 * j)
+    return acc
+
+# Inputs that tell the orders apart: every 8th lane is an integer in
+# [16, 32), the others small (k/256 in [-4, 4)), so the running half sum
+# sits where its ulp rounds away part of each small term, by an amount that
+# depends on the order. The host fails the check if the strict fold, the
+# tree and a single rounding of the exact f32 sum do not all differ: if the
+# inputs stopped discriminating, the check would say so, not pass. Case 1
+# is one large value and 255 ones (below).
+def sum_input(case: i64, seed: i64, t: i64) -> f64:
+    if case == 1:
+        # `seed` is the format's stall point here: 2048 for f16, 256 for
+        # bf16 (where 1 is half an ulp).
+        if t == 0:
+            return seed as f64
+        return 1.0
+    let s: i64 = next_seed(seed + 977 * t)
+    if t % 8 == 0:
+        return (((s >> 33) & 15) + 16) as f64
+    return small(s)
+
+def sums_f16(case: i64) -> Buffer[f16, (256,)]:
+    let mut x: Buffer[f16, (256,)] = buffer_alloc([256])
+    for t: i64 in range(256):
+        buffer_set(x, t, sum_input(case, 2048 * case + 2 * (1 - case), t) as f16)
+    return x
+
+def sums_bf16(case: i64) -> Buffer[bf16, (256,)]:
+    let mut x: Buffer[bf16, (256,)] = buffer_alloc([256])
+    for t: i64 in range(256):
+        buffer_set(x, t, sum_input(case, 256 * case + 16 * (1 - case), t) as bf16)
+    return x
+
+def check_sums_f16() -> i64:
+    let mut wide: f32 = -0.0
+    for t: i64 in range(256):
+        wide = wide + ((sum_input(0, 2, t) as f16) as f32)
+    let seq: f64 = seq_f16(sums_f16(0)) as f64
+    let tree: f64 = tree_f16(sums_f16(0)) as f64
+    let once: f64 = (wide as f16) as f64
+    let mut bad: i64 = 0
+    if same(seq, tree) or same(seq, once) or same(tree, once):
+        bad = bad + report("f16 sum input (order-blind)", 0, seq, tree)
+    bad = bad + check_lanes("f16 strict sum", device_sum_f16(sums_f16(0), False), 0, 256, seq)
+    bad = bad + check_lanes("f16 tree sum", device_sum_f16(sums_f16(0), True), 0, 256, tree)
+    # 2048 + 255 ones: each `+ 1` is a tie that rounds back to 2048 in f16;
+    # an f32 accumulator would reach 2303.
+    bad = bad + check_lanes("f16 sum stall", device_sum_f16(sums_f16(1), False), 0, 256, 2048.0)
+    return bad
+
+def check_sums_bf16() -> i64:
+    let mut wide: f32 = -0.0
+    for t: i64 in range(256):
+        wide = wide + ((sum_input(0, 16, t) as bf16) as f32)
+    let seq: f64 = seq_bf16(sums_bf16(0)) as f64
+    let tree: f64 = tree_bf16(sums_bf16(0)) as f64
+    let once: f64 = (wide as bf16) as f64
+    let mut bad: i64 = 0
+    if same(seq, tree) or same(seq, once) or same(tree, once):
+        bad = bad + report("bf16 sum input (order-blind)", 0, seq, tree)
+    bad = bad + check_lanes("bf16 strict sum", device_sum_bf16(sums_bf16(0), False), 0, 256, seq)
+    bad = bad + check_lanes("bf16 tree sum", device_sum_bf16(sums_bf16(0), True), 0, 256, tree)
+    # 256 + 255 ones: each `+ 1` is a tie that rounds back to 256 in bf16.
+    bad = bad + check_lanes("bf16 sum stall", device_sum_bf16(sums_bf16(1), False), 0, 256, 256.0)
+    return bad
+
+# IEEE minimumNumber/maximumNumber on exact f64 widenings (numeric contract
+# §5.3a): a NaN operand yields the other one, `-0.0 < +0.0`.
+def num_min(a: f64, b: f64) -> f64:
+    if a != a:
+        return b
+    if b != b:
+        return a
+    if a < b:
+        return a
+    if b < a:
+        return b
+    if a.to_bits() > b.to_bits():
+        return a
+    return b
+
+def num_max(a: f64, b: f64) -> f64:
+    if a != a:
+        return b
+    if b != b:
+        return a
+    if a > b:
+        return a
+    if b > a:
+        return b
+    if a.to_bits() < b.to_bits():
+        return a
+    return b
+
+# The min/max cases, as f64 sources rounded to the format: 0, a mix with
+# every special value and NaNs among the inputs (200 lanes, 56 NaN pad
+# lanes); 1, zeros of both signs only (min `-0.0`, max `+0.0`); 2, `+inf`
+# only (the NaN pad cannot lower it); 3, no input at all (all pads: NaN).
+def minmax_src(case: i64, f16_fmt: bool) -> Buffer[f64, (256,)]:
+    let zero: f64 = 0.0
+    if case == 0:
+        let mut mix: Buffer[f64, (256,)] = table(4040, pow2_neg(24), pow2_neg(14) - pow2_neg(24), pow2_neg(14), 65504.0)
+        if not f16_fmt:
+            let big: f64 = (2.0 - pow2_neg(7)) * 170141183460469231731687303715884105728.0
+            mix = table(4041, pow2_neg(133), pow2_neg(126) - pow2_neg(133), pow2_neg(126), big)
+        for i: i64 in range(16, 200, 37):
+            buffer_set(mix, i, zero / zero)
+        return mix
+    let mut b: Buffer[f64, (256,)] = buffer_alloc([256])
+    for i: i64 in range(256):
+        if case == 1:
+            if (i * 7) % 3 == 0:
+                buffer_set(b, i, -0.0)
+            else:
+                buffer_set(b, i, 0.0)
+        else:
+            buffer_set(b, i, 1.0 / zero)
+    return b
+
+def minmax_lanes(case: i64) -> i64:
+    if case == 0:
+        return 200
+    if case == 2:
+        return 100
+    if case == 3:
+        return 0
+    return 256
+
+# One min/max case: lanes below `n` take the source (rounded to the
+# format), the others NaN.
+def minmax_case_f16(case: i64) -> i64:
+    let zero: f64 = 0.0
+    let nan: f64 = zero / zero
+    let n: i64 = minmax_lanes(case)
+    let src: Buffer[f64, (256,)] = minmax_src(case, True)
+    let mut x: Buffer[f16, (256,)] = buffer_alloc([256])
+    let mut lo: f64 = nan
+    let mut hi: f64 = nan
+    for i: i64 in range(256):
+        let v: f16 = buffer_get(src, i) as f16
+        buffer_set(x, i, v)
+        if i < n:
+            lo = num_min(lo, v as f64)
+            hi = num_max(hi, v as f64)
+    let mut z: Buffer[f16, (512,)] = buffer_alloc([512])
+    let dx: Buffer[f16, (256,), device_global] = buffer_to_device(x)
+    let mut d: Buffer[f16, (512,), device_global] = buffer_to_device(z)
+    gpu_launch(minmax_f16, 1, BLOCK, n, nan as f16, &dx, &mut d)
+    let g: Buffer[f16, (512,)] = buffer_to_host(d)
+    let mut got: Buffer[f64, (512,)] = buffer_alloc([512])
+    for i: i64 in range(512):
+        buffer_set(got, i, buffer_get(g, i) as f64)
+    return check_minmax_lanes("f16 min/max", case, got, lo, hi)
+
+def minmax_case_bf16(case: i64) -> i64:
+    let zero: f64 = 0.0
+    let nan: f64 = zero / zero
+    let n: i64 = minmax_lanes(case)
+    let src: Buffer[f64, (256,)] = minmax_src(case, False)
+    let mut x: Buffer[bf16, (256,)] = buffer_alloc([256])
+    let mut lo: f64 = nan
+    let mut hi: f64 = nan
+    for i: i64 in range(256):
+        let v: bf16 = buffer_get(src, i) as bf16
+        buffer_set(x, i, v)
+        if i < n:
+            lo = num_min(lo, v as f64)
+            hi = num_max(hi, v as f64)
+    let mut z: Buffer[bf16, (512,)] = buffer_alloc([512])
+    let dx: Buffer[bf16, (256,), device_global] = buffer_to_device(x)
+    let mut d: Buffer[bf16, (512,), device_global] = buffer_to_device(z)
+    gpu_launch(minmax_bf16, 1, BLOCK, n, nan as bf16, &dx, &mut d)
+    let g: Buffer[bf16, (512,)] = buffer_to_host(d)
+    let mut got: Buffer[f64, (512,)] = buffer_alloc([512])
+    for i: i64 in range(512):
+        buffer_set(got, i, buffer_get(g, i) as f64)
+    return check_minmax_lanes("bf16 min/max", case, got, lo, hi)
+
+def check_minmax() -> i64:
+    let mut bad: i64 = 0
+    for case: i64 in range(4):
+        bad = bad + minmax_case_f16(case) + minmax_case_bf16(case)
+    return bad
+
+def main() -> i32:
+    let tiles: i64 = check_tiles_f16() + check_tiles_bf16() + check_matmul_f16() + check_matmul_bf16()
+    let coll: i64 = check_sums_f16() + check_sums_bf16() + check_minmax()
+    println!("half tiles: {tiles} mismatches")
+    println!("half collectives: {coll} mismatches")
+    if tiles + coll != 0:
+        return 1
+    println!("half workgroup: f16 and bf16 tiles, tiled matmuls and workgroup collectives match the strict host")
+    return 0

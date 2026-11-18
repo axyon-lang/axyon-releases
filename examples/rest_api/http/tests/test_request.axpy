@@ -1,0 +1,116 @@
+# Unit tests for the HTTP/1.1 request parser, including malformed input and
+# the size limits.
+#
+# Failures are reported with `assert!`: a test that returns non-zero is
+# reported as passing (#3534).
+
+from http.request import Limits, Request, HttpError, default_limits, find_head_end, parse_request, header_value
+
+# Status of the error `text` is rejected with, or 0 when it parses.
+def status_of(text: String) -> u16:
+    let limits: Limits = default_limits()
+    match parse_request(text.as_bytes(), &limits):
+        Ok(r) => return 0
+        Err(e) => return e.status
+
+@test
+def test_parse_get() -> i32:
+    let text: String = "GET /todos/7?verbose=1 HTTP/1.1\r\nHost: localhost\r\nAccept:  application/json \r\n\r\n"
+    let limits: Limits = default_limits()
+    match parse_request(text.as_bytes(), &limits):
+        Ok(r) =>
+            assert!(r.method == "GET", "method")
+            assert!(r.path == "/todos/7", "path excludes the query")
+            assert!(r.query == "verbose=1", "query")
+            assert!(r.headers.len() == 2, "two headers")
+            assert!(r.body.len() == 0, "no body")
+            match header_value(&r.headers, "ACCEPT"):
+                Some(v) => assert!(v == "application/json", "header lookup ignores case, value is trimmed")
+                None_ => assert!(False, "unexpected match arm")
+            match header_value(&r.headers, "x-missing"):
+                Some(v) => assert!(False, "unexpected match arm")
+                None_ => pass
+        Err(e) => assert!(False, "unexpected match arm")
+    return 0
+
+@test
+def test_parse_post_body() -> i32:
+    let text: String = "POST /todos HTTP/1.1\r\nContent-Length: 15\r\nContent-Type: application/json\r\n\r\n{\"title\":\"x\"}\r\nEXTRA"
+    let limits: Limits = default_limits()
+    match parse_request(text.as_bytes(), &limits):
+        Ok(r) =>
+            assert!(r.method == "POST", "method")
+            assert!(r.body.len() == 15, "the body is Content-Length bytes; the rest is ignored")
+            assert!(r.body[0] == 123, "body starts with '{'")
+        Err(e) => assert!(False, "unexpected match arm")
+    return 0
+
+@test
+def test_find_head_end() -> i32:
+    let partial: String = "GET / HTTP/1.1\r\nHost: x\r\n"
+    match find_head_end(partial.as_bytes()):
+        Some(i) => assert!(False, "unexpected match arm")
+        None_ => pass
+    let whole: String = "GET / HTTP/1.1\r\n\r\nbody"
+    match find_head_end(whole.as_bytes()):
+        Some(i) => assert!(i == 18, "index just past the blank line")
+        None_ => assert!(False, "unexpected match arm")
+    return 0
+
+@test
+def test_http_1_0_accepted() -> i32:
+    assert!(status_of("GET / HTTP/1.0\r\n\r\n") == 0, "HTTP/1.0 is accepted")
+    return 0
+
+@test
+def test_malformed_request_line() -> i32:
+    assert!(status_of("GET /\r\n\r\n") == 400, "missing version")
+    assert!(status_of("GET  / HTTP/1.1\r\n\r\n") == 400, "double space")
+    assert!(status_of(" GET / HTTP/1.1\r\n\r\n") == 400, "leading space")
+    assert!(status_of("GET todos HTTP/1.1\r\n\r\n") == 400, "relative target")
+    assert!(status_of("GET / HTTP/1.1 extra\r\n\r\n") == 400, "trailing token")
+    assert!(status_of("G(T / HTTP/1.1\r\n\r\n") == 400, "invalid method character")
+    assert!(status_of("GET / FTP/1.1\r\n\r\n") == 400, "not HTTP")
+    assert!(status_of("GET / HTTP/2.0\r\n\r\n") == 505, "unsupported version")
+    assert!(status_of("\r\n\r\n") == 400, "empty request line")
+    return 0
+
+@test
+def test_malformed_headers() -> i32:
+    assert!(status_of("GET / HTTP/1.1\r\nNoColon\r\n\r\n") == 400, "header without a colon")
+    assert!(status_of("GET / HTTP/1.1\r\nBad Name: x\r\n\r\n") == 400, "space in a header name")
+    assert!(status_of("GET / HTTP/1.1\r\n: x\r\n\r\n") == 400, "empty header name")
+    assert!(status_of("GET / HTTP/1.1\r\nA: b\r\n folded\r\n\r\n") == 400, "obsolete line folding")
+    assert!(status_of("GET / HTTP/1.1\r\nA: b\x01c\r\n\r\n") == 400, "control byte in a value")
+    return 0
+
+@test
+def test_content_length_errors() -> i32:
+    assert!(status_of("POST / HTTP/1.1\r\nContent-Length: abc\r\n\r\n") == 400, "non-numeric length")
+    assert!(status_of("POST / HTTP/1.1\r\nContent-Length: +3\r\n\r\nabc") == 400, "signed length")
+    assert!(status_of("POST / HTTP/1.1\r\nContent-Length: \r\n\r\n") == 400, "empty length")
+    assert!(status_of("POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabcd") == 400, "conflicting lengths")
+    assert!(status_of("POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc") == 0, "repeated equal lengths are fine")
+    assert!(status_of("POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc") == 400, "body shorter than announced")
+    assert!(status_of("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n") == 501, "chunked bodies are not supported")
+    return 0
+
+@test
+def test_size_limits() -> i32:
+    let limits: Limits = Limits { max_head_bytes: 64, max_body_bytes: 8 }
+    let big_body: String = "POST / HTTP/1.1\r\nContent-Length: 9\r\n\r\n123456789"
+    match parse_request(big_body.as_bytes(), &limits):
+        Ok(r) => assert!(False, "unexpected match arm")
+        Err(e) => assert!(e.status == 413, "body over the limit is 413")
+    let mut big_head: String = "GET / HTTP/1.1\r\nX-Pad: "
+    for i: usize in range(0, 64):
+        big_head.push_str("a")
+    big_head.push_str("\r\n\r\n")
+    match parse_request(big_head.as_bytes(), &limits):
+        Ok(r) => assert!(False, "unexpected match arm")
+        Err(e) => assert!(e.status == 431, "head over the limit is 431")
+    let small: String = "POST / HTTP/1.1\r\nContent-Length: 8\r\n\r\n12345678"
+    match parse_request(small.as_bytes(), &limits):
+        Ok(r) => assert!(r.body.len() == 8, "a body at the limit is accepted")
+        Err(e) => assert!(False, "unexpected match arm")
+    return 0

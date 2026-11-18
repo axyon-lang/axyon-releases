@@ -1,0 +1,458 @@
+# Complex c64/c128 scalars and device buffers on an NVIDIA GPU (issue #2827)
+#
+# Every kernel runs on the device and every result is compared bit for bit
+# (any NaN matches any NaN; payloads are not part of the contract) with the
+# strict host build of the same expression, over every pair of a 12-value
+# component table (zeros of both signs, a subnormal, large and huge values,
+# infinities, NaN), so 144 lanes per width:
+#
+# - construction `cN(re, im)` from two device float buffers;
+# - a `Buffer[cN, (..), device_global]` element read and write (numeric
+#   contract §10 layout `{re, im}`, align of the component, GPU buffer
+#   contract element codes 16/17);
+# - `.re` / `.im`, `+`, `-`, `*` (componentwise, every product and sum
+#   rounded on its own, never fused), unary `-`, `.conj()`, `==` / `!=`;
+# - a `@gpu` helper taking and returning complex values;
+# - (#2873) complex `/` (the numeric contract §10 divisor-scaled algorithm),
+#   `.abs()` (the scaled modulus `max * sqrt(1 + (min/max)^2)`), and the `as`
+#   conversions `f16|bf16|f32|f64 as cN` and `c64 as c128` / `c128 as c64`.
+#
+# By-value complex kernel arguments, complex atomics and complex workgroup
+# memory and collectives stay rejected in device code (nvidia-profile §6).
+
+const BLOCK: i64 = 128
+
+# The same value: equal bit patterns, or both NaN. The bits keep the sign of
+# zero.
+def same(x: f64, y: f64) -> bool:
+    if x != x:
+        return y != y
+    return x.to_bits() == y.to_bits()
+
+def report(what: str, op: i64, i: i64, got: f64, want: f64) -> i64:
+    println!("{what} mismatch: op {op} lane {i}: got {got}, want {want}")
+    return 1
+
+# The component table of `c64`.
+def table_c64(k: i64) -> f32:
+    if k == 0:
+        return 0.0_f32
+    if k == 1:
+        return -0.0_f32
+    if k == 2:
+        return 1.0_f32
+    if k == 3:
+        return -1.5_f32
+    if k == 4:
+        return 3.25_f32
+    if k == 5:
+        return f32.from_bits(1_u32)
+    if k == 6:
+        return 1.0e30_f32
+    if k == 7:
+        return -3.0e38_f32
+    if k == 8:
+        return f32.from_bits(2139095040_u32)
+    if k == 9:
+        return f32.from_bits(4286578688_u32)
+    if k == 10:
+        return f32.from_bits(2143289344_u32)
+    if k == 11:
+        return 0.1_f32
+    return 0.0_f32
+
+@gpu
+def mul_c64(x: c64, y: c64) -> c64:
+    return x * y
+
+@gpu(entry)
+def ops_c64(n: i64, xr: &Buffer[f32, (144,), device_global], xi: &Buffer[f32, (144,), device_global], b: &Buffer[c64, (144,), device_global], out: &mut Buffer[c64, (864,), device_global], parts: &mut Buffer[f32, (288,), device_global], cmp: &mut Buffer[i32, (144,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let x: c64 = c64(buffer_get(xr, i), buffer_get(xi, i))
+        let y: c64 = buffer_get(b, i)
+        buffer_set(out, i, x + y)
+        buffer_set(out, 144 + i, x - y)
+        buffer_set(out, 288 + i, x * y)
+        buffer_set(out, 432 + i, x.conj())
+        buffer_set(out, 576 + i, -x)
+        buffer_set(out, 720 + i, mul_c64(x, y))
+        buffer_set(parts, i, y.re)
+        buffer_set(parts, 144 + i, y.im)
+        let mut c: i32 = 0
+        if x == y:
+            c = c + 1
+        if x != y:
+            c = c + 2
+        buffer_set(cmp, i, c)
+
+# Every operation of `ops_c64` on the device against the host, lane by lane.
+def check_c64() -> i64:
+    let mut xr: Buffer[f32, (144,)] = buffer_alloc([144])
+    let mut xi: Buffer[f32, (144,)] = buffer_alloc([144])
+    let mut b: Buffer[c64, (144,)] = buffer_alloc([144])
+    let mut want: Buffer[c64, (864,)] = buffer_alloc([864])
+    let mut wparts: Buffer[f32, (288,)] = buffer_alloc([288])
+    let mut wcmp: Buffer[i32, (144,)] = buffer_alloc([144])
+    let sentinel: Buffer[c64, (864,)] = buffer_alloc([864])
+    let psentinel: Buffer[f32, (288,)] = buffer_alloc([288])
+    let csentinel: Buffer[i32, (144,)] = buffer_alloc([144])
+    let mut n: i64 = 0
+    for p: i64 in range(12):
+        for q: i64 in range(12):
+            let x: c64 = c64(table_c64(p), table_c64(q))
+            let y: c64 = c64(table_c64(q), table_c64((p + 5) % 12))
+            buffer_set(xr, n, x.re)
+            buffer_set(xi, n, x.im)
+            buffer_set(b, n, y)
+            buffer_set(want, n, x + y)
+            buffer_set(want, 144 + n, x - y)
+            buffer_set(want, 288 + n, x * y)
+            buffer_set(want, 432 + n, x.conj())
+            buffer_set(want, 576 + n, -x)
+            buffer_set(want, 720 + n, x * y)
+            buffer_set(wparts, n, y.re)
+            buffer_set(wparts, 144 + n, y.im)
+            let mut c: i32 = 0
+            if x == y:
+                c = c + 1
+            if x != y:
+                c = c + 2
+            buffer_set(wcmp, n, c)
+            n = n + 1
+    let dxr: Buffer[f32, (144,), device_global] = buffer_to_device(xr)
+    let dxi: Buffer[f32, (144,), device_global] = buffer_to_device(xi)
+    let db: Buffer[c64, (144,), device_global] = buffer_to_device(b)
+    let mut dout: Buffer[c64, (864,), device_global] = buffer_to_device(sentinel)
+    let mut dparts: Buffer[f32, (288,), device_global] = buffer_to_device(psentinel)
+    let mut dcmp: Buffer[i32, (144,), device_global] = buffer_to_device(csentinel)
+    gpu_launch(ops_c64, (n + BLOCK - 1) / BLOCK, BLOCK, n, &dxr, &dxi, &db, &mut dout, &mut dparts, &mut dcmp)
+    let got: Buffer[c64, (864,)] = buffer_to_host(dout)
+    let gparts: Buffer[f32, (288,)] = buffer_to_host(dparts)
+    let gcmp: Buffer[i32, (144,)] = buffer_to_host(dcmp)
+    let mut bad: i64 = 0
+    for op: i64 in range(6):
+        for i: i64 in range(n):
+            let g: c64 = buffer_get(got, op * 144 + i)
+            let w: c64 = buffer_get(want, op * 144 + i)
+            if not same(g.re as f64, w.re as f64):
+                bad = bad + report("c64 re", op, i, g.re as f64, w.re as f64)
+            if not same(g.im as f64, w.im as f64):
+                bad = bad + report("c64 im", op, i, g.im as f64, w.im as f64)
+    for i: i64 in range(288):
+        let g: f64 = buffer_get(gparts, i) as f64
+        let w: f64 = buffer_get(wparts, i) as f64
+        if not same(g, w):
+            bad = bad + report("c64 parts", 6, i, g, w)
+    for i: i64 in range(n):
+        if buffer_get(gcmp, i) != buffer_get(wcmp, i):
+            bad = bad + report("c64 compare", 7, i, buffer_get(gcmp, i) as f64, buffer_get(wcmp, i) as f64)
+    println!("c64: {bad} mismatches")
+    return bad
+
+# The component table of `c128`.
+def table_c128(k: i64) -> f64:
+    if k == 0:
+        return 0.0
+    if k == 1:
+        return -0.0
+    if k == 2:
+        return 1.0
+    if k == 3:
+        return -1.5
+    if k == 4:
+        return 3.25
+    if k == 5:
+        return f64.from_bits(1_u64)
+    if k == 6:
+        return 1.0e300
+    if k == 7:
+        return -1.7e308
+    if k == 8:
+        return f64.from_bits(9218868437227405312_u64)
+    if k == 9:
+        return f64.from_bits(18442240474082181120_u64)
+    if k == 10:
+        return f64.from_bits(9221120237041090560_u64)
+    if k == 11:
+        return 0.1
+    return 0.0
+
+@gpu
+def mul_c128(x: c128, y: c128) -> c128:
+    return x * y
+
+@gpu(entry)
+def ops_c128(n: i64, xr: &Buffer[f64, (144,), device_global], xi: &Buffer[f64, (144,), device_global], b: &Buffer[c128, (144,), device_global], out: &mut Buffer[c128, (864,), device_global], parts: &mut Buffer[f64, (288,), device_global], cmp: &mut Buffer[i32, (144,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let x: c128 = c128(buffer_get(xr, i), buffer_get(xi, i))
+        let y: c128 = buffer_get(b, i)
+        buffer_set(out, i, x + y)
+        buffer_set(out, 144 + i, x - y)
+        buffer_set(out, 288 + i, x * y)
+        buffer_set(out, 432 + i, x.conj())
+        buffer_set(out, 576 + i, -x)
+        buffer_set(out, 720 + i, mul_c128(x, y))
+        buffer_set(parts, i, y.re)
+        buffer_set(parts, 144 + i, y.im)
+        let mut c: i32 = 0
+        if x == y:
+            c = c + 1
+        if x != y:
+            c = c + 2
+        buffer_set(cmp, i, c)
+
+# Every operation of `ops_c128` on the device against the host, lane by lane.
+def check_c128() -> i64:
+    let mut xr: Buffer[f64, (144,)] = buffer_alloc([144])
+    let mut xi: Buffer[f64, (144,)] = buffer_alloc([144])
+    let mut b: Buffer[c128, (144,)] = buffer_alloc([144])
+    let mut want: Buffer[c128, (864,)] = buffer_alloc([864])
+    let mut wparts: Buffer[f64, (288,)] = buffer_alloc([288])
+    let mut wcmp: Buffer[i32, (144,)] = buffer_alloc([144])
+    let sentinel: Buffer[c128, (864,)] = buffer_alloc([864])
+    let psentinel: Buffer[f64, (288,)] = buffer_alloc([288])
+    let csentinel: Buffer[i32, (144,)] = buffer_alloc([144])
+    let mut n: i64 = 0
+    for p: i64 in range(12):
+        for q: i64 in range(12):
+            let x: c128 = c128(table_c128(p), table_c128(q))
+            let y: c128 = c128(table_c128(q), table_c128((p + 5) % 12))
+            buffer_set(xr, n, x.re)
+            buffer_set(xi, n, x.im)
+            buffer_set(b, n, y)
+            buffer_set(want, n, x + y)
+            buffer_set(want, 144 + n, x - y)
+            buffer_set(want, 288 + n, x * y)
+            buffer_set(want, 432 + n, x.conj())
+            buffer_set(want, 576 + n, -x)
+            buffer_set(want, 720 + n, x * y)
+            buffer_set(wparts, n, y.re)
+            buffer_set(wparts, 144 + n, y.im)
+            let mut c: i32 = 0
+            if x == y:
+                c = c + 1
+            if x != y:
+                c = c + 2
+            buffer_set(wcmp, n, c)
+            n = n + 1
+    let dxr: Buffer[f64, (144,), device_global] = buffer_to_device(xr)
+    let dxi: Buffer[f64, (144,), device_global] = buffer_to_device(xi)
+    let db: Buffer[c128, (144,), device_global] = buffer_to_device(b)
+    let mut dout: Buffer[c128, (864,), device_global] = buffer_to_device(sentinel)
+    let mut dparts: Buffer[f64, (288,), device_global] = buffer_to_device(psentinel)
+    let mut dcmp: Buffer[i32, (144,), device_global] = buffer_to_device(csentinel)
+    gpu_launch(ops_c128, (n + BLOCK - 1) / BLOCK, BLOCK, n, &dxr, &dxi, &db, &mut dout, &mut dparts, &mut dcmp)
+    let got: Buffer[c128, (864,)] = buffer_to_host(dout)
+    let gparts: Buffer[f64, (288,)] = buffer_to_host(dparts)
+    let gcmp: Buffer[i32, (144,)] = buffer_to_host(dcmp)
+    let mut bad: i64 = 0
+    for op: i64 in range(6):
+        for i: i64 in range(n):
+            let g: c128 = buffer_get(got, op * 144 + i)
+            let w: c128 = buffer_get(want, op * 144 + i)
+            if not same(g.re as f64, w.re as f64):
+                bad = bad + report("c128 re", op, i, g.re as f64, w.re as f64)
+            if not same(g.im as f64, w.im as f64):
+                bad = bad + report("c128 im", op, i, g.im as f64, w.im as f64)
+    for i: i64 in range(288):
+        let g: f64 = buffer_get(gparts, i) as f64
+        let w: f64 = buffer_get(wparts, i) as f64
+        if not same(g, w):
+            bad = bad + report("c128 parts", 6, i, g, w)
+    for i: i64 in range(n):
+        if buffer_get(gcmp, i) != buffer_get(wcmp, i):
+            bad = bad + report("c128 compare", 7, i, buffer_get(gcmp, i) as f64, buffer_get(wcmp, i) as f64)
+    println!("c128: {bad} mismatches")
+    return bad
+
+@gpu
+def div_c64(x: c64, y: c64) -> c64:
+    return x / y
+
+# Division, `abs` and the `as` conversions to a complex type (#2873).
+@gpu(entry)
+def ext_c64(n: i64, xr: &Buffer[f32, (144,), device_global], xi: &Buffer[f32, (144,), device_global], b: &Buffer[c64, (144,), device_global], w: &Buffer[f64, (144,), device_global], h: &Buffer[f16, (144,), device_global], bh: &Buffer[bf16, (144,), device_global], out: &mut Buffer[c64, (864,), device_global], mag: &mut Buffer[f32, (144,), device_global], wide: &mut Buffer[c128, (144,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let x: c64 = c64(buffer_get(xr, i), buffer_get(xi, i))
+        let y: c64 = buffer_get(b, i)
+        buffer_set(out, i, x / y)
+        buffer_set(out, 144 + i, div_c64(x, y))
+        buffer_set(out, 288 + i, buffer_get(xr, i) as c64)
+        buffer_set(out, 432 + i, buffer_get(w, i) as c64)
+        buffer_set(out, 576 + i, buffer_get(h, i) as c64)
+        buffer_set(out, 720 + i, buffer_get(bh, i) as c64)
+        buffer_set(mag, i, x.abs())
+        buffer_set(wide, i, x as c128)
+
+# Every operation of `ext_c64` on the device against the host, lane by lane.
+def check_ext_c64() -> i64:
+    let mut xr: Buffer[f32, (144,)] = buffer_alloc([144])
+    let mut xi: Buffer[f32, (144,)] = buffer_alloc([144])
+    let mut b: Buffer[c64, (144,)] = buffer_alloc([144])
+    let mut w: Buffer[f64, (144,)] = buffer_alloc([144])
+    let mut h: Buffer[f16, (144,)] = buffer_alloc([144])
+    let mut bh: Buffer[bf16, (144,)] = buffer_alloc([144])
+    let mut want: Buffer[c64, (864,)] = buffer_alloc([864])
+    let mut wmag: Buffer[f32, (144,)] = buffer_alloc([144])
+    let mut wwide: Buffer[c128, (144,)] = buffer_alloc([144])
+    let sentinel: Buffer[c64, (864,)] = buffer_alloc([864])
+    let msentinel: Buffer[f32, (144,)] = buffer_alloc([144])
+    let wsentinel: Buffer[c128, (144,)] = buffer_alloc([144])
+    let mut n: i64 = 0
+    for p: i64 in range(12):
+        for q: i64 in range(12):
+            let x: c64 = c64(table_c64(p), table_c64(q))
+            let y: c64 = c64(table_c64(q), table_c64((p + 5) % 12))
+            # An f64 value that is not an f32 one (RNE narrowing, overflow).
+            let d: f64 = table_c128(p) * 3.0 + table_c128(q)
+            let hv: f16 = table_c64(q) as f16
+            let bv: bf16 = table_c64(p) as bf16
+            buffer_set(xr, n, x.re)
+            buffer_set(xi, n, x.im)
+            buffer_set(b, n, y)
+            buffer_set(w, n, d)
+            buffer_set(h, n, hv)
+            buffer_set(bh, n, bv)
+            buffer_set(want, n, x / y)
+            buffer_set(want, 144 + n, x / y)
+            buffer_set(want, 288 + n, x.re as c64)
+            buffer_set(want, 432 + n, d as c64)
+            buffer_set(want, 576 + n, hv as c64)
+            buffer_set(want, 720 + n, bv as c64)
+            buffer_set(wmag, n, x.abs())
+            buffer_set(wwide, n, x as c128)
+            n = n + 1
+    let dxr: Buffer[f32, (144,), device_global] = buffer_to_device(xr)
+    let dxi: Buffer[f32, (144,), device_global] = buffer_to_device(xi)
+    let db: Buffer[c64, (144,), device_global] = buffer_to_device(b)
+    let dw: Buffer[f64, (144,), device_global] = buffer_to_device(w)
+    let dh: Buffer[f16, (144,), device_global] = buffer_to_device(h)
+    let dbh: Buffer[bf16, (144,), device_global] = buffer_to_device(bh)
+    let mut dout: Buffer[c64, (864,), device_global] = buffer_to_device(sentinel)
+    let mut dmag: Buffer[f32, (144,), device_global] = buffer_to_device(msentinel)
+    let mut dwide: Buffer[c128, (144,), device_global] = buffer_to_device(wsentinel)
+    gpu_launch(ext_c64, (n + BLOCK - 1) / BLOCK, BLOCK, n, &dxr, &dxi, &db, &dw, &dh, &dbh, &mut dout, &mut dmag, &mut dwide)
+    let got: Buffer[c64, (864,)] = buffer_to_host(dout)
+    let gmag: Buffer[f32, (144,)] = buffer_to_host(dmag)
+    let gwide: Buffer[c128, (144,)] = buffer_to_host(dwide)
+    let mut bad: i64 = 0
+    for op: i64 in range(6):
+        for i: i64 in range(n):
+            let g: c64 = buffer_get(got, op * 144 + i)
+            let e: c64 = buffer_get(want, op * 144 + i)
+            if not same(g.re as f64, e.re as f64):
+                bad = bad + report("c64 ext re", op, i, g.re as f64, e.re as f64)
+            if not same(g.im as f64, e.im as f64):
+                bad = bad + report("c64 ext im", op, i, g.im as f64, e.im as f64)
+    for i: i64 in range(n):
+        let g: f64 = buffer_get(gmag, i) as f64
+        let e: f64 = buffer_get(wmag, i) as f64
+        if not same(g, e):
+            bad = bad + report("c64 abs", 6, i, g, e)
+        let gw: c128 = buffer_get(gwide, i)
+        let ew: c128 = buffer_get(wwide, i)
+        if not same(gw.re, ew.re) or not same(gw.im, ew.im):
+            bad = bad + report("c64 as c128", 7, i, gw.re, ew.re)
+    println!("c64 div/abs/as: {bad} mismatches")
+    return bad
+
+@gpu
+def div_c128(x: c128, y: c128) -> c128:
+    return x / y
+
+# Division, `abs` and the `as` conversions to a complex type (#2873).
+@gpu(entry)
+def ext_c128(n: i64, xr: &Buffer[f64, (144,), device_global], xi: &Buffer[f64, (144,), device_global], b: &Buffer[c128, (144,), device_global], s: &Buffer[f32, (144,), device_global], h: &Buffer[f16, (144,), device_global], bh: &Buffer[bf16, (144,), device_global], out: &mut Buffer[c128, (864,), device_global], mag: &mut Buffer[f64, (144,), device_global], narrow: &mut Buffer[c64, (144,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let x: c128 = c128(buffer_get(xr, i), buffer_get(xi, i))
+        let y: c128 = buffer_get(b, i)
+        buffer_set(out, i, x / y)
+        buffer_set(out, 144 + i, div_c128(x, y))
+        buffer_set(out, 288 + i, buffer_get(xr, i) as c128)
+        buffer_set(out, 432 + i, buffer_get(s, i) as c128)
+        buffer_set(out, 576 + i, buffer_get(h, i) as c128)
+        buffer_set(out, 720 + i, buffer_get(bh, i) as c128)
+        buffer_set(mag, i, x.abs())
+        buffer_set(narrow, i, x as c64)
+
+# Every operation of `ext_c128` on the device against the host, lane by lane.
+def check_ext_c128() -> i64:
+    let mut xr: Buffer[f64, (144,)] = buffer_alloc([144])
+    let mut xi: Buffer[f64, (144,)] = buffer_alloc([144])
+    let mut b: Buffer[c128, (144,)] = buffer_alloc([144])
+    let mut s: Buffer[f32, (144,)] = buffer_alloc([144])
+    let mut h: Buffer[f16, (144,)] = buffer_alloc([144])
+    let mut bh: Buffer[bf16, (144,)] = buffer_alloc([144])
+    let mut want: Buffer[c128, (864,)] = buffer_alloc([864])
+    let mut wmag: Buffer[f64, (144,)] = buffer_alloc([144])
+    let mut wnarrow: Buffer[c64, (144,)] = buffer_alloc([144])
+    let sentinel: Buffer[c128, (864,)] = buffer_alloc([864])
+    let msentinel: Buffer[f64, (144,)] = buffer_alloc([144])
+    let nsentinel: Buffer[c64, (144,)] = buffer_alloc([144])
+    let mut n: i64 = 0
+    for p: i64 in range(12):
+        for q: i64 in range(12):
+            let x: c128 = c128(table_c128(p), table_c128(q))
+            let y: c128 = c128(table_c128(q), table_c128((p + 5) % 12))
+            let sv: f32 = table_c64(p)
+            let hv: f16 = table_c64(q) as f16
+            let bv: bf16 = table_c64(p) as bf16
+            buffer_set(xr, n, x.re)
+            buffer_set(xi, n, x.im)
+            buffer_set(b, n, y)
+            buffer_set(s, n, sv)
+            buffer_set(h, n, hv)
+            buffer_set(bh, n, bv)
+            buffer_set(want, n, x / y)
+            buffer_set(want, 144 + n, x / y)
+            buffer_set(want, 288 + n, x.re as c128)
+            buffer_set(want, 432 + n, sv as c128)
+            buffer_set(want, 576 + n, hv as c128)
+            buffer_set(want, 720 + n, bv as c128)
+            buffer_set(wmag, n, x.abs())
+            buffer_set(wnarrow, n, x as c64)
+            n = n + 1
+    let dxr: Buffer[f64, (144,), device_global] = buffer_to_device(xr)
+    let dxi: Buffer[f64, (144,), device_global] = buffer_to_device(xi)
+    let db: Buffer[c128, (144,), device_global] = buffer_to_device(b)
+    let ds: Buffer[f32, (144,), device_global] = buffer_to_device(s)
+    let dh: Buffer[f16, (144,), device_global] = buffer_to_device(h)
+    let dbh: Buffer[bf16, (144,), device_global] = buffer_to_device(bh)
+    let mut dout: Buffer[c128, (864,), device_global] = buffer_to_device(sentinel)
+    let mut dmag: Buffer[f64, (144,), device_global] = buffer_to_device(msentinel)
+    let mut dnarrow: Buffer[c64, (144,), device_global] = buffer_to_device(nsentinel)
+    gpu_launch(ext_c128, (n + BLOCK - 1) / BLOCK, BLOCK, n, &dxr, &dxi, &db, &ds, &dh, &dbh, &mut dout, &mut dmag, &mut dnarrow)
+    let got: Buffer[c128, (864,)] = buffer_to_host(dout)
+    let gmag: Buffer[f64, (144,)] = buffer_to_host(dmag)
+    let gnarrow: Buffer[c64, (144,)] = buffer_to_host(dnarrow)
+    let mut bad: i64 = 0
+    for op: i64 in range(6):
+        for i: i64 in range(n):
+            let g: c128 = buffer_get(got, op * 144 + i)
+            let e: c128 = buffer_get(want, op * 144 + i)
+            if not same(g.re, e.re):
+                bad = bad + report("c128 ext re", op, i, g.re, e.re)
+            if not same(g.im, e.im):
+                bad = bad + report("c128 ext im", op, i, g.im, e.im)
+    for i: i64 in range(n):
+        let g: f64 = buffer_get(gmag, i)
+        let e: f64 = buffer_get(wmag, i)
+        if not same(g, e):
+            bad = bad + report("c128 abs", 6, i, g, e)
+        let gn: c64 = buffer_get(gnarrow, i)
+        let en: c64 = buffer_get(wnarrow, i)
+        if not same(gn.re as f64, en.re as f64) or not same(gn.im as f64, en.im as f64):
+            bad = bad + report("c128 as c64", 7, i, gn.re as f64, en.re as f64)
+    println!("c128 div/abs/as: {bad} mismatches")
+    return bad
+
+def main() -> i32:
+    let bad: i64 = check_c64() + check_c128() + check_ext_c64() + check_ext_c128()
+    if bad != 0:
+        return 1
+    println!("complex: c64 and c128 construction, re/im, + - * /, conj, abs, negation, comparisons, as conversions and buffer elements match the strict host")
+    return 0

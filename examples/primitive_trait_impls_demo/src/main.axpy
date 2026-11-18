@@ -1,0 +1,53 @@
+# Trait implementations for primitive types (issue #90).
+#
+# Shows: `impl Trait for <primitive>`, method calls on primitive receivers,
+# and a custom bound satisfied by a primitive impl.
+#
+# Known limitation: calling a bound method on a type parameter *inside* a
+# generic body (`def f[T: Scale](x: T): return x.scale(2)`) is not supported
+# yet (AX0807) — it affects structs as well as primitives. Bounds are checked
+# at the call site, so `keep` below only passes the value through.
+
+trait Scale:
+    def scale(self, factor: Self) -> Self
+
+impl Scale for i32:
+    def scale(self, factor: i32) -> i32:
+        return self * factor
+
+impl Scale for f64:
+    def scale(self, factor: f64) -> f64:
+        return self * factor
+
+# `usize`/`isize` share their impls with `u64`/`i64`.
+impl Scale for usize:
+    def scale(self, factor: usize) -> usize:
+        return self * factor
+
+# A struct whose parameter must implement `Scale`.
+struct Scaled[T] where T: Scale:
+    value: T
+
+# Bound checked at the call site: `i32` has an impl, `u8` would be rejected (AX070).
+def keep[T: Scale](x: T) -> T:
+    return x
+
+def total(w: Scaled[i32]) -> i32:
+    return w.value
+
+def main() -> i32:
+    let a: i32 = 6
+    let b: f64 = 1.5
+    let n: usize = 7
+    let a2: i32 = a.scale(7)
+    let b2: f64 = b.scale(16777217.0)
+    let n2: usize = n.scale(3)
+    let k: i32 = keep(a2)
+    let w: Scaled[i32] = Scaled { value: k }
+    println!("i32 scale: {a2}")
+    println!("f64 scale: {b2}")
+    println!("usize scale: {n2}")
+    let t: i32 = total(w)
+    println!("scaled total: {t}")
+    assert!(a2 == 42, "i32 impl dispatch")
+    return 0

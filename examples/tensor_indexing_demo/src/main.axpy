@@ -1,0 +1,58 @@
+# Multi-index tensor subscripts (issue #849): `t[i, j]` reads and writes one
+# element of a rank-2 tensor, one integer index per dimension. Every index is
+# evaluated first (left to right), then bounds-checked against its own
+# dimension; an out-of-range index traps at runtime.
+
+import std.tensor as T
+
+# Element reads through `&Tensor` (issue #2821): implicit `f[i, j]` and explicit
+# `(*f)[i, j]` dereference, bounds-checked like a local tensor.
+def row_sum(f: &Tensor[i32, (2, 3)], r: i64) -> i32:
+    let mut acc: i32 = 0
+    for k: i64 in range(3):
+        acc = acc + f[r, k]
+    return acc
+
+def corner(f: &Tensor[i32, (2, 3)]) -> i32:
+    return (*f)[1, 2]
+
+# Element stores and compound assignment through `&mut Tensor` (issue #2821):
+# the caller passes `&mut grid` directly as the argument; the update is
+# visible in `grid` after the call.
+def scale_row(f: &mut Tensor[i32, (2, 3)], r: i64, s: i32) -> None:
+    for k: i64 in range(3):
+        f[r, k] = f[r, k] * s
+    f[r, 0] += 1_i32
+
+def main() -> i32:
+    println!("Tensor Indexing Example")
+
+    let mut grid: Tensor[i32, (2, 3)] = T.zeros[i32]([2, 3])
+    grid[0, 1] = 5_i32
+    grid[1, 2] = 7_i32
+
+    let a: i32 = grid[0, 1]
+    let b: i32 = grid[1, 2]
+    let c: i32 = grid[1, 0]
+    assert!(a == 5_i32, "row 0, col 1")
+    assert!(b == 7_i32, "row 1, col 2")
+    assert!(c == 0_i32, "untouched element")
+
+    # Loop indices are checked per dimension too.
+    let mut total: i32 = 0
+    for r: i64 in range(2):
+        for k: i64 in range(3):
+            total = total + grid[r, k]
+    assert!(total == 12_i32, "sum of all elements")
+
+    assert!(row_sum(&grid, 0) == 5_i32, "row 0 through &Tensor")
+    assert!(row_sum(&grid, 1) == 7_i32, "row 1 through &Tensor")
+    assert!(corner(&grid) == 7_i32, "explicit deref read")
+
+    scale_row(&mut grid, 1, 3_i32)
+    assert!(grid[1, 2] == 21_i32, "store through &mut Tensor")
+    assert!(grid[1, 0] == 1_i32, "compound assignment through &mut Tensor")
+    assert!(grid[0, 1] == 5_i32, "other rows untouched")
+
+    println!("total = {total}")
+    return 0

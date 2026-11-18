@@ -1,0 +1,46 @@
+# Arc[T]: a thread-safe reference-counted pointer (#186).
+#
+# Three threads share one `Arc[i64]`; each owns its own handle (cloned
+# atomically) and bumps the shared payload with the raw `atomic_fetch_add`
+# builtin through `Arc.as_ptr()`. No `&mut`/`ref_mut` to the payload is ever
+# formed (`AtomicI64.fetch_add` takes `mut self`, which would alias exclusive
+# borrows across threads). The payload is freed when the last handle drops;
+# each handoff block is freed by the worker right after `ptr_read`.
+
+from std.sync.arc import Arc
+from std.concurrent import spawn_with, JoinHandle, JoinResult
+
+def work(data: ptr_mut[u8]) -> unit:
+    unsafe:
+        let slot: ptr_mut[Arc[i64]] = data as ptr_mut[Arc[i64]]
+        let mine: Arc[i64] = ptr_read(slot)
+        # The worker owns the handoff block: free it once the handle is moved out.
+        global_dealloc(data, 32, 16)
+        # SAFETY: `mine` keeps the payload alive; only atomic RMWs touch it
+        # while threads run, so there is no data race and no exclusive borrow.
+        let p: ptr_mut[i64] = mine.as_ptr()
+        for i: i64 in range(1000):
+            let _old: i64 = atomic_fetch_add(p, 1, "seq_cst")
+
+def spawn_one(a: ref[Arc[i64]]) -> JoinHandle[unit]:
+    unsafe:
+        let cell: ptr_mut[Arc[i64]] = global_alloc_zeroed_checked(32, 16) as ptr_mut[Arc[i64]]
+        ptr_write(cell, a.clone())
+        return spawn_with(work, cell as ptr_mut[u8])
+
+@host
+def main() -> i32:
+    let a: Arc[i64] = Arc.new(0)
+    let h1: JoinHandle[unit] = spawn_one(ref(a))
+    let h2: JoinHandle[unit] = spawn_one(ref(a))
+    let h3: JoinHandle[unit] = spawn_one(ref(a))
+    let _x: JoinResult = h1.join()
+    let _y: JoinResult = h2.join()
+    let _z: JoinResult = h3.join()
+    let n: i64 = a.strong_count()
+    println!("strong {n}")
+    unsafe:
+        # SAFETY: all workers are joined; the payload is only read.
+        let total: i64 = atomic_load[i64](a.as_ptr(), "seq_cst")
+        println!("total {total}")
+    return 0

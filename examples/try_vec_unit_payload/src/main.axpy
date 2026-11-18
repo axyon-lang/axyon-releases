@@ -1,0 +1,36 @@
+from core import Result
+
+def make(n: i32) -> Result[Vec[u8], i32]:
+    if n < 0:
+        return Result.Err(n)
+    let mut v: Vec[u8] = Vec.new()
+    v.push(7)
+    v.push(9)
+    return Result.Ok(v)
+
+def check(n: i32) -> Result[unit, i32]:
+    if n == 0:
+        return Result.Err(100)
+    return Result.Ok(())
+
+def use_vec(n: i32) -> Result[i32, i32]:
+    let v: Vec[u8] = make(n)?
+    return Result.Ok(v.len() as i32)
+
+def use_unit(n: i32) -> Result[i32, i32]:
+    check(n)?
+    return Result.Ok(n)
+
+def show(r: Result[i32, i32]) -> None:
+    match r:
+        case Result.Ok(x):
+            println!("ok {x}")
+        case Result.Err(e):
+            println!("err {e}")
+
+def main() -> i32:
+    show(use_vec(1))
+    show(use_vec(-3))
+    show(use_unit(5))
+    show(use_unit(0))
+    return 0

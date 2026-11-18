@@ -1,0 +1,34 @@
+# Owning tuple destructuring (#1206)
+#
+# `let (a, b) = f()` moves each element out of the returned tuple, including
+# owning (non-Copy) values such as `Vec`. Every binding drops its element at
+# scope exit; a `_` element is moved into a hidden binding and dropped too.
+# A direct `t[i]` read of a non-Copy element of a live tuple is still rejected.
+
+def pop(v: Vec[i64]) -> (Vec[i64], i64):
+    let mut w: Vec[i64] = v
+    let x: i64 = w.pop()
+    return (w, x)
+
+def mk() -> (Vec[i64], i64):
+    let mut a: Vec[i64] = Vec.new()
+    a.push(7)
+    return (a, 3)
+
+def main() -> i32:
+    let mut s: Vec[i64] = Vec.new()
+    s.push(5)
+    s.push(6)
+    let (rest, top) = pop(s)
+    assert!(top == 6, "popped value")
+    assert!(rest.len() == 1, "rest of the stack")
+
+    # Owning element kept, Copy element discarded.
+    let (kept, _) = mk()
+    assert!(kept.len() == 1, "kept element")
+
+    # Owning element discarded, Copy element kept.
+    let (_, n) = mk()
+    assert!(n == 3, "copy element")
+    println!("ok {n}")
+    return 0

@@ -1,0 +1,14 @@
+[package]
+name = "kernels"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/__init__.axpy"
+
+[dependencies]
+
+# The kernels compile to PTX for CUDA: exactly one GPU target with a
+# device runtime. The library's object carries its own kernel image.
+[target]
+gpu = ["nvptx-sm80"]

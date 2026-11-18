@@ -1,0 +1,11 @@
+from .shapes import Shape
+
+@public
+struct Square:
+    @public
+    side: i64
+
+# Implements only `area`; `double_area` comes from the imported trait.
+impl Shape for Square:
+    def area(self) -> i64:
+        return self.side * self.side

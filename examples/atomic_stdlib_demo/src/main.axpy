@@ -1,0 +1,36 @@
+# std.atomic Demo (issue #178)
+# Typed atomics with explicit memory ordering on top of the #170 builtins.
+#
+# The owners are move-only: declare them `let mut`, operate through methods,
+# and release them with `free()` (which consumes the owner - a second `free()`
+# or any use afterwards is a compile error).
+
+from std.atomic import AtomicOrdering, AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64
+
+def main() -> i32:
+    let mut counter: AtomicI64 = AtomicI64.new(40_i64)
+    counter.store(41_i64, AtomicOrdering.Release)
+    let before: i64 = counter.fetch_add(1_i64, AtomicOrdering.SeqCst)
+    let seen: i64 = counter.compare_exchange(42_i64, 100_i64, AtomicOrdering.AcqRel, AtomicOrdering.Acquire)
+    let after: i64 = counter.load(AtomicOrdering.Acquire)
+    counter.free()
+
+    let mut flag: AtomicBool = AtomicBool.new(False)
+    let was_set: bool = flag.swap(True, AtomicOrdering.SeqCst)
+    let now_set: bool = flag.load(AtomicOrdering.Relaxed)
+    flag.free()
+
+    let mut small: AtomicU32 = AtomicU32.new(7_u32)
+    let prev_or: u32 = small.fetch_or(8_u32, AtomicOrdering.Relaxed)
+    let merged: u32 = small.load(AtomicOrdering.SeqCst)
+    small.free()
+
+    assert!(before == 41_i64, "fetch_add returns the previous value")
+    assert!(seen == 42_i64, "compare_exchange returns the previous value")
+    assert!(after == 100_i64, "compare_exchange stored the desired value")
+    assert!(was_set == False, "swap returns the previous bool")
+    assert!(now_set == True, "swap stored the new bool")
+    assert!(prev_or == 7_u32, "fetch_or returns the previous value")
+    assert!(merged == 15_u32, "fetch_or stored the merged value")
+    println!("std.atomic demo ok: {after}")
+    return 0

@@ -1,0 +1,53 @@
+# Struct Demo Example for AXYON
+# Demonstrates user-defined struct types with functions.
+
+struct Point:
+    @public x: f32
+    @public y: f32
+
+def square_f32(x: f32) -> f32:
+    """Square a float value."""
+    return x * x
+
+def distance_squared(x: f32, y: f32) -> f32:
+    """Compute squared distance from origin: x^2 + y^2."""
+    return square_f32(x) + square_f32(y)
+
+def is_closer_to_origin(x1: f32, y1: f32, x2: f32, y2: f32) -> bool:
+    """Check if point (x1, y1) is closer to origin than point (x2, y2)."""
+    let d1: f32 = distance_squared(x1, y1)
+    let d2: f32 = distance_squared(x2, y2)
+    return d1 < d2
+
+def main() -> i32:
+    println!("Struct Demo with Functions")
+
+    # Create points using struct literal syntax
+    let p1: Point = Point { x: 3.0, y: 4.0 }
+    let p2: Point = Point { x: 1.0, y: 1.0 }
+
+    # Access fields
+    let x1: f32 = p1.x
+    let y1: f32 = p1.y
+    let x2: f32 = p2.x
+    let y2: f32 = p2.y
+
+    println!("Point 1: x={x1}, y={y1}")
+    println!("Point 2: x={x2}, y={y2}")
+
+    # Use functions with struct field values
+    let dist1: f32 = distance_squared(x1, y1)
+    let dist2: f32 = distance_squared(x2, y2)
+
+    println!("Distance squared from origin:")
+    println!("  p1: {dist1}")
+    println!("  p2: {dist2}")
+
+    # Compare which point is closer to origin
+    let p2_closer: bool = is_closer_to_origin(x2, y2, x1, y1)
+    if p2_closer:
+        println!("Point 2 is closer to the origin")
+    else:
+        println!("Point 1 is closer to the origin")
+
+    return 0

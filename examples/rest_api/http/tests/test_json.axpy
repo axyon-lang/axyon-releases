@@ -1,0 +1,153 @@
+# Unit tests for the JSON codec: encoding, decoding, round trips and
+# malformed input.
+#
+# Failures are reported with `assert!`: a test that returns non-zero is
+# reported as passing (#3534).
+
+from http.json import Json, Member, JsonError, member, find, encode, decode
+
+# Decode `text` and re-encode it; "<error>" when decoding fails.
+def round_trip(text: String) -> String:
+    match decode(text.as_bytes()):
+        Ok(v) => return encode(&v)
+        Err(e) => return "<error>"
+
+def rejects(text: String) -> bool:
+    match decode(text.as_bytes()):
+        Ok(v) => return False
+        Err(e) => return True
+
+@test
+def test_encode_scalars() -> i32:
+    assert!(encode(&Json.Null) == "null", "null")
+    assert!(encode(&Json.Bool(True)) == "true", "true")
+    assert!(encode(&Json.Bool(False)) == "false", "false")
+    assert!(encode(&Json.Num(42.0)) == "42", "integral numbers print without a fraction")
+    assert!(encode(&Json.Num(-7.0)) == "-7", "negative integer")
+    assert!(encode(&Json.Num(2.5)) == "2.5", "fraction")
+    return 0
+
+@test
+def test_encode_string_escapes() -> i32:
+    let v: Json = Json.Str("a\"b\\c\nd\te\x01")
+    assert!(encode(&v) == "\"a\\\"b\\\\c\\nd\\te\\u0001\"", "quotes, backslashes and control characters are escaped")
+    return 0
+
+@test
+def test_encode_nested() -> i32:
+    let mut items: Vec[Json] = Vec.new()
+    items.push(Json.Num(1.0))
+    items.push(Json.Null)
+    let mut members: Vec[Member] = Vec.new()
+    members.push(member("id", Json.Num(3.0)))
+    members.push(member("tags", Json.Arr(items)))
+    # Workaround (#3537): `Json.Obj(Vec.new())` cannot infer
+    # the element type from the variant's field type.
+    let none: Vec[Member] = Vec.new()
+    members.push(member("empty", Json.Obj(none)))
+    assert!(encode(&Json.Obj(members)) == "{\"id\":3,\"tags\":[1,null],\"empty\":{}}", "nested object")
+    return 0
+
+@test
+def test_decode_round_trip() -> i32:
+    assert!(round_trip(" { \"a\" : [1, 2.5, -3e2, true, false, null], \"b\": {} } ") == "{\"a\":[1,2.5,-300,true,false,null],\"b\":{}}", "whitespace is dropped")
+    assert!(round_trip("[]") == "[]", "empty array")
+    assert!(round_trip("\"\"") == "\"\"", "empty string")
+    assert!(round_trip("0") == "0", "zero")
+    return 0
+
+@test
+def test_decode_string_escapes() -> i32:
+    assert!(round_trip("\"\\\"\\\\\\/\\b\\f\\n\\r\\t\"") == "\"\\\"\\\\/\\b\\f\\n\\r\\t\"", "simple escapes")
+    match decode("\"\\u00e9\\ud83d\\ude00\"".as_bytes()):
+        Ok(v) =>
+            match v:
+                case Json.Str(value=s):
+                    # U+00E9 is 2 UTF-8 bytes, U+1F600 (a surrogate pair) is 4.
+                    assert!(s.len() == 6, "\\u escapes decode to UTF-8")
+                    assert!(s.as_bytes()[0] == 195 and s.as_bytes()[2] == 240, "UTF-8 lead bytes")
+                case _:
+                    assert!(False, "unexpected match arm")
+        Err(e) => assert!(False, "unexpected match arm")
+    return 0
+
+@test
+def test_find_member() -> i32:
+    match decode("{\"x\": 1, \"title\": \"hi\", \"x\": 2}".as_bytes()):
+        Ok(v) =>
+            match v:
+                case Json.Obj(members=ms):
+                    match find(&ms, "title"):
+                        Some(i) => assert!(i == 1, "title is the second member")
+                        None_ => assert!(False, "unexpected match arm")
+                    match find(&ms, "x"):
+                        Some(i) => assert!(i == 0, "the first duplicate wins")
+                        None_ => assert!(False, "unexpected match arm")
+                    match find(&ms, "missing"):
+                        Some(i) => assert!(False, "unexpected match arm")
+                        None_ => pass
+                case _:
+                    assert!(False, "unexpected match arm")
+        Err(e) => assert!(False, "unexpected match arm")
+    return 0
+
+@test
+def test_decode_rejects_malformed() -> i32:
+    assert!(rejects(""), "empty input")
+    assert!(rejects("   "), "only whitespace")
+    assert!(rejects("{"), "unterminated object")
+    assert!(rejects("[1, 2"), "unterminated array")
+    assert!(rejects("[1,]"), "trailing comma in array")
+    assert!(rejects("{\"a\":1,}"), "trailing comma in object")
+    assert!(rejects("{a: 1}"), "unquoted key")
+    assert!(rejects("{\"a\" 1}"), "missing colon")
+    assert!(rejects("\"abc"), "unterminated string")
+    assert!(rejects("\"a\nb\""), "raw control character in string")
+    assert!(rejects("\"\\x\""), "unknown escape")
+    assert!(rejects("\"\\u12\""), "truncated \\u escape")
+    assert!(rejects("\"\\ud800\""), "lone high surrogate")
+    assert!(rejects("\"\\udc00\""), "lone low surrogate")
+    assert!(rejects("01"), "leading zero")
+    assert!(rejects("1."), "missing fraction digits")
+    assert!(rejects("-"), "lone minus")
+    assert!(rejects("1e"), "missing exponent digits")
+    assert!(rejects("1e999"), "number out of range")
+    assert!(rejects("tru"), "truncated literal")
+    assert!(rejects("nul"), "truncated null")
+    assert!(rejects("1 2"), "trailing value")
+    assert!(rejects("[1] x"), "trailing garbage")
+    return 0
+
+@test
+def test_decode_rejects_deep_nesting() -> i32:
+    let mut deep: String = String.new()
+    for i: usize in range(0, 100):
+        deep.push_str("[")
+    for i: usize in range(0, 100):
+        deep.push_str("]")
+    assert!(rejects(deep), "nesting deeper than MAX_DEPTH is rejected")
+    let mut ok: String = String.new()
+    for i: usize in range(0, 10):
+        ok.push_str("[")
+    for i: usize in range(0, 10):
+        ok.push_str("]")
+    assert!(not rejects(ok), "moderate nesting is fine")
+    return 0
+
+@test
+def test_decode_reports_offset() -> i32:
+    match decode("[1, ?]".as_bytes()):
+        Ok(v) => assert!(False, "unexpected match arm")
+        Err(e) => assert!(e.offset == 4, "offset of the bad character")
+    return 0
+
+@test
+def test_decode_rejects_invalid_utf8() -> i32:
+    let mut bytes: Vec[u8] = Vec.new()
+    bytes.push(34 as u8)
+    bytes.push(255 as u8)
+    bytes.push(34 as u8)
+    match decode(bytes.as_slice()):
+        Ok(v) => assert!(False, "unexpected match arm")
+        Err(e) => pass
+    return 0

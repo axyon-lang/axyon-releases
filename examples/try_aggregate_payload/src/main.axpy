@@ -1,0 +1,85 @@
+enum E:
+    Bad(msg: string)
+    Zero
+
+enum R:
+    Ok(v: i64)
+    Err(e: E)
+
+enum S:
+    Ok(s: string)
+    Err(e: string)
+
+enum S2:
+    Ok(n: i64)
+    Err(e: string)
+
+enum O:
+    Some(s: string)
+    None_
+
+enum O2:
+    Some(n: i64)
+    None_
+
+def div(a: i64, b: i64) -> R:
+    if b == 0:
+        return R.Err(E.Bad("div by zero"))
+    return R.Ok(a / b)
+
+def calc(b: i64) -> R:
+    let q: i64 = div(6, b)?
+    return R.Ok(q + 1)
+
+def name(ok: bool) -> S:
+    if ok:
+        return S.Ok("hello")
+    return S.Err("nope")
+
+def len2(ok: bool) -> S2:
+    let s: string = name(ok)?
+    return S2.Ok(s.len() as i64)
+
+def maybe(ok: bool) -> O:
+    if ok:
+        return O.Some("x")
+    return O.None_
+
+def maybe2(ok: bool) -> O2:
+    let s: string = maybe(ok)?
+    return O2.Some(s.len() as i64)
+
+def main() -> i32:
+    match calc(3):
+        case R.Ok(v=v):
+            println!("{v}")
+        case R.Err(e=_):
+            println!("err")
+    match calc(0):
+        case R.Ok(v=v):
+            println!("{v}")
+        case R.Err(e=E.Bad(msg=m)):
+            println!("bad {m}")
+        case R.Err(e=_):
+            println!("err")
+    match len2(true):
+        case S2.Ok(n=n):
+            println!("{n}")
+        case S2.Err(e=e):
+            println!("E {e}")
+    match len2(false):
+        case S2.Ok(n=n):
+            println!("{n}")
+        case S2.Err(e=e):
+            println!("E {e}")
+    match maybe2(true):
+        case O2.Some(n=n):
+            println!("{n}")
+        case O2.None_:
+            println!("none")
+    match maybe2(false):
+        case O2.Some(n=n):
+            println!("{n}")
+        case O2.None_:
+            println!("none")
+    return 0

@@ -1,0 +1,11 @@
+[package]
+name = "quantum_resources"
+version = "0.1.0"
+edition = "2024"
+description = "Quantum resource ownership and typestate (#481, #482): runs on the local simulator"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true

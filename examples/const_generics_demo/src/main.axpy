@@ -1,0 +1,103 @@
+# Const generic parameters, compile-time `if` and unrolled loops (#1740).
+def sum[N: i64](a: Array[f64; N]) -> f64:
+    let mut s: f64 = 0.0
+    for i: i64 in comptime_range(N):
+        s = s + a[i]
+    return s
+
+def first_or_last[N: i64](a: Array[f64; N]) -> f64:
+    if comptime(N > 2):
+        return a[N - 1]
+    else:
+        return a[0]
+
+def pick[N: i64](a: Array[i64; N * 2], b: Array[i64; N * 3]) -> i64:
+    return a[1] + b[2]
+
+struct Simd[T, N: i64]:
+    lanes: Array[T; N]
+
+impl[T, N: i64] Simd[T, N]:
+    def width(self: &Self) -> i64:
+        return N
+
+    def wide(self: &Self) -> bool:
+        if comptime(N > 2):
+            return True
+        return False
+
+# A generic struct instantiated with a const-length array inside a const-generic
+# function is re-targeted per extent (#1863).
+struct Holder[T]:
+    v: T
+
+impl Holder[T]:
+    def get(self: &Self) -> T:
+        return self.v
+
+def first_of_held[N: i64](a: Array[i64; N]) -> i64:
+    let h: Holder[Array[i64; N]] = Holder { v: a }
+    let b: Array[i64; N] = h.get()
+    return b[0]
+
+# A generic constructor call on such an instance is re-targeted too (#2014).
+struct Cell[T]:
+    v: T
+
+impl Cell[T]:
+    def __init__(v: T) -> Cell[T]:
+        return Cell { v: v }
+
+    def get(self: &Self) -> T:
+        return self.v
+
+def first_of_cell[N: i64](a: Array[i64; N]) -> i64:
+    let c: Cell[Array[i64; N]] = Cell(a)
+    let b: Array[i64; N] = c.get()
+    return b[0]
+
+# A const binder nested in an inherent impl's target is bound per instance (#1911).
+struct Tag[K: i64]:
+    x: i64
+
+struct Boxed[T]:
+    v: T
+
+impl[K: i64] Boxed[Tag[K]]:
+    def key(self: &Self) -> i64:
+        return K
+
+    # `K` is also a length operand in the signature (#2019).
+    def double_first(self: &Self, a: Array[i64; K * 2]) -> i64:
+        return a[0] * 2
+
+def main() -> i32:
+    let v: Simd[f64, 4] = Simd { lanes: [1.0, 2.0, 3.0, 4.0] }
+    let w: Simd[f64, 2] = Simd { lanes: [1.0, 2.0] }
+    assert!(v.width() == 4)
+    assert!(v.wide())
+    assert!(not w.wide())
+    let a: Array[f64; 4] = [1.0, 2.0, 3.0, 4.0]
+    let b: Array[f64; 2] = [5.0, 6.0]
+    assert!(sum(a) == 10.0)
+    assert!(first_or_last(a) == 4.0)
+    assert!(first_or_last(b) == 5.0)
+    let pp: Array[i64; 2] = [1, 2]
+    let qq: Array[i64; 3] = [3, 4, 5]
+    assert!(pick[1](pp, qq) == 7)
+    let p: Array[i64; 2] = [7, 8]
+    let q: Array[i64; 3] = [9, 10, 11]
+    assert!(first_of_held(p) == 7)
+    assert!(first_of_held(q) == 9)
+    assert!(first_of_cell(p) == 7)
+    assert!(first_of_cell(q) == 9)
+    let t3: Boxed[Tag[3]] = Boxed { v: Tag { x: 1 } }
+    let t7: Boxed[Tag[7]] = Boxed { v: Tag { x: 1 } }
+    assert!(t3.key() == 3)
+    assert!(t7.key() == 7)
+    let d6: Array[i64; 6] = [1, 2, 3, 4, 5, 6]
+    let d14: Array[i64; 14] = [5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    assert!(t3.double_first(d6) == 2)
+    assert!(t7.double_first(d14) == 10)
+    println!("const generics ok")
+    return 0

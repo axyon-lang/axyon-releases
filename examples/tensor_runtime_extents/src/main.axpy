@@ -1,0 +1,20 @@
+# Tensors with runtime (`?`) extents (issue #1534).
+#
+# `?` marks an extent that is only known when the program runs. It is accepted
+# in `def` signatures; `T.zeros` / `T.ones` / `T.full` take runtime `i64`
+# extents; matmul, element-wise ops, reductions, reshape and transpose run on
+# `?` tensors. A runtime shape mismatch traps with a message naming both
+# extents.
+
+import std.tensor as T
+
+def rows(n: i64) -> Tensor[f32, (?, 3)]:
+    return T.full([n, 3], 1.0)
+
+def main() -> i32:
+    let a: Tensor[f32, (?, 3)] = rows(4)
+    let w: Tensor[f32, (3, 2)] = T.full([3, 2], 1.0)
+    let y: Tensor[f32, (?, 2)] = T.matmul(a, w)
+    let s: Tensor[f32, (?,)] = T.sum(y, 1)
+    println!("{}", s[3])
+    return 0

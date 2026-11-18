@@ -1,0 +1,43 @@
+# Function calls example for AXYON
+# Demonstrates user-defined function calls
+
+def square(x: i64) -> i64:
+    """Compute x squared."""
+    return x * x
+
+def add_one(x: i64) -> i64:
+    """Add one to x."""
+    return x + 1
+
+def compose(x: i64) -> i64:
+    """Compose square and add_one: square(add_one(x))."""
+    return square(add_one(x))
+
+def main() -> i32:
+    """Entry point demonstrating function calls."""
+    let a: i64 = 5
+
+    # Call user function
+    let b: i64 = square(a)
+    println!("square({a}) = {b}")
+
+    # Chain calls
+    let c: i64 = add_one(b)
+    println!("add_one({b}) = {c}")
+
+    # Nested calls
+    let d: i64 = square(add_one(a))
+    println!("square(add_one({a})) = {d}")
+
+    # Call composed function
+    let e: i64 = compose(a)
+    println!("compose({a}) = {e}")
+
+    # Verify results
+    assert!(b == 25, "square(5) should be 25")
+    assert!(c == 26, "add_one(25) should be 26")
+    assert!(d == 36, "square(add_one(5)) should be 36")
+    assert!(e == 36, "compose(5) should be 36")
+
+    println!("All tests passed!")
+    return 0

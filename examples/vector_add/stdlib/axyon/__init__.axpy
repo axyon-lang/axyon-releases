@@ -1,0 +1,4 @@
+# axyon - Core AXYON runtime module
+#
+# This module provides access to compiler builtin operations
+# for tensor manipulation and other low-level primitives.

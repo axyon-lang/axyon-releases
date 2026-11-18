@@ -1,0 +1,12 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kernels = { path = "../kernels" }
+
+# Same GPU target as `kernels`: a launch of an imported kernel needs a
+# kernel launch route.
+[target]
+gpu = ["nvptx-sm80"]

@@ -1,0 +1,39 @@
+# `comptime` conditions over consts and build-target queries (issue #1859).
+#
+# A module or function-local `const` folds in a `comptime` condition, so only
+# the taken branch is kept. `target.simd_width[T]()` / `target.simd_bits()` read
+# the build target (`--target-cpu`, `--target-features`) and fold the same way.
+# The asserts hold on every target; only the branch taken differs.
+
+const LANES: i64 = 8
+
+def lanes_class() -> i64:
+    if comptime(LANES > 4):
+        return 2
+    else:
+        return 1
+
+def local_const_class() -> i64:
+    const LIMIT: i64 = 3
+    if comptime(LIMIT > 4):
+        return 10
+    return 20
+
+def vector_class() -> i64:
+    if comptime(target.simd_width[f32]() >= 8):
+        return 256
+    else:
+        return 128
+
+def main() -> i32:
+    assert!(lanes_class() == 2)
+    assert!(local_const_class() == 20)
+    assert!(target.simd_bits() == target.simd_width[f32]() * 32)
+    assert!(target.simd_width[f64]() * 2 == target.simd_width[f32]())
+    let vclass: i64 = vector_class()
+    if target.simd_bits() >= 256:
+        assert!(vclass == 256)
+    else:
+        assert!(vclass == 128)
+    println!("simd bits: {vclass}")
+    return 0

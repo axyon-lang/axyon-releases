@@ -1,0 +1,17 @@
+# Scoped lint levels (issue #697): `@allow` silences named lints for one
+# function; the same lint is still reported everywhere else.
+import axyon.debug as D
+
+@allow("unused_variables")
+def scratch() -> i32:
+    let tmp: i32 = 1     # not reported: allowed in this function
+    return 0
+
+@warn("unused_variables")
+def reported() -> i32:
+    let kept: i32 = 2    # reported even under `-A unused_variables`
+    return 0
+
+def main() -> i32:
+    D.println("lint levels")
+    return scratch() + reported()

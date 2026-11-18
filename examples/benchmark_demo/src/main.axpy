@@ -1,0 +1,196 @@
+# Benchmark Demo Example for AXYON
+# Demonstrates the @bench decorator for performance benchmarking.
+#
+# Run benchmarks with: axyon bench
+# Run with filters: axyon bench --filter sum
+# Save baseline: axyon bench --save-baseline main
+# Compare: axyon bench --compare main
+
+# ============================================================================
+# Helper Functions for Benchmarking
+# ============================================================================
+
+def sum_range(n: i32) -> i32:
+    """Sum integers from 0 to n-1 using iteration."""
+    let mut total: i32 = 0
+    for i in range(n):
+        total += i
+    return total
+
+def sum_formula(n: i32) -> i32:
+    """Sum using closed-form formula: n*(n-1)/2."""
+    return (n * (n - 1)) / 2
+
+def count_iterations(limit: i32) -> i32:
+    """Count number of iterations (simple loop)."""
+    let mut count: i32 = 0
+    for _i in range(limit):
+        count += 1
+    return count
+
+def nested_loop(size: i32) -> i32:
+    """Nested loop iterations (O(n^2))."""
+    let mut result: i32 = 0
+    for _i in range(size):
+        for _j in range(size):
+            result += 1
+    return result
+
+# ============================================================================
+# Basic Benchmarks - Simple @bench decorator
+# ============================================================================
+
+@bench
+def bench_sum_100() -> i32:
+    """Benchmark summing 100 numbers."""
+    let result: i32 = sum_range(100)
+    assert!(result == 4950, "sum of 0..100")
+    return 0
+
+@bench
+def bench_sum_1000() -> i32:
+    """Benchmark summing 1000 numbers."""
+    let result: i32 = sum_range(1000)
+    assert!(result == 499500, "sum of 0..1000")
+    return 0
+
+@bench
+def bench_sum_10000() -> i32:
+    """Benchmark summing 10000 numbers."""
+    let result: i32 = sum_range(10000)
+    assert!(result > 0, "result should be positive")
+    return 0
+
+# ============================================================================
+# Custom Iterations - @bench(warmup=N, runs=M)
+# ============================================================================
+
+@bench(warmup=5, runs=50)
+def bench_count_precise() -> i32:
+    """Benchmark with custom warmup and runs for precision."""
+    let result: i32 = count_iterations(1000)
+    assert!(result == 1000, "count should equal 1000")
+    return 0
+
+@bench(warmup=10, runs=100)
+def bench_formula_stable() -> i32:
+    """Many iterations for statistical stability."""
+    let result: i32 = sum_formula(10000)
+    assert!(result > 0, "result should be positive")
+    return 0
+
+# ============================================================================
+# Device-Specific Benchmarks - @bench(device="<device>")
+# ============================================================================
+
+@bench(device="cpu")
+def bench_cpu_only() -> i32:
+    """Benchmark that only runs on CPU."""
+    let result: i32 = sum_range(2000)
+    assert!(result > 0, "result should be positive")
+    return 0
+
+@bench(device="cuda")
+def bench_cuda_only() -> i32:
+    """Benchmark that only runs on CUDA devices."""
+    let result: i32 = sum_range(2000)
+    assert!(result > 0, "result should be positive")
+    return 0
+
+# ============================================================================
+# Algorithm Complexity Comparison
+# ============================================================================
+
+@bench(warmup=5, runs=30)
+def bench_linear_n100() -> i32:
+    """O(n) with n=100."""
+    let count: i32 = count_iterations(100)
+    assert!(count == 100, "count should equal 100")
+    return 0
+
+@bench(warmup=5, runs=30)
+def bench_linear_n1000() -> i32:
+    """O(n) with n=1000 - should be ~10x slower than n=100."""
+    let count: i32 = count_iterations(1000)
+    assert!(count == 1000, "count should equal 1000")
+    return 0
+
+@bench(warmup=3, runs=20)
+def bench_quadratic_n10() -> i32:
+    """O(n^2) with n=10."""
+    let count: i32 = nested_loop(10)
+    assert!(count == 100, "10x10 iterations")
+    return 0
+
+@bench(warmup=3, runs=20)
+def bench_quadratic_n30() -> i32:
+    """O(n^2) with n=30 - should be ~9x slower than n=10."""
+    let count: i32 = nested_loop(30)
+    assert!(count == 900, "30x30 iterations")
+    return 0
+
+# ============================================================================
+# Baseline Comparison - @bench(baseline="<name>")
+# ============================================================================
+
+@bench(baseline="main")
+def bench_with_baseline() -> i32:
+    """Benchmark that can compare against a saved baseline."""
+    let result: i32 = sum_range(2000)
+    assert!(result > 0, "result should be positive")
+    return 0
+
+# ============================================================================
+# Combined Options
+# ============================================================================
+
+@bench(device="cpu", warmup=5, runs=50)
+def bench_combined_options() -> i32:
+    """CPU benchmark with custom iterations."""
+    let mut result: i32 = 0
+    for _i in range(100):
+        result += sum_range(10)
+    assert!(result > 0, "result should be positive")
+    return 0
+
+@bench(warmup=10, runs=100, baseline="v1")
+def bench_hot_loop() -> i32:
+    """Heavily iterated for accuracy, with baseline."""
+    let mut sum: i32 = 0
+    for i: i32 in range(500):
+        sum += i
+    assert!(sum == 124750, "sum of 0..500")
+    return 0
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+def main() -> i32:
+    """Main function - run 'axyon bench' to execute benchmarks."""
+    println!("Benchmark Demo")
+    println!("==============")
+    println!("")
+    println!("Run benchmarks with: axyon bench")
+    println!("")
+    println!("Options:")
+    println!("  --filter X         Run benchmarks matching X")
+    println!("  --device X         Run only benchmarks for device X")
+    println!("  --format json      Output results as JSON")
+    println!("  --save-baseline X  Save results as baseline X")
+    println!("  --compare X        Compare against baseline X")
+    println!("")
+    println!("Decorators:")
+    println!("  @bench                      Default iterations")
+    println!("  @bench(warmup=10, runs=100) Custom iterations")
+    println!("  @bench(device=\"cpu\")        CPU-only")
+    println!("  @bench(baseline=\"main\")     Enable comparison")
+    println!("")
+
+    println!("Quick demo - comparing iterative vs formula:")
+    let iter_result: i32 = sum_range(1000)
+    let form_result: i32 = sum_formula(1000)
+    println!("  Iterative: {iter_result}")
+    println!("  Formula:   {form_result}")
+
+    return 0

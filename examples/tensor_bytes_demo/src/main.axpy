@@ -1,0 +1,13 @@
+import std.tensor as T
+
+def main() -> i32:
+    let mut b: Vec[u8] = Vec.new()
+    b.push(128 as u8)
+    b.push(63 as u8)
+    b.push(0 as u8)
+    b.push(192 as u8)
+    b.push(128 as u8)
+    b.push(127 as u8)
+    let t: Tensor[f32, (3,)] = T.from_bf16_le_bytes(&b, 0, [3])
+    println!("{} {} {}", t[0], t[1], t[2])
+    return 0

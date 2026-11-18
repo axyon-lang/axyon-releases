@@ -1,0 +1,3 @@
+[package]
+name = "unsafe_cell_demo"
+version = "0.1.0"

@@ -1,0 +1,104 @@
+# Kernels on device buffers of run-time size (issue #2634)
+#
+# A kernel parameter may give a buffer a symbolic extent, here
+# `&Buffer[f32, (N,), device_global]` and `&mut Buffer[i32, (R, 4), ...]`.
+# The kernel then works for any length chosen at run time: `gpu_launch`
+# passes each buffer's extents along with its device address, `buffer_dim`
+# reads them inside the kernel, and every `buffer_get` / `buffer_set` is
+# checked against them. An index past an extent stops the kernel, and the
+# program ends with an AXYON panic instead of touching other memory. Before
+# each launch the runtime also checks that the buffer holds exactly the
+# extents' product.
+#
+# A buffer of any length fits a run-time extent, a static one too
+# (`Buffer[f32, (4,), device_global]` for `(N,)`, issue #2670): the launch
+# reads the extents from the buffer it is given.
+#
+# `buffer_fill` works on a `&mut` kernel borrow too (#2669), but it is
+# per-thread: the calling thread stores the value into every element, so
+# every thread that reaches it fills the whole buffer. `fill_once` guards it
+# with both `gpu_block_id(0) == 0` and `gpu_thread_id(0) == 0`: a guard on the
+# thread id alone picks one thread in every block, not one in the grid.
+#
+# Running it needs an NVIDIA GPU and driver; without one the first device
+# allocation stops the program with an AXYON panic.
+
+@gpu(entry)
+def scale(a: f32, x: &mut Buffer[f32, (N,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    # The grid may have more threads than elements: the tail lanes skip.
+    if i < buffer_dim(x, 0):
+        buffer_set(x, i, a * buffer_get(x, i))
+
+@gpu(entry)
+def number_rows(x: &mut Buffer[i32, (R, 4), device_global]) -> None:
+    # One block per row, one thread per column.
+    let r: i64 = gpu_block_id(0)
+    let c: i64 = gpu_thread_id(0)
+    if r < buffer_dim(x, 0) and c < buffer_dim(x, 1):
+        buffer_set(x, r, c, (r * 10 + c) as i32)
+
+@gpu(entry)
+def fill_once(v: i32, x: &mut Buffer[i32, (N,), device_global]) -> None:
+    # Exactly one thread of the whole grid fills; the others do nothing.
+    if gpu_block_id(0) == 0 and gpu_thread_id(0) == 0:
+        buffer_fill(x, v)
+
+# Scale `n` elements on the GPU; the same kernel serves every length.
+def scaled_sum(n: i64, a: f32) -> f32:
+    let mut h: Buffer[f32, (N,)] = buffer_alloc([n])
+    for i: i64 in range(n):
+        buffer_set(h, i, i as f32)
+    let mut d: Buffer[f32, (N,), device_global] = buffer_to_device(h)
+    let blocks: i64 = (n + 127) / 128
+    gpu_launch(scale, blocks, 128, a, &mut d)
+    let back: Buffer[f32, (N,)] = buffer_to_host(d)
+    let mut sum: f32 = 0.0
+    for i: i64 in range(n):
+        sum = sum + buffer_get(back, i)
+    return sum
+
+# The same kernel over a buffer whose length is a compile-time constant.
+def scaled_static_sum() -> f32:
+    let mut h: Buffer[f32, (4,)] = buffer_alloc([4])
+    for i: i64 in range(4):
+        buffer_set(h, i, i as f32)
+    let mut d: Buffer[f32, (4,), device_global] = buffer_to_device(h)
+    gpu_launch(scale, 1, 32, 3.0, &mut d)
+    let back: Buffer[f32, (4,)] = buffer_to_host(d)
+    let mut sum: f32 = 0.0
+    for i: i64 in range(4):
+        sum = sum + buffer_get(back, i)
+    return sum
+
+def main() -> i32:
+    let fixed: f32 = scaled_static_sum()
+    println!("sum of 3 * [0, 4) on the GPU = {fixed}")
+    let small: f32 = scaled_sum(10, 2.0)
+    let large: f32 = scaled_sum(1000, 0.5)
+    println!("sum of 2 * [0, 10) on the GPU = {small}")
+    println!("sum of 0.5 * [0, 1000) on the GPU = {large}")
+
+    let rows: i64 = 3
+    let h: Buffer[i32, (R, 4)] = buffer_alloc([rows, 4])
+    let mut d: Buffer[i32, (R, 4), device_global] = buffer_to_device(h)
+    gpu_launch(number_rows, rows, 4, &mut d)
+    let back: Buffer[i32, (R, 4)] = buffer_to_host(d)
+    let corner: i32 = buffer_get(back, rows - 1, 3)
+    println!("last row, last column = {corner}")
+
+    # A multi-block launch of the guarded fill: 4 blocks of 64 threads, one
+    # of which fills all 300 elements. The host checks every element.
+    let n: i64 = 300
+    let mut hf: Buffer[i32, (N,)] = buffer_alloc([n])
+    buffer_fill(hf, -1)
+    let mut df: Buffer[i32, (N,), device_global] = buffer_to_device(hf)
+    gpu_launch(fill_once, 4, 64, 9, &mut df)
+    let filled: Buffer[i32, (N,)] = buffer_to_host(df)
+    for i: i64 in range(n):
+        let got: i32 = buffer_get(filled, i)
+        if got != 9:
+            println!("fill_once: element {i} = {got}")
+            return 1
+    println!("one thread filled all {n} elements with 9")
+    return 0

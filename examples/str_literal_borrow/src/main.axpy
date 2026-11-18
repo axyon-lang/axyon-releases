@@ -1,0 +1,17 @@
+# A string literal reaches a `&str` parameter (#1632), bare or as `&"lit"`;
+# an owned `str` binding is borrowed with `&`.
+
+def shout(s: &str) -> i64:
+    return s.len() as i64
+
+def main() -> i32:
+    let a: i64 = shout("abc")
+    let b: i64 = shout(&"hello")
+    let owned: str = "hi"
+    let c: i64 = shout(&owned)
+    assert!(a == 3, "bare literal")
+    assert!(b == 5, "explicit borrow of a literal")
+    assert!(c == 2, "borrowed binding")
+    println!("{a} {b} {c}")
+    return 0
+

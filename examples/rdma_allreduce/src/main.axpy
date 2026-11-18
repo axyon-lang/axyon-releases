@@ -1,0 +1,486 @@
+# std.rdma collectives across N processes (#2048): deterministic and fast
+# allreduce, reduce_scatter, allgather, broadcast, alltoall, barrier, and a
+# deliberately mismatched call that fails on every rank. Then the
+# non-blocking forms (#2217): several collectives outstanding at once and
+# waited for in a different order on odd ranks, a forgotten Pending, a
+# non-blocking mismatch, and a collective overlapping compute with the
+# progress thread on.
+#
+# Each rank writes its UCX address to RDMA_DIR/addr.<rank> and reads every
+# other rank's:
+#   RDMA_RANK=r RDMA_SIZE=n RDMA_DIR=/shared/dir ./rdma_allreduce   (one per rank)
+# RDMA_TIMEOUT_MS bounds every call (default 30000). Every rank prints
+# `RESULT rank <r> ok` when all checks pass, or `RESULT error <code>` /
+# `RESULT check <name> failed`.
+#
+# On one host, select a transport with e.g. UCX_TLS=self,tcp or self,posix,tcp.
+# Without UCX (e.g. macOS) the native TCP fallback runs instead (#2818); see
+# scripts/ci/rdma-native-local.sh and docs/src/reference/runtime-rdma.md.
+
+from std.rdma import (
+    RdmaContext, Endpoint, Address, RegBuf, Pending, PendingBarrier, Comm,
+    RdmaError, RdmaErrorKind, ReduceOp, CollMode,
+    register, allreduce, reduce_scatter, allgather, broadcast, alltoall,
+    iallreduce, ireduce_scatter, iallgather, ibroadcast, ialltoall,
+)
+from std.alloc import Vec, String
+from std.core import usize, u8, u32, i32, i64, f32, f64, bool, unit, Result, Ok, Err
+from std.env import var, VarStatus
+from std.fs import read, write
+from std.time import Instant
+
+@intrinsic
+def forget[T](value: T) -> unit:
+    pass
+
+const DEFAULT_TIMEOUT_MS: i64 = 30000
+# Small enough to gather, and large enough for the pipelined chain and ring.
+const SMALL: usize = 1000
+const LARGE: usize = 70000
+
+def env_string(name: Slice[u8]) -> String:
+    let mut out: Vec[u8] = Vec.new()
+    let status: VarStatus = var(name, &mut out)
+    let mut text: String = String.new()
+    if status == VarStatus.Ok:
+        let mut i: usize = 0
+        while i < out.len():
+            text.push(out.get(i))
+            i = i + 1
+    return text
+
+def env_i64(name: Slice[u8], default: i64) -> i64:
+    let text: String = env_string(name)
+    if text.len() == 0:
+        return default
+    let mut value: i64 = 0
+    let bytes: Slice[u8] = text.as_bytes()
+    let mut i: usize = 0
+    while i < bytes.len():
+        value = value * 10 + ((bytes[i] as i64) - 48)
+        i = i + 1
+    return value
+
+def hex_digit(n: u8) -> u8:
+    if n < 10:
+        return 48 + n
+    return 87 + n
+
+def hex_value(c: u8) -> u8:
+    if c >= 97:
+        return c - 87
+    return c - 48
+
+def append(out: ref_mut[String], bytes: Slice[u8]) -> unit:
+    let mut i: usize = 0
+    while i < bytes.len():
+        out.push(bytes[i])
+        i = i + 1
+
+def addr_path(dir: ref[String], rank: i64) -> String:
+    let mut p: String = String.new()
+    let d: Slice[u8] = dir.as_bytes()
+    let mut i: usize = 0
+    while i < d.len():
+        p.push(d[i])
+        i = i + 1
+    append(&mut p, "/addr.".as_bytes())
+    # Rank in decimal (ranks are small).
+    if rank >= 100:
+        p.push((48 + (rank / 100) % 10) as u8)
+    if rank >= 10:
+        p.push((48 + (rank / 10) % 10) as u8)
+    p.push((48 + rank % 10) as u8)
+    return p
+
+def write_address(path: String, addr: ref[Address]) -> bool:
+    let mut text: String = String.new()
+    let bytes: Vec[u8] = addr.to_bytes()
+    let mut i: usize = 0
+    while i < bytes.len():
+        let b: u8 = bytes.get(i)
+        text.push(hex_digit(b / 16))
+        text.push(hex_digit(b % 16))
+        i = i + 1
+    return write(path.as_bytes(), text.as_bytes()).is_ok()
+
+def sleep_ms(ms: i64) -> unit:
+    let start: Instant = Instant.now()
+    while start.elapsed().as_nanos() < ms * 1000000:
+        pass
+
+# Poll for a peer's address file (the peer writes complete hex text).
+def read_address(path: ref[String], tries: i64) -> Address:
+    if tries > 30000:
+        panic("rdma_allreduce: timed out waiting for a peer's address file")
+    match read(path.as_bytes()):
+        Ok(bytes) =>
+            if bytes.len() > 0 and bytes.len() % 2 == 0:
+                let mut out: Vec[u8] = Vec.new()
+                let mut i: usize = 0
+                while i < bytes.len():
+                    let hi: u8 = hex_value(bytes.get(i))
+                    let lo: u8 = hex_value(bytes.get(i + 1))
+                    out.push(hi * 16 + lo)
+                    i = i + 2
+                # SAFETY: `out` is a peer's address, written by `write_address`.
+                unsafe:
+                    return Address.from_bytes_unchecked(out)
+        Err(e) =>
+            pass
+    sleep_ms(1)
+    return read_address(path, tries + 1)
+
+# Connect to every other rank. Recursion instead of a loop: `?` is not yet
+# supported inside loop bodies. The Comm keeps each endpoint alive.
+def wire(ctx: ref[RdmaContext], comm: ref[Comm], dir: ref[String], rank: i64, size: i64, q: i64) -> Result[i64, RdmaError]:
+    if q == size:
+        return Result.Ok(0)
+    if q == rank:
+        return wire(ctx, comm, dir, rank, size, q + 1)
+    let path: String = addr_path(dir, q)
+    let addr: Address = read_address(&path, 0)
+    let ep: Endpoint = ctx.connect(&addr)?
+    comm.set_peer(q as u32, &ep)?
+    return wire(ctx, comm, dir, rank, size, q + 1)
+
+# Rank r's input element i: mixed magnitudes, so the order of a float sum
+# shows in the low bits.
+def input_f32(r: i64, i: usize) -> f32:
+    let h: i64 = (r * 7919 + (i as i64) * 104729) % 20011
+    let base: f32 = ((h - 10000) as f32)
+    if h % 3 == 0:
+        return base * 0.001
+    if h % 3 == 1:
+        return base
+    return base * 1000.0
+
+def f32_buf(ctx: ref[RdmaContext], rank: i64, n: usize) -> Result[RegBuf[f32], RdmaError]:
+    let mut data: Vec[f32] = Vec.with_capacity(n)
+    let mut i: usize = 0
+    while i < n:
+        data.push(input_f32(rank, i))
+        i = i + 1
+    return register(ctx, data)
+
+# The deterministic contract: the left fold over ranks, in rank order.
+def fold_f32(size: i64, i: usize) -> f32:
+    let mut acc: f32 = input_f32(0, i)
+    let mut q: i64 = 1
+    while q < size:
+        acc = acc + input_f32(q, i)
+        q = q + 1
+    return acc
+
+def fail(name: Slice[u8]) -> Result[i64, RdmaError]:
+    let mut text: String = String.new()
+    let mut i: usize = 0
+    while i < name.len():
+        text.push(name[i])
+        i = i + 1
+    println!("RESULT check {text} failed")
+    return Result.Ok(1)
+
+def check_deterministic(ctx: ref[RdmaContext], comm: ref[Comm], rank: i64, size: i64, n: usize, ms: i64) -> Result[i64, RdmaError]:
+    let buf: RegBuf[f32] = f32_buf(ctx, rank, n)?
+    let out: RegBuf[f32] = allreduce(buf, comm, ReduceOp.Sum, CollMode.Deterministic, ms)?
+    let mut i: usize = 0
+    while i < n:
+        if out.at(i) != fold_f32(size, i):
+            return fail("deterministic_allreduce".as_bytes())
+        i = i + 1
+    return Result.Ok(0)
+
+def check_fast(ctx: ref[RdmaContext], comm: ref[Comm], rank: i64, size: i64, n: usize, ms: i64) -> Result[i64, RdmaError]:
+    let buf: RegBuf[f32] = f32_buf(ctx, rank, n)?
+    let out: RegBuf[f32] = allreduce(buf, comm, ReduceOp.Sum, CollMode.Fast, ms)?
+    let mut i: usize = 0
+    while i < n:
+        let want: f32 = fold_f32(size, i)
+        let mut diff: f32 = out.at(i) - want
+        if diff < 0.0:
+            diff = 0.0 - diff
+        let mut mag: f32 = want
+        if mag < 0.0:
+            mag = 0.0 - mag
+        if diff > 0.001 * (1.0 + mag) + 0.01:
+            return fail("fast_allreduce".as_bytes())
+        i = i + 1
+    return Result.Ok(0)
+
+def check_max_i64(ctx: ref[RdmaContext], comm: ref[Comm], rank: i64, size: i64, ms: i64) -> Result[i64, RdmaError]:
+    let mut data: Vec[i64] = Vec.new()
+    let mut i: i64 = 0
+    while i < 16:
+        data.push((rank - i) * (rank - i))
+        i = i + 1
+    let buf: RegBuf[i64] = register(ctx, data)?
+    let out: RegBuf[i64] = allreduce(buf, comm, ReduceOp.Max, CollMode.Fast, ms)?
+    i = 0
+    while i < 16:
+        let lo: i64 = i * i
+        let hi: i64 = (size - 1 - i) * (size - 1 - i)
+        let want: i64 = if lo > hi { lo } else { hi }
+        if out.at(i as usize) != want:
+            return fail("max_i64".as_bytes())
+        i = i + 1
+    return Result.Ok(0)
+
+# Block `rank` ends with the sum over ranks; the other blocks keep the input.
+def check_reduce_scatter(ctx: ref[RdmaContext], comm: ref[Comm], rank: i64, size: i64, mode: CollMode, ms: i64) -> Result[i64, RdmaError]:
+    let block: i64 = 7
+    let mut data: Vec[f64] = Vec.new()
+    let mut i: i64 = 0
+    while i < block * size:
+        data.push((i * 3 + rank) as f64)
+        i = i + 1
+    let buf: RegBuf[f64] = register(ctx, data)?
+    let out: RegBuf[f64] = reduce_scatter(buf, comm, ReduceOp.Sum, mode, ms)?
+    i = 0
+    while i < block * size:
+        let mut want: f64 = (i * 3 + rank) as f64
+        if i / block == rank:
+            want = ((i * 3 * size) + (size * (size - 1)) / 2) as f64
+        if out.at(i as usize) != want:
+            return fail("reduce_scatter".as_bytes())
+        i = i + 1
+    return Result.Ok(0)
+
+def word(src: i64, i: i64) -> i32:
+    return (src * 1000 + i) as i32
+
+def check_movement(ctx: ref[RdmaContext], comm: ref[Comm], rank: i64, size: i64, ms: i64) -> Result[i64, RdmaError]:
+    let block: i64 = 5
+    let n: i64 = block * size
+    # Allgather: block q comes from rank q.
+    let mut g: Vec[i32] = Vec.new()
+    let mut i: i64 = 0
+    while i < n:
+        g.push(if i / block == rank { word(rank, i) } else { -1 as i32 })
+        i = i + 1
+    let gbuf: RegBuf[i32] = register(ctx, g)?
+    let gout: RegBuf[i32] = allgather(gbuf, comm, ms)?
+    i = 0
+    while i < n:
+        if gout.at(i as usize) != word(i / block, i):
+            return fail("allgather".as_bytes())
+        i = i + 1
+    # Broadcast from the last rank.
+    let root: i64 = size - 1
+    let mut b: Vec[u8] = Vec.new()
+    i = 0
+    while i < n:
+        b.push(((rank + 1) * 10 + i % 7) as u8)
+        i = i + 1
+    let bbuf: RegBuf[u8] = register(ctx, b)?
+    let bout: RegBuf[u8] = broadcast(bbuf, comm, root as u32, ms)?
+    i = 0
+    while i < n:
+        if bout.at(i as usize) != (((root + 1) * 10 + i % 7) as u8):
+            return fail("broadcast".as_bytes())
+        i = i + 1
+    # Alltoall: block q of the result is block `rank` of rank q.
+    let mut a: Vec[i32] = Vec.new()
+    i = 0
+    while i < n:
+        a.push(word(rank, i))
+        i = i + 1
+    let abuf: RegBuf[i32] = register(ctx, a)?
+    let aout: RegBuf[i32] = alltoall(abuf, comm, ms)?
+    i = 0
+    while i < n:
+        if aout.at(i as usize) != word(i / block, rank * block + i % block):
+            return fail("alltoall".as_bytes())
+        i = i + 1
+    return Result.Ok(0)
+
+# Rank 0 passes 4 elements, the others 5: every rank gets CollectiveMismatch,
+# and the communicator stays usable.
+def check_mismatch(ctx: ref[RdmaContext], comm: ref[Comm], rank: i64, ms: i64) -> Result[i64, RdmaError]:
+    let n: usize = if rank == 0 { 4 as usize } else { 5 as usize }
+    let buf: RegBuf[f32] = f32_buf(ctx, rank, n)?
+    match allreduce(buf, comm, ReduceOp.Sum, CollMode.Deterministic, ms):
+        Ok(b) => return fail("mismatch_detected".as_bytes())
+        Err(e) =>
+            if e.kind != RdmaErrorKind.CollectiveMismatch:
+                return fail("mismatch_kind".as_bytes())
+    comm.barrier(ms)?
+    return Result.Ok(0)
+
+# Stand-in for a compute section: no RDMA call while it runs.
+def compute(rounds: i64) -> f64:
+    let mut acc: f64 = 0.0
+    let mut i: i64 = 0
+    while i < rounds:
+        acc = acc * 0.5 + (i % 7) as f64
+        i = i + 1
+    return acc
+
+def gather_input(ctx: ref[RdmaContext], rank: i64, size: i64, block: i64) -> Result[RegBuf[i32], RdmaError]:
+    let mut g: Vec[i32] = Vec.new()
+    let mut i: i64 = 0
+    while i < block * size:
+        g.push(if i / block == rank { word(rank, i) } else { -1 as i32 })
+        i = i + 1
+    return register(ctx, g)
+
+def words_input(ctx: ref[RdmaContext], rank: i64, n: i64) -> Result[RegBuf[i32], RdmaError]:
+    let mut a: Vec[i32] = Vec.new()
+    let mut i: i64 = 0
+    while i < n:
+        a.push(word(rank, i))
+        i = i + 1
+    return register(ctx, a)
+
+def scatter_input(ctx: ref[RdmaContext], rank: i64, size: i64, block: i64) -> Result[RegBuf[f64], RdmaError]:
+    let mut data: Vec[f64] = Vec.new()
+    let mut i: i64 = 0
+    while i < block * size:
+        data.push((i * 3 + rank) as f64)
+        i = i + 1
+    return register(ctx, data)
+
+# Finish the later posts first, without consuming them.
+def late_first(p5: ref[Pending[i32]], p3: ref[Pending[f64]], bar: ref[PendingBarrier], ms: i64) -> Result[bool, RdmaError]:
+    let done5: bool = p5.wait_for(ms)?
+    let done3: bool = p3.wait_for(ms)?
+    let done_bar: bool = bar.wait_for(ms)?
+    return Result.Ok(done5 and done3 and done_bar)
+
+# Five non-blocking collectives and a barrier outstanding on one context at
+# once, compute in between; odd ranks finish the later ones first.
+def check_nonblocking(ctx: ref[RdmaContext], comm: ref[Comm], rank: i64, size: i64, ms: i64) -> Result[i64, RdmaError]:
+    let block: i64 = 5
+    let n: i64 = block * size
+    let root: i64 = size - 1
+    let b1: RegBuf[f32] = f32_buf(ctx, rank, LARGE)?
+    let p1: Pending[f32] = iallreduce(b1, comm, ReduceOp.Sum, CollMode.Deterministic, ms)?
+    let b2: RegBuf[i32] = gather_input(ctx, rank, size, block)?
+    let p2: Pending[i32] = iallgather(b2, comm, ms)?
+    let b3: RegBuf[f64] = scatter_input(ctx, rank, size, 7)?
+    let p3: Pending[f64] = ireduce_scatter(b3, comm, ReduceOp.Sum, CollMode.Fast, ms)?
+    let mut bv: Vec[u8] = Vec.new()
+    let mut i: i64 = 0
+    while i < n:
+        bv.push(((rank + 1) * 10 + i % 7) as u8)
+        i = i + 1
+    let b4: RegBuf[u8] = register(ctx, bv)?
+    let p4: Pending[u8] = ibroadcast(b4, comm, root as u32, ms)?
+    let b5: RegBuf[i32] = words_input(ctx, rank, n)?
+    let p5: Pending[i32] = ialltoall(b5, comm, ms)?
+    let bar: PendingBarrier = comm.ibarrier(ms)?
+    let _work: f64 = compute(200000)
+    if rank % 2 == 1:
+        match late_first(&p5, &p3, &bar, ms):
+            Ok(done) =>
+                if not done:
+                    return fail("nonblocking_wait_for".as_bytes())
+            Err(e) => return Result.Err(e)
+    let o1: RegBuf[f32] = p1.wait()?
+    i = 0
+    while i < (LARGE as i64):
+        if o1.at(i as usize) != fold_f32(size, i as usize):
+            return fail("iallreduce".as_bytes())
+        i = i + 1
+    let o2: RegBuf[i32] = p2.wait()?
+    i = 0
+    while i < n:
+        if o2.at(i as usize) != word(i / block, i):
+            return fail("iallgather".as_bytes())
+        i = i + 1
+    let o3: RegBuf[f64] = p3.wait()?
+    i = 0
+    while i < 7 * size:
+        let mut want: f64 = (i * 3 + rank) as f64
+        if i / 7 == rank:
+            want = ((i * 3 * size) + (size * (size - 1)) / 2) as f64
+        if o3.at(i as usize) != want:
+            return fail("ireduce_scatter".as_bytes())
+        i = i + 1
+    let o4: RegBuf[u8] = p4.wait()?
+    i = 0
+    while i < n:
+        if o4.at(i as usize) != (((root + 1) * 10 + i % 7) as u8):
+            return fail("ibroadcast".as_bytes())
+        i = i + 1
+    let o5: RegBuf[i32] = p5.wait()?
+    i = 0
+    while i < n:
+        if o5.at(i as usize) != word(i / block, rank * block + i % block):
+            return fail("ialltoall".as_bytes())
+        i = i + 1
+    bar.wait()?
+    # A forgotten Pending leaks its buffer (never freed); the collective still
+    # runs to completion on later progress, and the ranks stay in step.
+    let fb: RegBuf[f32] = f32_buf(ctx, rank, SMALL)?
+    let forgotten: Pending[f32] = iallreduce(fb, comm, ReduceOp.Sum, CollMode.Fast, ms)?
+    forget(forgotten)
+    # A count mismatch posted non-blocking: CollectiveMismatch on every rank.
+    let mn: usize = if rank == 0 { 4 as usize } else { 5 as usize }
+    let mb: RegBuf[f32] = f32_buf(ctx, rank, mn)?
+    let mp: Pending[f32] = iallreduce(mb, comm, ReduceOp.Sum, CollMode.Deterministic, ms)?
+    match mp.wait():
+        Ok(b) => return fail("nonblocking_mismatch_detected".as_bytes())
+        Err(e) =>
+            if e.kind != RdmaErrorKind.CollectiveMismatch:
+                return fail("nonblocking_mismatch_kind".as_bytes())
+    # Overlap: with the progress thread on, the collective advances during
+    # the compute section without any call from this thread.
+    ctx.set_progress_thread(true)?
+    if not ctx.progress_thread_running():
+        return fail("progress_thread_running".as_bytes())
+    let ob: RegBuf[f32] = f32_buf(ctx, rank, LARGE)?
+    let op: Pending[f32] = iallreduce(ob, comm, ReduceOp.Sum, CollMode.Deterministic, ms)?
+    let _work2: f64 = compute(200000)
+    let out: RegBuf[f32] = op.wait()?
+    i = 0
+    while i < (LARGE as i64):
+        if out.at(i as usize) != fold_f32(size, i as usize):
+            return fail("overlapped_iallreduce".as_bytes())
+        i = i + 1
+    ctx.set_progress_thread(false)?
+    return Result.Ok(0)
+
+def run(rank: i64, size: i64) -> Result[i64, RdmaError]:
+    let ms: i64 = env_i64("RDMA_TIMEOUT_MS".as_bytes(), DEFAULT_TIMEOUT_MS)
+    let dir: String = env_string("RDMA_DIR".as_bytes())
+    let ctx: RdmaContext = RdmaContext.new()?
+    let mine: Address = ctx.address()?
+    let wrote: bool = write_address(addr_path(&dir, rank), &mine)
+    if not wrote:
+        return fail("write_address".as_bytes())
+    let comm: Comm = Comm.new(&ctx, rank as u32, size as u32)?
+    wire(&ctx, &comm, &dir, rank, size, 0)?
+    comm.barrier(ms)?
+    let mut bad: i64 = 0
+    bad = bad + check_deterministic(&ctx, &comm, rank, size, SMALL, ms)?
+    bad = bad + check_deterministic(&ctx, &comm, rank, size, LARGE, ms)?
+    bad = bad + check_fast(&ctx, &comm, rank, size, SMALL, ms)?
+    bad = bad + check_fast(&ctx, &comm, rank, size, LARGE, ms)?
+    bad = bad + check_max_i64(&ctx, &comm, rank, size, ms)?
+    bad = bad + check_reduce_scatter(&ctx, &comm, rank, size, CollMode.Deterministic, ms)?
+    bad = bad + check_reduce_scatter(&ctx, &comm, rank, size, CollMode.Fast, ms)?
+    bad = bad + check_movement(&ctx, &comm, rank, size, ms)?
+    bad = bad + check_mismatch(&ctx, &comm, rank, ms)?
+    bad = bad + check_nonblocking(&ctx, &comm, rank, size, ms)?
+    comm.barrier(ms)?
+    return Result.Ok(bad)
+
+def main() -> i32:
+    # Without the bootstrap environment there is nothing to run: example
+    # sweeps build and run every example with no arguments.
+    if env_string("RDMA_DIR".as_bytes()).len() == 0:
+        println!("rdma_allreduce: set RDMA_RANK, RDMA_SIZE and RDMA_DIR (see the header)")
+        return 0
+    let rank: i64 = env_i64("RDMA_RANK".as_bytes(), 0)
+    let size: i64 = env_i64("RDMA_SIZE".as_bytes(), 1)
+    match run(rank, size):
+        Ok(bad) =>
+            if bad != 0:
+                return 1
+            println!("RESULT rank {rank} ok")
+            return 0
+        Err(e) =>
+            let code: i64 = e.code
+            println!("RESULT error {code}")
+            return 2

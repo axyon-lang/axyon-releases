@@ -1,0 +1,19 @@
+# Private Helpers Demo - Main Entry Point
+#
+# Both `main.axpy` and `util.axpy` define a private `helper()`. Private
+# functions are module-local, so the names do not clash: each call below
+# resolves to the helper defined in its own module.
+
+from private_helpers_demo import scaled
+
+def helper() -> i64:
+    return 3
+
+def main() -> i32:
+    let own: i64 = helper()
+    let imported: i64 = scaled(4)
+    println!("main's helper = {own}")
+    println!("util's helper via scaled(4) = {imported}")
+    assert!(own == 3, "main's helper must return 3")
+    assert!(imported == 40, "util's helper must return 10")
+    return 0

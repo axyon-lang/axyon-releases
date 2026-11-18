@@ -1,0 +1,27 @@
+# Non-strippable `panic(msg)` and `abort()` in conditional expressions (#576).
+#
+# Unlike `assert!`, `panic(msg)` is emitted in every build profile, so it can
+# enforce invariants in release builds. A diverging call may be a branch of an
+# if-expression; the other branch supplies the type.
+
+@host
+def checked_div(a: i32, b: i32) -> i32:
+    let d: i32 = a / b if b != 0 else panic("division by zero")
+    return d
+
+@host
+def require_positive(x: i32) -> i32:
+    if x <= 0:
+        panic("value must be positive")
+    return x
+
+@host
+def main() -> i32:
+    # Branch order does not matter.
+    let a: i32 = panic("unreachable") if False else 7
+    let b: i32 = 9 if True else abort()
+    let c: i32 = require_positive(a)
+    let d: i32 = checked_div(a, 7)
+    println!("a = {a}, b = {b}, c = {c}, d = {d}")
+    assert!(d == 1, "checked_div")
+    return 0

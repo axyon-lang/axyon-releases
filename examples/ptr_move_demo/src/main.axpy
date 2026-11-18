@@ -1,0 +1,45 @@
+# Moving owning values through raw memory (#1782).
+#
+# `ptr_write` consumes a value and stores it without dropping what the slot
+# held; `ptr_read` moves it back out and leaves the slot logically
+# uninitialised. `drop_in_place` runs the destructor in place. All three need
+# an `unsafe:` block. Every `Noisy` below prints "drop <id>" exactly once.
+
+struct Noisy:
+    id: i64
+
+impl Drop for Noisy:
+    def drop(self) -> unit:
+        println!("drop {self.id}")
+
+# A single-slot heap cell: the shape `Box`-like and `Rc`-like types build on.
+struct Slot[T]:
+    block: ptr_mut[T]
+
+impl[T] Slot[T]:
+    def new(value: T) -> Slot[T]:
+        unsafe:
+            let raw: ptr_mut[u8] = global_alloc_zeroed_checked(size_of[T](), align_of[T]())
+            let block: ptr_mut[T] = raw as ptr_mut[T]
+            ptr_write(block, value)
+            return Slot { block: block }
+
+    # Consume the slot and hand its value back.
+    def take(self) -> T:
+        unsafe:
+            let value: T = ptr_read(self.block)
+            global_dealloc(self.block as ptr_mut[u8], size_of[T](), align_of[T]())
+            return value
+
+def main() -> i32:
+    let a: Slot[Noisy] = Slot.new(Noisy { id: 1 })
+    let b: Noisy = a.take()
+    println!("took {b.id}")
+
+    unsafe:
+        let raw: ptr_mut[u8] = global_alloc_zeroed_checked(size_of[Noisy](), align_of[Noisy]())
+        let p: ptr_mut[Noisy] = raw as ptr_mut[Noisy]
+        ptr_write(p, Noisy { id: 2 })
+        drop_in_place(p)
+        global_dealloc(raw, size_of[Noisy](), align_of[Noisy]())
+    return 0

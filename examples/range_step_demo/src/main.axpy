@@ -1,0 +1,27 @@
+# Range Step Demo - range(start, stop, step) used as a value outside `for`
+#
+# range(stop) and range(start, stop) produce a `Range[i64]`; the three-argument
+# form produces a `RangeStep[i64]` with fields `start`, `end` and `step`.
+
+# `core.ops` declares the same layout, but importing it is currently blocked by
+# a parse error elsewhere in that module, so the struct is declared locally.
+struct RangeStep[T]:
+    start: T
+    end: T
+    step: T
+
+def evens() -> RangeStep[i64]:
+    let r: RangeStep[i64] = range(0, 10, 2)
+    return r
+
+def countdown() -> RangeStep[i64]:
+    # Negative steps are allowed; only a literal zero step is rejected.
+    let r: RangeStep[i64] = range(10, 0, -3)
+    return r
+
+def main() -> i32:
+    let e: RangeStep[i64] = evens()
+    let c: RangeStep[i64] = countdown()
+    println!("evens: start={e.start} end={e.end} step={e.step}")
+    println!("countdown: start={c.start} end={c.end} step={c.step}")
+    return 0

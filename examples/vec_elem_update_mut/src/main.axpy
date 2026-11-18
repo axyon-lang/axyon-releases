@@ -1,0 +1,28 @@
+# Owning `Vec` element updates through `&mut` (#1323): grow an adjacency list in
+# place, and replace a whole row (the old row is freed exactly once).
+struct Graph:
+    adj: Vec[Vec[i64]]
+
+def add_edge(g: &mut Graph, u: usize, v: i64) -> None:
+    g.adj[u].push(v)
+
+def set_row(g: &mut Graph, u: usize, a: Vec[i64]) -> None:
+    g.adj[u] = a
+
+def main() -> i32:
+    let mut g: Graph = Graph { adj: Vec.new() }
+    let r0: Vec[i64] = Vec.new()
+    let r1: Vec[i64] = Vec.new()
+    g.adj.push(r0)
+    g.adj.push(r1)
+    add_edge(&mut g, 0, 5)
+    add_edge(&mut g, 0, 6)
+    add_edge(&mut g, 1, 7)
+    let mut a: Vec[i64] = Vec.new()
+    a.push(9)
+    set_row(&mut g, 0, a)
+    add_edge(&mut g, 0, 8)
+    let n0: usize = g.adj[0].len()
+    let n1: usize = g.adj[1].len()
+    println!("row0 = {n0} row1 = {n1}")
+    return 0

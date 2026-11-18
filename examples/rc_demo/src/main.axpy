@@ -1,0 +1,38 @@
+# Rc[T]: a single-threaded reference-counted pointer (#182).
+#
+# `clone` bumps the strong count; dropping a handle lowers it. The payload's
+# destructor runs once, when the last handle goes away. `get` lends a shared
+# reference into the block, valid while the `Rc` it came from is borrowed.
+
+from std.alloc.rc import Rc, Weak
+from std.core.option import Option
+
+struct Noisy:
+    id: i64
+
+impl Drop for Noisy:
+    def drop(self) -> unit:
+        println!("drop {self.id}")
+
+def main() -> i32:
+    let a: Rc[Noisy] = Rc.new(Noisy { id: 7 })
+    let b: Rc[Noisy] = a.clone()
+    let n: i64 = a.strong_count()
+    println!("count {n}")
+    let r: ref[Noisy] = b.get()
+    println!("id {r.id}")
+
+    let s: Rc[String] = Rc.new(String.from("shared"))
+    let t: ref[String] = s.get()
+    println!("{t}")
+    let w: Weak[String] = s.downgrade()
+    let wc: i64 = s.weak_count()
+    println!("weak {wc}")
+    let up: Option[Rc[String]] = w.upgrade()
+    match up:
+        case Option.Some(r):
+            println!("upgraded")
+        case Option.None_:
+            println!("gone")
+    println!("end")
+    return 0

@@ -1,0 +1,107 @@
+# Unsafe Demo for AXYON
+# Demonstrates the `unsafe:` block and what it is for.
+#
+# These operations need an `unsafe:` context (the unsafety check, #767):
+#   - dereferencing a raw pointer (`ptr[T]` / `ptr_mut[T]`): read, write, or
+#     borrow through it (AX0529)
+#   - calling an `@unsafe` function or method, an `@extern` import that is
+#     not `@safe`, or an `unsafe fn` pointer (AX0538)
+#   - unchecked builtins such as `unreachable_unchecked()` (AX0529)
+#
+# The body of an `@unsafe` function is itself an unsafe context. An
+# `unsafe:` block with nothing unsafe in it gets the `unused_unsafe` warning
+# (AX2005). Type and borrow checking still apply inside `unsafe:`.
+
+# The caller promises `p` points at a live `i64`.
+@unsafe
+def read_raw(p: ptr[i64]) -> i64:
+    # No `unsafe:` needed here: an `@unsafe` body is already unsafe.
+    return (*p)
+
+# The caller promises `p` points at `len` live, initialized `i64`s. Nothing
+# in the signature can check that (any pointer can be cast to `ptr[i64]`),
+# so this helper is `@unsafe` too: a function that relies on an unchecked
+# promise about its arguments must pass the obligation on to its caller.
+@unsafe
+def first(p: ptr[i64], len: i64) -> i64:
+    if len == 0:
+        return 0
+    return read_raw(p)
+
+# The caller promises that, when `n > 0`, `p` points at a live `i64` it may
+# write.
+@unsafe
+def fill(p: ptr_mut[i64], n: i64, value: i64) -> None:
+    if n > 0:
+        *p = value
+
+# A genuinely safe wrapper: it owns the allocation, so it can prove every
+# precondition itself. The `unsafe:` blocks mark exactly where it does so.
+def boxed_first(value: i64) -> i64:
+    let raw: ptr_mut[u8] = global_alloc_zeroed(8, 8)
+    if (raw as usize) == 0:
+        return 0
+    let slot: ptr_mut[i64] = raw as ptr_mut[i64]
+    let mut out: i64 = 0
+    # SAFETY: `slot` is a fresh, non-null, 8-byte, 8-aligned allocation that
+    # holds one `i64`, and it is freed exactly once, after the last read.
+    unsafe:
+        fill(slot, 1, value)
+        out = first(slot as ptr[i64], 1)
+        global_dealloc(raw, 8, 8)
+    return out
+
+# The caller promises `x` is even.
+@unsafe
+def halve_even(x: i64) -> i64:
+    return x / 2
+
+# An `unsafe fn` pointer may hold safe or unsafe functions, so calling
+# through it is unsafe. This function cannot check `f`'s preconditions, so it
+# is `@unsafe` itself and passes the obligation on to its caller.
+@unsafe
+def call_unsafe(f: unsafe fn(i64) -> i64, x: i64) -> i64:
+    return f(x)
+
+def main() -> i32:
+    println!("Unsafe Demo")
+    println!("===========")
+
+    # Allocating is safe; freeing and every access through the raw pointer
+    # are not. The allocator returns null when it cannot satisfy a request,
+    # so check before relying on the pointer.
+    let raw: ptr_mut[u8] = global_alloc_zeroed(8, 8)
+    if (raw as usize) == 0:
+        println!("allocation failed")
+        return 1
+    let slot: ptr_mut[i64] = raw as ptr_mut[i64]
+    let p: ptr[i64] = slot as ptr[i64]
+
+    let mut a: i64 = 0
+    let mut b: i64 = 0
+    # SAFETY: `raw` is a live (checked non-null) 8-byte, 8-aligned
+    # allocation, so `slot` / `p` point at one live `i64` until the dealloc
+    # below; 8 is even.
+    unsafe:
+        fill(slot, 1, 7)
+        a = first(p, 1)
+        b = read_raw(p) + call_unsafe(halve_even, 8)
+        global_dealloc(raw, 8, 8)
+    println!("first(p, 1) = {a}")
+    println!("read_raw(p) + call_unsafe(halve_even, 8) = {b}")
+
+    let c: i64 = boxed_first(42)
+    println!("boxed_first(42) = {c}")
+
+    # The failure path: a zero-byte request cannot be satisfied, so the
+    # allocator returns null and the guard above is what keeps `fill` from
+    # writing through it.
+    let empty: ptr_mut[u8] = global_alloc_zeroed(0, 8)
+    let failed: bool = (empty as usize) == 0
+    println!("global_alloc_zeroed(0, 8) is null: {failed}")
+
+    assert!(a == 7, "first element should be 7")
+    assert!(b == 11, "7 + 8 / 2 should be 11")
+    assert!(c == 42, "boxed_first should round-trip its argument")
+    assert!(failed, "an unsatisfiable allocation should return null")
+    return 0

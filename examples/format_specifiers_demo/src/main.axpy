@@ -1,0 +1,84 @@
+# Format specifier demo
+#
+# Demonstrates the Rust-style format specifiers supported by `println!` /
+# `print!` / `eprintln!` (issue #151). A placeholder may carry a specifier after
+# `:`; it is validated against the argument type at compile time
+# (`AX211`/`AX212`) rather than producing silently-wrong output.
+#
+#   {}      Display                 {:?}         Debug
+#   {:x}    hex (lower)             {:X}         hex (upper)
+#   {:b}    binary                  {:o}         octal
+#   {:e}    scientific (lower)      {:E}         scientific (upper)
+#
+# Plus width, alignment, fill, sign, zero-pad, alternate, and precision:
+#
+#   {:>10}  right-align in width 10 {:<10}       left-align
+#   {:^10}  center                  {:*>10}      pad with `*`
+#   {:+}    force sign              {:08}        zero-pad to width 8
+#   {:#x}   alternate (`0x…`)       {:.3}        precision (floats/strings)
+#
+# Both named (`{n}`, `{n:x}`) and positional (`{}`, `{:x}`) placeholders work.
+# Named placeholders read variables in scope; positional placeholders consume
+# the trailing arguments in order.
+
+def main() -> i32:
+    println!("Format Specifiers Demo")
+    println!("======================")
+
+    # Display and Debug on a named placeholder
+    let n: i64 = 255
+    println!("display : {n}")
+    println!("debug   : {n:?}")
+
+    # Radix specifiers (integers): named placeholders
+    println!("hex     : {n:x}")
+    println!("HEX     : {n:X}")
+    println!("binary  : {n:b}")
+    println!("octal   : {n:o}")
+
+    # Radix specifiers on positional arguments
+    println!("pos hex : {:x} {:X}", 255, 255)
+    println!("pos bin : {:b}", 5)
+    println!("pos oct : {:o}", 64)
+
+    # Signed radix follows Rust semantics: the two's-complement bit pattern is
+    # formatted at the value's own width (no `-` sign), so -1_i32 -> ffffffff.
+    let neg: i32 = -1
+    println!("neg hex : {neg:x}")
+
+    # Unsigned Display / radix: `u64` values above `i64::MAX` are preserved
+    # end-to-end (the literal below is `u64::MAX`) and format as unsigned.
+    let big: u64 = 18446744073709551615
+    println!("u64     : {big}")
+    println!("u64 hex : {big:x}")
+
+    # Scientific notation (floats)
+    let f: f32 = 1234.5
+    println!("f32 sci : {f:e}")
+    let d: f64 = 0.000123
+    println!("f64 SCI : {d:E}")
+
+    # Width and alignment (issue #151): pad to a minimum field width.
+    println!("right   : [{n:>10}]")
+    println!("left    : [{n:<10}]")
+    println!("center  : [{n:^10}]")
+    println!("fill    : [{n:*>10}]")
+
+    # Sign, zero-pad, and alternate radix.
+    println!("signed  : [{n:+08}]")
+    println!("alt hex : [{big:#06x}]")
+
+    # Precision (floats): number of decimal places, with optional width.
+    println!("prec    : [{d:.3}]")
+    println!("wprec   : [{f:>12.2}]")
+
+    # Positional placeholders accept the same modifiers.
+    println!("pos pad : [{:>6}] [{:.2}]", n, f)
+
+    # Escaped braces render literally.
+    println!("braces  : {{ {n} }}")
+
+    # eprintln! shares the same grammar (writes to stderr).
+    eprintln!("stderr  : n={n:x} padded=[{n:>8}]")
+
+    return 0

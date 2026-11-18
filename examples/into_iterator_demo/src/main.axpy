@@ -1,0 +1,78 @@
+# `for x in c:` over a user-defined collection (#3296, #3409).
+#
+# When the loop expression has no `next()` method but its type implements
+# `core.iter.IntoIterator`, the loop means `for x in c.into_iter():` and
+# consumes `c` (it is moved and cannot be used afterwards). A type with an
+# inherent or `Iterator` `next()` is iterated directly, as before. The builtin
+# `Vec[T]` is `IntoIterator` too and yields its elements front to back.
+# `IntoIterator` impls are only seen when `core.iter` is imported.
+
+from core.iter import Iterator, IntoIterator
+from core.option import Option
+
+# An iterator over the half-open range [n, end) stepping by `step`.
+struct Steps:
+    n: i64
+    end: i64
+    step: i64
+
+impl Iterator for Steps:
+    type Item = i64
+
+    def next(mut self) -> Option[i64]:
+        if self.n >= self.end:
+            return Option.None_
+        let v: i64 = self.n
+        self.n = self.n + self.step
+        return Option.Some(v)
+
+# A collection that is not itself an iterator: it describes the multiples of
+# `step` below `limit` and hands out a fresh `Steps` iterator when consumed.
+struct Multiples:
+    step: i64
+    limit: i64
+
+impl IntoIterator for Multiples:
+    type Item = i64
+    type IntoIter = Steps
+
+    def into_iter(self) -> Steps:
+        return Steps { n: 0, end: self.limit, step: self.step }
+
+def main() -> i32:
+    # 1. A user collection: the loop calls `into_iter()` and consumes `m`.
+    let m: Multiples = Multiples { step: 3, limit: 10 }
+    let mut sum: i64 = 0
+    let mut count: i64 = 0
+    for x in m:
+        sum = sum + x
+        count = count + 1
+    assert!(sum == 18, "0 + 3 + 6 + 9 must be 18")
+    assert!(count == 4, "four multiples of 3 below 10")
+    println!("multiples of 3 below 10: count={count} sum={sum}")
+
+    # 2. The explicit spelling is equivalent.
+    let mut squares: i64 = 0
+    for x in Multiples { step: 2, limit: 7 }.into_iter():
+        squares = squares + x * x
+    assert!(squares == 56, "0 + 4 + 16 + 36 must be 56")
+    println!("sum of squares of evens below 7: {squares}")
+
+    # 3. An iterator is iterated directly through its own `next()`.
+    let mut steps: i64 = 0
+    for x in Steps { n: 5, end: 8, step: 1 }:
+        steps = steps * 10 + x
+    assert!(steps == 567, "Steps yields 5, 6, 7 in order")
+    println!("steps: {steps}")
+
+    # 4. The builtin Vec is IntoIterator: elements come out front to back.
+    let mut v: Vec[i64] = Vec.new()
+    v.push(1)
+    v.push(2)
+    v.push(3)
+    let mut order: i64 = 0
+    for x in v:
+        order = order * 10 + x
+    assert!(order == 123, "Vec yields its elements front to back")
+    println!("vec order: {order}")
+    return 0

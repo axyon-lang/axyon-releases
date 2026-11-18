@@ -1,0 +1,75 @@
+# A hand-written `key = value` configuration reader built on std.strconv
+# (#2811): split the text into lines, drop `#` comments and blank lines, split
+# each line at `=`, trim, and parse the value. No allocation: every line, key
+# and value is a sub-slice of the input bytes.
+
+from std.strconv import ParseError, parse_i64, parse_f64, trim_ascii, split_once, find_byte, bytes_eq
+
+def is_key(k: Slice[u8], want: String) -> bool:
+    return bytes_eq(k, want.as_bytes())
+
+@host
+def main() -> i32:
+    let text: String = "# Sod shock tube\nnx = 400\ncfl = 0.45   # stability\nt_final = 2.0e-1\nsponge = -1.5e+2\n"
+    let mut nx: i64 = 0
+    let mut cfl: f64 = 0.0
+    let mut t_final: f64 = 0.0
+    let mut sponge: f64 = 0.0
+    let mut rest: Slice[u8] = text.as_bytes()
+    let mut more: bool = True
+    while more:
+        let mut line: Slice[u8] = rest
+        match split_once(rest, 10 as u8):
+            Some(parts) =>
+                line = parts[0]
+                rest = parts[1]
+            None_ =>
+                more = False
+        # Strip a trailing `# comment`.
+        match find_byte(line, 35 as u8):
+            Some(i) => line = line.slice(0, i)
+            None_ => pass
+        let t: Slice[u8] = trim_ascii(line)
+        if t.len() == 0:
+            continue
+        match split_once(t, 61 as u8):
+            None_ =>
+                println!("malformed line")
+                return 1
+            Some(kv) =>
+                let key: Slice[u8] = trim_ascii(kv[0])
+                let value: Slice[u8] = trim_ascii(kv[1])
+                if is_key(key, "nx"):
+                    match parse_i64(value):
+                        Ok(n) => nx = n
+                        Err(e) => return 2
+                elif is_key(key, "cfl"):
+                    match parse_f64(value):
+                        Ok(x) => cfl = x
+                        Err(e) => return 3
+                elif is_key(key, "t_final"):
+                    match parse_f64(value):
+                        Ok(x) => t_final = x
+                        Err(e) => return 4
+                elif is_key(key, "sponge"):
+                    match parse_f64(value):
+                        Ok(x) => sponge = x
+                        Err(e) => return 5
+    println!("nx = {nx}, cfl = {cfl}, t_final = {t_final}, sponge = {sponge}")
+
+    # Parsing fails closed: trailing bytes and out-of-range values are errors.
+    let bad: String = "12abc"
+    match parse_i64(bad.as_bytes()):
+        Ok(n) => return 6
+        Err(e) =>
+            if e != ParseError.InvalidDigit:
+                return 7
+    let huge: String = "1e400"
+    match parse_f64(huge.as_bytes()):
+        Ok(x) => return 8
+        Err(e) =>
+            if e != ParseError.OutOfRange:
+                return 9
+    if nx != 400 or cfl != 0.45 or t_final != 0.2 or sponge != -150.0:
+        return 10
+    return 0

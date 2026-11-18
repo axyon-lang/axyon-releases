@@ -1,0 +1,15 @@
+[package]
+name = "cuda_mma_gemm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# Tensor-core fragments lower to `mma.sync` on CUDA (#2513): exactly one
+# GPU target with a device runtime.
+[target]
+gpu = ["nvptx-sm80"]

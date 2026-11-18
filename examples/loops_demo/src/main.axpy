@@ -1,0 +1,76 @@
+# Loops Demo - Showcasing for loops, while loops, and @unroll
+
+def sum_to_n(n: i64) -> i64:
+    """Sum numbers from 0 to n-1 using a basic for loop."""
+    let mut total: i64 = 0
+    for i in range(n):
+        total += i
+    return total
+
+def sum_evens(n: i64) -> i64:
+    """Sum even numbers from 0 to n-1 using for loop with step."""
+    let mut total: i64 = 0
+    for i in range(0, n, 2):
+        total += i
+    return total
+
+def countdown(start: i64) -> i64:
+    """Count down from start to 0 using a while loop."""
+    let mut x: i64 = start
+    let mut count: i64 = 0
+    while x > 0:
+        x -= 1
+        count += 1
+    return count
+
+def process_unrolled(n: i64) -> i64:
+    """Process with loop unrolling hint for optimization."""
+    let mut total: i64 = 0
+    @unroll(4)
+    for i in range(n):
+        total += i
+    return total
+
+def test_pass(n: i64) -> i64:
+    """Test pass statement - does nothing, returns input unchanged."""
+    if n > 0:
+        pass
+    return n
+
+def count_positive(n: i64) -> i64:
+    """Count positive numbers, using pass for the zero/negative case."""
+    let mut count: i64 = 0
+    for i in range(n):
+        if i > 0:
+            count += 1
+        else:
+            pass
+    return count
+
+def main() -> i32:
+    """Entry point demonstrating all loop types."""
+    # Basic for loop: sum 0+1+2+3+4 = 10
+    let sum1: i64 = sum_to_n(5)
+    println!("sum_to_n(5) = {sum1}, expected 10")
+
+    # For loop with step: sum 0+2+4+6+8 = 20
+    let sum2: i64 = sum_evens(10)
+    println!("sum_evens(10) = {sum2},  expected 20")
+
+    # While loop: count down from 5
+    let count: i64 = countdown(5)
+    println!("countdown(5) = {count}, expected 5")
+
+    # Unrolled loop: same as sum_to_n but with unroll hint
+    let sum3: i64 = process_unrolled(5)
+    println!("process_unrolled(5) = {sum3},  expected 10")
+
+    # Pass statement test: pass does nothing, returns input unchanged
+    let pass_result: i64 = test_pass(42)
+    println!("test_pass(42) = {pass_result}, expected 42")
+
+    # Count positive: count numbers > 0 in range(5) = 4 (1,2,3,4)
+    let pos: i64 = count_positive(5)
+    println!("count_positive(5) = {pos}, expected 4")
+
+    return 0

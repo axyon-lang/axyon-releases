@@ -1,0 +1,388 @@
+# The numeric-contract rules on an AMD GPU (issue #2957)
+#
+# Every kernel of this file runs on the device and every result is compared
+# bit for bit with the strict host build of the same expression
+# (numeric-contract.md §3, §5.4, §6):
+#
+# 1. No contraction: `a * b + c` and `a * b - c` round twice (a fused
+#    multiply-add would round once). Lane 0 is a case where the two differ.
+# 2. Masked shifts: `x << s` and `x >> s` use `s & (BITS - 1)` for every
+#    amount, including negative ones and amounts of the width or more.
+# 3. Guarded integer division: `/`, `//` and `%` by non-zero constant
+#    divisors (the range analysis discharges their checks, so the device has
+#    no trap path) at `i32` and `i64`, on inputs including `MIN` and `MAX`.
+# 4. Saturating conversion: `f32 as i32` and `f32 as i64` round toward zero,
+#    saturate and send NaN to 0.
+# 5. Float division and remainder: `f32` `/`, `//` and `%` (the AMDGPU
+#    `fdiv` expansion, `floor` and the `frem` expansion) over every pair of
+#    a special-value table (signed zeros, subnormals, the smallest normal,
+#    the largest finite, infinities, NaN) and random bit patterns. A NaN
+#    matches any NaN; every other result must have the host's bits.
+#
+# Set `AXYON_GPU_LAUNCH_EVIDENCE=1` to see, for each launch, the backend,
+# the device it ran on and a fingerprint of the HSACO image. Without a
+# usable AMD device the first device allocation stops the program with an
+# AXYON panic: there is no CPU fallback.
+
+const N: i64 = 4096
+const BLOCK: i64 = 128
+const SPECIALS: i64 = 20
+
+@gpu(entry)
+def contract_f32(n: i64, a: &Buffer[f32, (4096,), device_global], b: &Buffer[f32, (4096,), device_global], c: &Buffer[f32, (4096,), device_global], out: &mut Buffer[f32, (8192,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let x: f32 = buffer_get(a, i)
+        let y: f32 = buffer_get(b, i)
+        let z: f32 = buffer_get(c, i)
+        buffer_set(out, i, x * y + z)
+        buffer_set(out, n + i, x * y - z)
+
+@gpu(entry)
+def shifts_i32(n: i64, x: &Buffer[i32, (4096,), device_global], s: &Buffer[i32, (4096,), device_global], out: &mut Buffer[i32, (8192,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let v: i32 = buffer_get(x, i)
+        let k: i32 = buffer_get(s, i)
+        buffer_set(out, i, v << k)
+        buffer_set(out, n + i, v >> k)
+
+@gpu(entry)
+def shifts_i64(n: i64, x: &Buffer[i64, (4096,), device_global], s: &Buffer[i64, (4096,), device_global], out: &mut Buffer[i64, (8192,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let v: i64 = buffer_get(x, i)
+        let k: i64 = buffer_get(s, i)
+        buffer_set(out, i, v << k)
+        buffer_set(out, n + i, v >> k)
+
+@gpu(entry)
+def divide_i32(n: i64, x: &Buffer[i32, (4096,), device_global], out: &mut Buffer[i32, (24576,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let v: i32 = buffer_get(x, i)
+        buffer_set(out, i, v / 7)
+        buffer_set(out, n + i, v // 7)
+        buffer_set(out, 2 * n + i, v % 7)
+        buffer_set(out, 3 * n + i, v / -3)
+        buffer_set(out, 4 * n + i, v // -3)
+        buffer_set(out, 5 * n + i, v % -3)
+
+@gpu(entry)
+def divide_i64(n: i64, x: &Buffer[i64, (4096,), device_global], out: &mut Buffer[i64, (24576,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let v: i64 = buffer_get(x, i)
+        buffer_set(out, i, v / 7)
+        buffer_set(out, n + i, v // 7)
+        buffer_set(out, 2 * n + i, v % 7)
+        buffer_set(out, 3 * n + i, v / -3)
+        buffer_set(out, 4 * n + i, v // -3)
+        buffer_set(out, 5 * n + i, v % -3)
+
+@gpu(entry)
+def saturate(n: i64, a: &Buffer[f32, (4096,), device_global], oi: &mut Buffer[i32, (4096,), device_global], ol: &mut Buffer[i64, (4096,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let x: f32 = buffer_get(a, i)
+        buffer_set(oi, i, x as i32)
+        buffer_set(ol, i, x as i64)
+
+@gpu(entry)
+def divide_f32(n: i64, a: &Buffer[f32, (4096,), device_global], b: &Buffer[f32, (4096,), device_global], out: &mut Buffer[f32, (12288,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let x: f32 = buffer_get(a, i)
+        let y: f32 = buffer_get(b, i)
+        buffer_set(out, i, x / y)
+        buffer_set(out, n + i, x // y)
+        buffer_set(out, 2 * n + i, x % y)
+
+# A fixed-seed linear congruential generator: the same inputs every run.
+def next_seed(s: i64) -> i64:
+    return (s * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+
+# 32 random bits of a seed.
+def bits32(s: i64) -> i64:
+    return (s >> 20) & 4294967295
+
+# A value in [-1, 1) from a seed (53 random bits).
+def unit(s: i64) -> f64:
+    return ((s >> 10) as f64) / 4503599627370496.0 - 1.0
+
+def blocks_for(n: i64) -> i64:
+    return (n + BLOCK - 1) / BLOCK
+
+def f32_of(bits: i64) -> f32:
+    return f32.from_bits(bits as u32)
+
+# The special-value table of the float division case, as f32 bit patterns.
+def special(k: i64) -> f32:
+    let table: Array[i64; 20] = [0, 2147483648, 1, 2155872255, 4194304, 8388608, 2139095039, 4286578687, 2139095040, 4286578688, 2143289344, 1065353216, 3212836864, 1077936128, 1036831949, 1343554297, 1900671690, 3235905536, 1051372203, 1258291201]
+    return f32_of(table[k])
+
+def op_name(k: i64) -> str:
+    if k == 0:
+        return "f32 /"
+    if k == 1:
+        return "f32 //"
+    return "f32 %"
+
+# The same f32 result: equal bits, or both NaN.
+def same_f32(x: f32, y: f32) -> bool:
+    if x != x and y != y:
+        return True
+    return x.to_bits() == y.to_bits()
+
+def report_f32(what: str, i: i64, x: f32, y: f32, got: f32, want: f32) -> i64:
+    let xb: u32 = x.to_bits()
+    let yb: u32 = y.to_bits()
+    let gb: u32 = got.to_bits()
+    let wb: u32 = want.to_bits()
+    println!("{what} lane {i}: operands {xb} {yb}: got bits {gb}, want bits {wb}")
+    return 1
+
+def report_int(what: str, i: i64, x: i64, got: i64, want: i64) -> i64:
+    println!("{what} lane {i}: operand {x}: got {got}, want {want}")
+    return 1
+
+# 1. No contraction.
+def check_contract(seed: i64) -> i64:
+    let mut s: i64 = seed
+    let mut a: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut b: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut c: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let o: Buffer[f32, (8192,)] = buffer_alloc([8192])
+    for i: i64 in range(N):
+        s = next_seed(s)
+        buffer_set(a, i, unit(s) as f32)
+        s = next_seed(s)
+        buffer_set(b, i, unit(s) as f32)
+        s = next_seed(s)
+        buffer_set(c, i, unit(s) as f32)
+    # (1 + 2^-23)^2 - 1: 2^-22 rounded twice, 2^-22 + 2^-46 fused.
+    buffer_set(a, 0, f32_of(1065353217))
+    buffer_set(b, 0, f32_of(1065353217))
+    buffer_set(c, 0, 1.0_f32)
+    let mut want: Buffer[f32, (8192,)] = buffer_alloc([8192])
+    for i: i64 in range(N):
+        let x: f32 = buffer_get(a, i)
+        let y: f32 = buffer_get(b, i)
+        let z: f32 = buffer_get(c, i)
+        buffer_set(want, i, x * y + z)
+        buffer_set(want, N + i, x * y - z)
+    let da: Buffer[f32, (4096,), device_global] = buffer_to_device(a)
+    let db: Buffer[f32, (4096,), device_global] = buffer_to_device(b)
+    let dc: Buffer[f32, (4096,), device_global] = buffer_to_device(c)
+    let mut d_o: Buffer[f32, (8192,), device_global] = buffer_to_device(o)
+    gpu_launch(contract_f32, blocks_for(N), BLOCK, N, &da, &db, &dc, &mut d_o)
+    let ho: Buffer[f32, (8192,)] = buffer_to_host(d_o)
+    let mut bad: i64 = 0
+    for i: i64 in range(2 * N):
+        let got: f32 = buffer_get(ho, i)
+        if not same_f32(got, buffer_get(want, i)):
+            bad = bad + report_f32("f32 a * b +- c", i, 0.0_f32, 0.0_f32, got, buffer_get(want, i))
+    return bad
+
+# 2. Masked shifts.
+def check_shifts(seed: i64) -> i64:
+    let mut s: i64 = seed
+    let mut x32: Buffer[i32, (4096,)] = buffer_alloc([4096])
+    let mut s32: Buffer[i32, (4096,)] = buffer_alloc([4096])
+    let mut x64: Buffer[i64, (4096,)] = buffer_alloc([4096])
+    let mut s64: Buffer[i64, (4096,)] = buffer_alloc([4096])
+    let o32: Buffer[i32, (8192,)] = buffer_alloc([8192])
+    let o64: Buffer[i64, (8192,)] = buffer_alloc([8192])
+    for i: i64 in range(N):
+        s = next_seed(s)
+        let v: i64 = s - 4611686018427387904
+        buffer_set(x32, i, (v >> 30) as i32)
+        buffer_set(x64, i, v * 2 + (i & 1))
+        # Every amount from -200 to 199: negative, in range and beyond the width.
+        buffer_set(s32, i, ((i % 400) - 200) as i32)
+        buffer_set(s64, i, (i % 400) - 200)
+    let mut w32: Buffer[i32, (8192,)] = buffer_alloc([8192])
+    let mut w64: Buffer[i64, (8192,)] = buffer_alloc([8192])
+    for i: i64 in range(N):
+        let v: i32 = buffer_get(x32, i)
+        let k: i32 = buffer_get(s32, i)
+        buffer_set(w32, i, v << k)
+        buffer_set(w32, N + i, v >> k)
+        let u: i64 = buffer_get(x64, i)
+        let m: i64 = buffer_get(s64, i)
+        buffer_set(w64, i, u << m)
+        buffer_set(w64, N + i, u >> m)
+    let mut keep_s32: Buffer[i32, (4096,)] = buffer_alloc([4096])
+    let mut keep_s64: Buffer[i64, (4096,)] = buffer_alloc([4096])
+    for i: i64 in range(N):
+        buffer_set(keep_s32, i, buffer_get(s32, i))
+        buffer_set(keep_s64, i, buffer_get(s64, i))
+    let dx32: Buffer[i32, (4096,), device_global] = buffer_to_device(x32)
+    let ds32: Buffer[i32, (4096,), device_global] = buffer_to_device(s32)
+    let mut do32: Buffer[i32, (8192,), device_global] = buffer_to_device(o32)
+    let dx64: Buffer[i64, (4096,), device_global] = buffer_to_device(x64)
+    let ds64: Buffer[i64, (4096,), device_global] = buffer_to_device(s64)
+    let mut do64: Buffer[i64, (8192,), device_global] = buffer_to_device(o64)
+    gpu_launch(shifts_i32, blocks_for(N), BLOCK, N, &dx32, &ds32, &mut do32)
+    gpu_launch(shifts_i64, blocks_for(N), BLOCK, N, &dx64, &ds64, &mut do64)
+    let h32: Buffer[i32, (8192,)] = buffer_to_host(do32)
+    let h64: Buffer[i64, (8192,)] = buffer_to_host(do64)
+    let mut bad: i64 = 0
+    for i: i64 in range(2 * N):
+        if buffer_get(h32, i) != buffer_get(w32, i):
+            bad = bad + report_int("i32 shift", i, buffer_get(keep_s32, i % N) as i64, buffer_get(h32, i) as i64, buffer_get(w32, i) as i64)
+        if buffer_get(h64, i) != buffer_get(w64, i):
+            bad = bad + report_int("i64 shift", i, buffer_get(keep_s64, i % N), buffer_get(h64, i), buffer_get(w64, i))
+    return bad
+
+# 3. Guarded integer division by non-zero constants.
+def check_divide(seed: i64) -> i64:
+    let mut s: i64 = seed
+    let mut x32: Buffer[i32, (4096,)] = buffer_alloc([4096])
+    let mut x64: Buffer[i64, (4096,)] = buffer_alloc([4096])
+    let o32: Buffer[i32, (24576,)] = buffer_alloc([24576])
+    let o64: Buffer[i64, (24576,)] = buffer_alloc([24576])
+    for i: i64 in range(N):
+        s = next_seed(s)
+        let v: i64 = s - 4611686018427387904
+        buffer_set(x32, i, (v >> 30) as i32)
+        buffer_set(x64, i, v * 2 + (i & 1))
+    # The extremes and the values around zero.
+    buffer_set(x32, 0, -2147483647_i32 - 1_i32)
+    buffer_set(x32, 1, 2147483647_i32)
+    buffer_set(x64, 0, -9223372036854775807 - 1)
+    buffer_set(x64, 1, 9223372036854775807)
+    for k: i64 in range(15):
+        buffer_set(x32, 2 + k, (k - 7) as i32)
+        buffer_set(x64, 2 + k, k - 7)
+    let mut w32: Buffer[i32, (24576,)] = buffer_alloc([24576])
+    let mut w64: Buffer[i64, (24576,)] = buffer_alloc([24576])
+    for i: i64 in range(N):
+        let v: i32 = buffer_get(x32, i)
+        buffer_set(w32, i, v / 7)
+        buffer_set(w32, N + i, v // 7)
+        buffer_set(w32, 2 * N + i, v % 7)
+        buffer_set(w32, 3 * N + i, v / -3)
+        buffer_set(w32, 4 * N + i, v // -3)
+        buffer_set(w32, 5 * N + i, v % -3)
+        let u: i64 = buffer_get(x64, i)
+        buffer_set(w64, i, u / 7)
+        buffer_set(w64, N + i, u // 7)
+        buffer_set(w64, 2 * N + i, u % 7)
+        buffer_set(w64, 3 * N + i, u / -3)
+        buffer_set(w64, 4 * N + i, u // -3)
+        buffer_set(w64, 5 * N + i, u % -3)
+    let mut keep_x32: Buffer[i32, (4096,)] = buffer_alloc([4096])
+    let mut keep_x64: Buffer[i64, (4096,)] = buffer_alloc([4096])
+    for i: i64 in range(N):
+        buffer_set(keep_x32, i, buffer_get(x32, i))
+        buffer_set(keep_x64, i, buffer_get(x64, i))
+    let dx32: Buffer[i32, (4096,), device_global] = buffer_to_device(x32)
+    let mut do32: Buffer[i32, (24576,), device_global] = buffer_to_device(o32)
+    let dx64: Buffer[i64, (4096,), device_global] = buffer_to_device(x64)
+    let mut do64: Buffer[i64, (24576,), device_global] = buffer_to_device(o64)
+    gpu_launch(divide_i32, blocks_for(N), BLOCK, N, &dx32, &mut do32)
+    gpu_launch(divide_i64, blocks_for(N), BLOCK, N, &dx64, &mut do64)
+    let h32: Buffer[i32, (24576,)] = buffer_to_host(do32)
+    let h64: Buffer[i64, (24576,)] = buffer_to_host(do64)
+    let mut bad: i64 = 0
+    for i: i64 in range(6 * N):
+        if buffer_get(h32, i) != buffer_get(w32, i):
+            bad = bad + report_int("i32 division", i, buffer_get(keep_x32, i % N) as i64, buffer_get(h32, i) as i64, buffer_get(w32, i) as i64)
+        if buffer_get(h64, i) != buffer_get(w64, i):
+            bad = bad + report_int("i64 division", i, buffer_get(keep_x64, i % N), buffer_get(h64, i), buffer_get(w64, i))
+    return bad
+
+# 4. Saturating float to integer conversion.
+def check_saturate(seed: i64) -> i64:
+    let mut s: i64 = seed
+    let mut a: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let oi: Buffer[i32, (4096,)] = buffer_alloc([4096])
+    let ol: Buffer[i64, (4096,)] = buffer_alloc([4096])
+    for i: i64 in range(N):
+        s = next_seed(s)
+        # Every bit pattern class: NaNs, infinities, out-of-range magnitudes.
+        buffer_set(a, i, f32_of(bits32(s)))
+    for k: i64 in range(SPECIALS):
+        buffer_set(a, k, special(k))
+    # The edges of the i32 and i64 ranges: 2^31, -2^31, 2^31 - 128, 2^63, -2^63.
+    buffer_set(a, SPECIALS, f32_of(1325400064))
+    buffer_set(a, SPECIALS + 1, f32_of(3472883712))
+    buffer_set(a, SPECIALS + 2, f32_of(1325400063))
+    buffer_set(a, SPECIALS + 3, f32_of(1593835520))
+    buffer_set(a, SPECIALS + 4, f32_of(3741319168))
+    buffer_set(a, SPECIALS + 5, f32_of(1593835519))
+    let mut wi: Buffer[i32, (4096,)] = buffer_alloc([4096])
+    let mut wl: Buffer[i64, (4096,)] = buffer_alloc([4096])
+    for i: i64 in range(N):
+        let x: f32 = buffer_get(a, i)
+        buffer_set(wi, i, x as i32)
+        buffer_set(wl, i, x as i64)
+    let mut keep_a: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    for i: i64 in range(N):
+        buffer_set(keep_a, i, buffer_get(a, i))
+    let da: Buffer[f32, (4096,), device_global] = buffer_to_device(a)
+    let mut doi: Buffer[i32, (4096,), device_global] = buffer_to_device(oi)
+    let mut dol: Buffer[i64, (4096,), device_global] = buffer_to_device(ol)
+    gpu_launch(saturate, blocks_for(N), BLOCK, N, &da, &mut doi, &mut dol)
+    let hi: Buffer[i32, (4096,)] = buffer_to_host(doi)
+    let hl: Buffer[i64, (4096,)] = buffer_to_host(dol)
+    let mut bad: i64 = 0
+    for i: i64 in range(N):
+        let xb: i64 = buffer_get(keep_a, i).to_bits() as i64
+        if buffer_get(hi, i) != buffer_get(wi, i):
+            bad = bad + report_int("f32 -> i32", i, xb, buffer_get(hi, i) as i64, buffer_get(wi, i) as i64)
+        if buffer_get(hl, i) != buffer_get(wl, i):
+            bad = bad + report_int("f32 -> i64", i, xb, buffer_get(hl, i), buffer_get(wl, i))
+    return bad
+
+# 5. Float division, floor division and remainder.
+def check_float_division(seed: i64) -> i64:
+    let mut s: i64 = seed
+    let mut a: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut b: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let o: Buffer[f32, (12288,)] = buffer_alloc([12288])
+    for i: i64 in range(N):
+        if i < SPECIALS * SPECIALS:
+            buffer_set(a, i, special(i / SPECIALS))
+            buffer_set(b, i, special(i % SPECIALS))
+        else:
+            s = next_seed(s)
+            buffer_set(a, i, f32_of(bits32(s)))
+            s = next_seed(s)
+            buffer_set(b, i, f32_of(bits32(s)))
+    let mut want: Buffer[f32, (12288,)] = buffer_alloc([12288])
+    for i: i64 in range(N):
+        let x: f32 = buffer_get(a, i)
+        let y: f32 = buffer_get(b, i)
+        buffer_set(want, i, x / y)
+        buffer_set(want, N + i, x // y)
+        buffer_set(want, 2 * N + i, x % y)
+    let mut keep_a: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut keep_b: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    for i: i64 in range(N):
+        buffer_set(keep_a, i, buffer_get(a, i))
+        buffer_set(keep_b, i, buffer_get(b, i))
+    let da: Buffer[f32, (4096,), device_global] = buffer_to_device(a)
+    let db: Buffer[f32, (4096,), device_global] = buffer_to_device(b)
+    let mut d_o: Buffer[f32, (12288,), device_global] = buffer_to_device(o)
+    gpu_launch(divide_f32, blocks_for(N), BLOCK, N, &da, &db, &mut d_o)
+    let ho: Buffer[f32, (12288,)] = buffer_to_host(d_o)
+    let mut bad: i64 = 0
+    for i: i64 in range(3 * N):
+        let got: f32 = buffer_get(ho, i)
+        if not same_f32(got, buffer_get(want, i)):
+            bad = bad + report_f32(op_name(i / N), i % N, buffer_get(keep_a, i % N), buffer_get(keep_b, i % N), got, buffer_get(want, i))
+    return bad
+
+def main() -> i32:
+    let contract: i64 = check_contract(2957)
+    let shifts: i64 = check_shifts(11)
+    let divide: i64 = check_divide(13)
+    let saturate: i64 = check_saturate(17)
+    let float_division: i64 = check_float_division(19)
+    println!("numeric-contract: contraction {contract}, shifts {shifts}, integer division {divide}, conversions {saturate}, float division {float_division} mismatches")
+    if contract + shifts + divide + saturate + float_division != 0:
+        return 1
+    println!("numeric-contract: every device result matches the strict host bit for bit")
+    return 0

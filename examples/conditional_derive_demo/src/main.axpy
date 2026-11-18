@@ -1,0 +1,22 @@
+# Conditional Derive Demo - `@derive` on a generic struct (issue #785)
+#
+# `@derive(Eq)` on `Key[T]` means `impl Eq for Key[T] where T: Eq`. `Key[f64]`
+# is a valid type, it just is not `Eq`; `Key[i32]` is, so it satisfies an `Eq`
+# bound. Using `Key[f64]` where `Eq` is required is an AX070 error.
+
+@derive(Eq)
+struct Key[T]:
+    v: T
+
+def needs_eq[T: Eq](x: T) -> i32:
+    return 1
+
+def main() -> i32:
+    let f: Key[f64] = Key { v: 3.14 }
+    let i: Key[i32] = Key { v: 7 }
+    let ok: i32 = needs_eq(i)
+    println!("Key[i32] is Eq: {ok}")
+    assert!(ok == 1, "Key[i32] satisfies Eq")
+    let fv: f64 = f.v
+    assert!(fv > 3.0, "Key[f64] is still a usable type")
+    return 0

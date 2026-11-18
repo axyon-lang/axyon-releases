@@ -1,0 +1,193 @@
+# Enum Demo Example for AXYON
+# Demonstrates algebraic data types (enums) with pattern matching.
+#
+# Enums in AXYON are sum types / tagged unions that can represent
+# values that may be one of several different variants.
+
+# ============================================================================
+# Basic Enum Definitions
+# ============================================================================
+
+# Unit enum - variants with no associated data (like C enums)
+enum Color:
+    Red
+    Green
+    Blue
+
+# Enum with payload - variants can carry data (algebraic data types)
+# Note: We use 'Empty' instead of 'None' to avoid Python keyword conflict
+enum OptionI32:
+    Empty
+    Some(value: i32)
+
+# Multiple fields in a variant
+enum Result:
+    Ok(value: i32)
+    Err(code: i32)
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def color_to_string(c: Color) -> i32:
+    """Convert a color to a numeric code."""
+    match c:
+        case Color.Red:
+            return 0
+        case Color.Green:
+            return 1
+        case Color.Blue:
+            return 2
+
+def unwrap_or(opt: OptionI32, default: i32) -> i32:
+    """Extract value from OptionI32, or return default if None."""
+    match opt:
+        case OptionI32.Empty:
+            return default
+        case OptionI32.Some(value=v):
+            return v
+
+def is_some(opt: OptionI32) -> bool:
+    """Check if OptionI32 contains a value."""
+    match opt:
+        case OptionI32.Empty:
+            return False
+        case OptionI32.Some(value=v):
+            return True
+
+def is_ok(res: Result) -> bool:
+    """Check if Result is Ok."""
+    match res:
+        case Result.Ok(value=v):
+            return True
+        case Result.Err(code=c):
+            return False
+
+def map_option(opt: OptionI32, add_value: i32) -> OptionI32:
+    """Transform the value inside an OptionI32 by adding to it."""
+    match opt:
+        case OptionI32.Empty:
+            return OptionI32.Empty
+        case OptionI32.Some(value=v):
+            let new_val: i32 = v + add_value
+            return OptionI32.Some(new_val)
+
+# ============================================================================
+# Main Function - Demonstrates Enum Usage
+# ============================================================================
+
+# `return match` (#1193): typed by the return type.
+def color_level(c: Color) -> i32:
+    return match c:
+        Color.Red => 10
+        Color.Green => 20
+        Color.Blue => 30
+
+def double(x: i32) -> i32:
+    return x * 2
+
+def main() -> i32:
+    println!("Enum Demo - Algebraic Data Types")
+    println!("=================================")
+    println!("")
+
+    # --- Unit Enum Usage ---
+    println!("1. Unit Enums (no payload)")
+    let my_color: Color = Color.Green
+    let color_code: i32 = color_to_string(my_color)
+    println!("   Color.Green has code: {color_code}")
+
+    let red: Color = Color.Red
+    let red_code: i32 = color_to_string(red)
+    println!("   Color.Red has code: {red_code}")
+    println!("")
+
+    # --- Option Enum Usage ---
+    println!("2. Option Enum (Some/None)")
+    let some_val: OptionI32 = OptionI32.Some(42)
+    let none_val: OptionI32 = OptionI32.Empty
+
+    # Check is_some before consuming with unwrap_or
+    let some_val_check: OptionI32 = OptionI32.Some(42)
+    let has_value: bool = is_some(some_val_check)
+    if has_value:
+        println!("   some_val contains a value")
+    else:
+        println!("   some_val is empty")
+
+    let extracted: i32 = unwrap_or(some_val, 0)
+    println!("   OptionI32.Some(42) unwrapped: {extracted}")
+
+    let default_used: i32 = unwrap_or(none_val, -1)
+    println!("   OptionI32.Empty unwrapped with default: {default_used}")
+    println!("")
+
+    # --- Result Enum Usage ---
+    println!("3. Result Enum (Ok/Err)")
+    let success: Result = Result.Ok(100)
+    let failure: Result = Result.Err(404)
+
+    let ok_check: bool = is_ok(success)
+    if ok_check:
+        println!("   Result.Ok(100) is a success")
+    else:
+        println!("   Result.Ok(100) is an error")
+
+    let err_check: bool = is_ok(failure)
+    if err_check:
+        println!("   Result.Err(404) is a success")
+    else:
+        println!("   Result.Err(404) is an error")
+    println!("")
+
+    # --- Pattern Matching with Transformation ---
+    println!("4. Pattern Matching with Transformation")
+    let original: OptionI32 = OptionI32.Some(10)
+    let transformed: OptionI32 = map_option(original, 5)
+    let result: i32 = unwrap_or(transformed, 0)
+    println!("   OptionI32.Some(10) + 5 = {result}")
+
+    let empty: OptionI32 = OptionI32.Empty
+    let still_empty: OptionI32 = map_option(empty, 5)
+    let empty_result: i32 = unwrap_or(still_empty, -999)
+    println!("   OptionI32.Empty + 5 = {empty_result} (stayed None)")
+    println!("")
+
+    # --- Exhaustive Matching ---
+    println!("5. Exhaustive Pattern Matching")
+    println!("   All enum match statements must be exhaustive.")
+    println!("   Missing variants cause compile-time errors!")
+    println!("")
+
+    # --- match as a value (#1028) ---
+    let shade: Color = Color.Green
+    let level: i32 = match shade:
+        Color.Red => 10
+        Color.Green => 20
+        Color.Blue => 30
+    println!("6. match as a value: Green -> {level}")
+    let inferred = match Color.Blue:
+        Color.Red => 1
+        Color.Green => 2
+        Color.Blue => 3
+    println!("   unannotated let: Blue -> {inferred}")
+    let mut assigned: i32 = 0
+    assigned = match Color.Red:
+        Color.Red => 100
+        Color.Green => 200
+        Color.Blue => 300
+    println!("   assignment: Red -> {assigned}")
+    # Unsuffixed literal arms of a call-argument `match` take the parameter's
+    # `i32` type (#1264); typed arms of another width would be rejected.
+    let doubled: i32 = double(match Color.Green:
+        Color.Red => 1
+        Color.Green => 2
+        Color.Blue => 3
+    )
+    println!("   call argument: Green -> {doubled}")
+    let blue_level: i32 = color_level(Color.Blue)
+    println!("   return match: Blue -> {blue_level}")
+    println!("")
+
+    println!("Demo complete!")
+    return 0

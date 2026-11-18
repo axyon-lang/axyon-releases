@@ -1,0 +1,17 @@
+[package]
+name = "rocm_bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# The reproducible AMD benchmark suite (#2658). The driver
+# `benches/rocm_gpu/run_rocm_bench.py` builds it with `--release` and
+# records the device tuning, the per-kernel occupancy report and the ROCm
+# stack with every result.
+[target]
+gpu = ["rocdl-gfx942"]

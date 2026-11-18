@@ -1,0 +1,86 @@
+# An `async def` may take references and use them across an `await` (#2243).
+# The future holds the caller's loan, so it cannot outlive the referent: the
+# borrow checker sees the constructor call as a borrow that lasts as long as the
+# future. A reference into the function's own locals is rejected (`AX0927`),
+# because the future could move after its first poll.
+
+from core.future import Future, Poll
+from core.task import Context, RawWaker, RawWakerVTable, Waker
+
+struct Delay:
+    left: i64
+    value: i64
+
+impl Future for Delay:
+    type Output = i64
+
+    def poll(mut self, cx: ref_mut[Context]) -> Poll[i64]:
+        if self.left == 0:
+            return Poll.Ready(self.value)
+        self.left = self.left - 1
+        cx.waker().wake_by_ref()
+        return Poll.Pending
+
+def delay(left: i64, value: i64) -> Delay:
+    return Delay { left: left, value: value }
+
+struct Pair:
+    a: i64
+    b: i64
+
+# `p` and `bonus` are caller loans. `r` is rebuilt from `p` in each state.
+async def sum_ref(p: ref[Pair], bonus: ref[i64]) -> i64:
+    let r: ref[i64] = ref(p.b)
+    let v: i64 = await delay(1, *bonus)
+    return p.a + *r + v
+
+# An exclusive reference writes through across the `await`.
+async def bump(x: ref_mut[i64]) -> i64:
+    *x = *x + 1
+    let v: i64 = await delay(1, 1)
+    *x = *x + v
+    return *x
+
+@unsafe
+def nop_clone(data: ptr[unit]) -> ptr[unit]:
+    return data
+
+@unsafe
+def nop_wake(data: ptr[unit]) -> unit:
+    pass
+
+def noop_waker(data: ptr[unit], vt: ref[RawWakerVTable]) -> Waker:
+    unsafe:
+        return Waker.from_raw(RawWaker.new(data, vt))
+
+def main() -> i32:
+    let clone_fn: unsafe fn(ptr[unit]) -> ptr[unit] = nop_clone
+    let wake_fn: unsafe fn(ptr[unit]) -> unit = nop_wake
+    let vtable: RawWakerVTable = RawWakerVTable.new(clone_fn, wake_fn, wake_fn, wake_fn)
+    let data: ptr_mut[u8] = global_alloc_zeroed(8, 8)
+    let waker: Waker = noop_waker(data as ptr[unit], ref(vtable))
+    let mut cx: Context = Context.from_waker(ref(waker))
+
+    let p: Pair = Pair { a: 10, b: 20 }
+    let bonus: i64 = 5
+    let mut sum: __Future_sum_ref = sum_ref(ref(p), ref(bonus))
+    let mut total: i64 = -1
+    while total == -1:
+        match sum.poll(&mut cx):
+            case Poll.Ready(value):
+                total = value
+            case Poll.Pending:
+                total = -1
+    println!("sum = {total}")
+
+    let mut n: i64 = 1
+    let mut inc: __Future_bump = bump(&mut n)
+    let mut done: i64 = -1
+    while done == -1:
+        match inc.poll(&mut cx):
+            case Poll.Ready(value):
+                done = value
+            case Poll.Pending:
+                done = -1
+    println!("bump = {done}, n = {n}")
+    return 0

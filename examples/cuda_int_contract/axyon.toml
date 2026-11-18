@@ -1,0 +1,16 @@
+[package]
+name = "cuda_int_contract"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# Generated kernels run on CUDA (#3098): exactly one GPU target with a
+# device runtime.
+[target]
+gpu = ["nvptx-sm80"]

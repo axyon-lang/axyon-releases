@@ -1,0 +1,86 @@
+# std.quant demo (#1773): int8/int4 weight-only quantization at the SmolLM2-135M
+# MLP up-projection shape (1536 x 576, group 32). Prints weight bytes, the max
+# |w - deq|, checks every element against its own group's documented scale/2
+# bound (f32 tolerance 1e-4 relative) and prints the matvec drift versus an f32
+# reference. Wall-clock timings of the scalar f32 and dequant-in-matvec kernels
+# go to stderr so stdout stays deterministic (indicative only: the SmolLM2
+# comparison against bf16/f32 AXYON and PyTorch is measured in #1771).
+from std.alloc import Vec
+from std.quant import QTensor, QuantError, quantize_vec_i8, quantize_vec_i4
+from std.time import Instant
+
+def fabs(x: f32) -> f32:
+    let mut a: f32 = x
+    if x < 0.0:
+        a = 0.0 - x
+    return a
+
+def weights(n: usize) -> Vec[f32]:
+    let mut w: Vec[f32] = Vec.new()
+    let mut s: u32 = 12345
+    for i: usize in range(n):
+        s = s * 1664525 + 1013904223
+        let u: f32 = ((s >> 8) % 2000) as f32
+        w.push(u / 1000.0 - 1.0)
+    return w
+
+def f32_matvec(w: ref[Vec[f32]], x: ref[Vec[f32]], rows: usize, cols: usize) -> Vec[f32]:
+    let mut y: Vec[f32] = Vec.new()
+    for r: usize in range(rows):
+        let mut acc: f32 = 0.0
+        for c: usize in range(cols):
+            acc = acc + w[r * cols + c] * x[c]
+        y.push(acc)
+    return y
+
+def max_diff(a: ref[Vec[f32]], b: ref[Vec[f32]]) -> f32:
+    let mut m: f32 = 0.0
+    for i: usize in range(a.len()):
+        let d: f32 = fabs(a[i] - b[i])
+        if d > m:
+            m = d
+    return m
+
+# True when every |w[i] - deq[i]| is within scale/2 of its own group (the
+# scale of flat element i is scale_at(i / group)), with a small f32 tolerance.
+def within_half_scale(q: ref[QTensor], w: ref[Vec[f32]], d: ref[Vec[f32]]) -> bool:
+    let g: usize = q.group()
+    for i: usize in range(w.len()):
+        let bound: f32 = 0.5 * q.scale_at(i / g) * 1.0001
+        if fabs(w[i] - d[i]) > bound:
+            return false
+    return true
+
+def report(name: str, qt: Result[QTensor, QuantError], w: ref[Vec[f32]], x: ref[Vec[f32]], yref: ref[Vec[f32]]) -> i32:
+    match qt:
+        Err(e) => return 1
+        Ok(q) =>
+            let d: Vec[f32] = q.dequantize()
+            let werr: f32 = max_diff(w, &d)
+            let t0: Instant = Instant.now()
+            let y: Vec[f32] = q.matvec_vec(x).unwrap()
+            let ns: i64 = Instant.now().duration_since(t0).as_nanos()
+            let wb: usize = q.weight_bytes()
+            let yerr: f32 = max_diff(&y, yref)
+            let ok: bool = within_half_scale(&q, w, &d)
+            println!("{name}: weight_bytes={wb} max_w_err={werr} within_half_scale={ok} max_y_err={yerr}")
+            eprintln!("{name}: matvec_ns={ns}")
+            if not ok:
+                return 2
+            return 0
+
+@host
+def main() -> i32:
+    let rows: usize = 1536
+    let cols: usize = 576
+    let w: Vec[f32] = weights(rows * cols)
+    let x: Vec[f32] = weights(cols)
+    let t0: Instant = Instant.now()
+    let yref: Vec[f32] = f32_matvec(&w, &x, rows, cols)
+    let ns: i64 = Instant.now().duration_since(t0).as_nanos()
+    let fb: usize = rows * cols * 4
+    println!("f32: weight_bytes={fb}")
+    eprintln!("f32: matvec_ns={ns}")
+    let r8: i32 = report("i8 g32", quantize_vec_i8(&w, rows, cols, 32), &w, &x, &yref)
+    let r4: i32 = report("i4 g32", quantize_vec_i4(&w, rows, cols, 32), &w, &x, &yref)
+    return r8 + r4

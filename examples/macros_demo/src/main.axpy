@@ -1,0 +1,162 @@
+# Macros Demo - Demonstrating AXYON's macro system
+#
+# This example shows:
+# - Built-in macros (println!, assert!, debug_assert!, todo!, unreachable!)
+# - Qualified macro paths (std.println!, std.assert!)
+# - Macro imports with aliases
+# - Multiple macro imports
+#
+# Note: User-defined macros (macro_rules!) are planned for a future release.
+
+# Import macros with aliases - demonstrating different import styles
+from std.fmt import println! as log!
+from std.fmt import println! as info!
+from std import assert! as check!
+from std import debug_assert! as debug_check!
+
+def demonstrate_println() -> None:
+    """Demonstrate println! macro with string interpolation."""
+    println!("=== println! Demo ===")
+
+    let name: i32 = 42
+    println!("The answer is {name}")
+
+    let a: i32 = 10
+    let b: i32 = 20
+    println!("Sum: a={a}, b={b}")
+
+    # Multiple values in one line
+    let x: i32 = 1
+    let y: i32 = 2
+    let z: i32 = 3
+    println!("Coordinates: x={x}, y={y}, z={z}")
+
+def demonstrate_assert() -> None:
+    """Demonstrate assert! macro for runtime checks."""
+    println!("=== assert! Demo ===")
+
+    let x: i32 = 100
+    assert!(x > 0, "x must be positive")
+
+    let y: i32 = 50
+    assert!(y < x, "y must be less than x")
+
+    # Using the imported alias
+    check!(x != y, "x and y must be different")
+
+    println!("All assertions passed!")
+
+def demonstrate_debug_assert() -> None:
+    """Demonstrate debug_assert! macro (only runs in debug builds)."""
+    println!("=== debug_assert! Demo ===")
+
+    let value: i32 = 42
+
+    # debug_assert! is typically optimized out in release builds
+    debug_assert!(value > 0, "value should be positive")
+
+    # Using the imported alias
+    debug_check!(value < 100, "value should be reasonable")
+
+    println!("Debug assertions passed!")
+
+def demonstrate_qualified_macros() -> None:
+    """Demonstrate qualified macro paths."""
+    println!("=== Qualified Macros Demo ===")
+
+    # Using fully qualified paths
+    std.println!("Called via std.println!")
+    std.fmt.println!("Called via std.fmt.println!")
+
+    # Using the imported aliases
+    log!("Called via log! alias")
+    info!("Called via info! alias")
+
+    # Qualified assert
+    let test_value: i32 = 10
+    std.assert!(test_value > 0, "qualified assert check")
+
+def demonstrate_control_flow_macros() -> None:
+    """Demonstrate macros in control flow contexts."""
+    println!("=== Control Flow Macros Demo ===")
+
+    let mode: i32 = 1
+
+    if mode == 1:
+        println!("Mode 1: Normal operation")
+    else:
+        if mode == 2:
+            println!("Mode 2: Debug operation")
+        else:
+            # In a real application, this would panic
+            # unreachable!()
+            println!("Unexpected mode (would use unreachable! here)")
+
+    # Demonstrating conditional assertions
+    let data_ready: bool = True
+    assert!(data_ready, "data must be ready before processing")
+    println!("Data processing would happen here")
+
+def demonstrate_validation_pattern() -> None:
+    """Demonstrate using macros for input validation."""
+    println!("=== Validation Pattern Demo ===")
+
+    # Simulating parameter validation
+    let width: i32 = 100
+    let height: i32 = 50
+
+    assert!(width > 0, "width must be positive")
+    assert!(height > 0, "height must be positive")
+    assert!(width >= height, "width must be >= height")
+
+    println!("Validated: width={width}, height={height}")
+
+    # Calculate area with debug assertion for overflow check
+    let area: i32 = width * height
+    debug_assert!(area > 0, "area overflow detected")
+    println!("Area: {area}")
+
+def demonstrate_multiple_imports() -> None:
+    """Demonstrate using multiple imported macro aliases."""
+    println!("=== Multiple Imports Demo ===")
+
+    # All these are aliases for println!
+    log!("This is a log message")
+    info!("This is an info message")
+
+    # check! is an alias for assert!
+    let status: bool = True
+    check!(status, "status check failed")
+
+    println!("Multiple import aliases work correctly!")
+
+def main() -> i32:
+    """Entry point demonstrating macro features."""
+    println!("AXYON Macros Demo")
+    println!("==================")
+    println!("")
+
+    demonstrate_println()
+    println!("")
+
+    demonstrate_assert()
+    println!("")
+
+    demonstrate_debug_assert()
+    println!("")
+
+    demonstrate_qualified_macros()
+    println!("")
+
+    demonstrate_control_flow_macros()
+    println!("")
+
+    demonstrate_validation_pattern()
+    println!("")
+
+    demonstrate_multiple_imports()
+    println!("")
+
+    println!("==================")
+    println!("Demo complete!")
+    return 0

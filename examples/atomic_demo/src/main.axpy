@@ -1,0 +1,29 @@
+# Atomic Demo (issue #170)
+# Lowers atomic builtins to LLVM atomic instructions on a heap cell.
+#
+#   atomic_load[T](ptr, order)                         -> T
+#   atomic_store(ptr, value, order)
+#   atomic_swap / atomic_fetch_{add,sub,and,or,xor}(ptr, value, order) -> old value
+#   atomic_cmpxchg(ptr, expected, desired, success, failure)           -> old value
+#
+# Orderings are string literals: "relaxed", "acquire", "release", "acq_rel", "seq_cst".
+# These builtins operate on raw pointers, so they must be called inside an
+# `unsafe:` block (AX0529).
+
+def main() -> i32:
+    unsafe:
+        let raw: ptr_mut[u8] = global_alloc_zeroed(8, 8)
+        let counter: ptr_mut[i32] = raw as ptr_mut[i32]
+
+        atomic_store(counter, 40_i32, "release")
+        let before: i32 = atomic_fetch_add(counter, 2_i32, "seq_cst")
+        let seen: i32 = atomic_cmpxchg(counter, 42_i32, 100_i32, "seq_cst", "relaxed")
+        let after: i32 = atomic_load[i32](counter, "acquire")
+
+        global_dealloc(raw, 8, 8)
+
+        assert!(before == 40, "fetch_add returns the previous value")
+        assert!(seen == 42, "cmpxchg returns the previous value")
+        assert!(after == 100, "cmpxchg stored the desired value")
+        println!("atomic demo ok: {after}")
+        return 0

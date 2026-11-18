@@ -1,0 +1,118 @@
+# Asynchronous kernel launches on HIP streams with completion handles, on an
+# AMD GPU through ROCm (issue #2792)
+#
+# Every `gpu_submit*` below returns as soon as its kernel is enqueued on a
+# HIP stream; only `gpu_wait` (or `Completion.wait()`) blocks. The kernels
+# are ordered only by completion handles and queues, never by a hidden wait:
+#
+#   a = fill(w)        slow; w[i] = i + 1000        queue 0
+#   b = bump(w)        w[i] = w[i] + 1              queue 0, after `a` by queue order
+#   c = fill(x)        slow; x[i] = i + 1000        queue 1
+#   d = twice(x, y)    y[i] = x[i] * 2              queue 2, after `c` (explicit dependency)
+#   e = twice(x, z)    z[i] = x[i] * 2              no queue, after `c`
+#   f = bump(v)        v[i] = v[i] + 1              `gpu_launch_async` (Queue 3; the
+#                                                   shared unqueued stream, see
+#                                                   known limitation 2792)
+#
+# A warm-up first submits once on every queue (and once without one), so the
+# streams exist before the chain: creating a HIP stream may synchronize the
+# device, which would hide a missing dependency.
+#
+# `fill` spins before it stores, so a kernel that ran before it (`bump` on
+# another stream, `twice` without its dependency) would read the old values
+# and fail the check. Leaving out a dependency is a compile error (AX0644),
+# and so is reading a buffer back before the wait that covers it (AX0647).
+#
+# Set `AXYON_GPU_LAUNCH_EVIDENCE=1` to see each launch's backend, device and
+# image. Without an AMD device the first device allocation stops the program
+# with an AXYON panic: there is no CPU fallback.
+
+from std import CompletionId
+from std.gpu import Completion, Queue
+
+const N: i64 = 256
+
+# Spin `iters` dependent steps per thread, then store `i + 1000`. The store
+# depends on the spin (`magic` is a run-time operand the spin never
+# produces), so the compiler cannot drop the loop.
+@gpu(entry)
+def fill(n: i64, iters: i64, magic: i64, w: &mut Buffer[i64, (256,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let mut acc: i64 = i
+        for k: i64 in range(iters):
+            acc = acc * 6364136223846793005 + k
+        let mut value: i64 = i + 1000
+        if acc == magic:
+            value = 0
+        buffer_set(w, i, value)
+
+@gpu(entry)
+def bump(n: i64, w: &mut Buffer[i64, (256,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(w, i, buffer_get(w, i) + 1)
+
+@gpu(entry)
+def twice(n: i64, x: &Buffer[i64, (256,), device_global], y: &mut Buffer[i64, (256,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(y, i, buffer_get(x, i) * 2)
+
+def zeros() -> Buffer[i64, (256,)]:
+    let mut b: Buffer[i64, (256,)] = buffer_alloc([256])
+    for i: i64 in range(N):
+        buffer_set(b, i, 0)
+    return b
+
+def main() -> i32:
+    let iters: i64 = 2000000
+    let magic: i64 = 1
+    let mut dw: Buffer[i64, (256,), device_global] = buffer_to_device(zeros())
+    let mut dx: Buffer[i64, (256,), device_global] = buffer_to_device(zeros())
+    let mut dy: Buffer[i64, (256,), device_global] = buffer_to_device(zeros())
+    let mut dz: Buffer[i64, (256,), device_global] = buffer_to_device(zeros())
+    let mut dv: Buffer[i64, (256,), device_global] = buffer_to_device(zeros())
+    # Warm-up: the first submission of a queue creates its HIP stream, which
+    # may synchronize the device; do it before the chain so the chain's
+    # ordering rests on its handles alone.
+    let w0: CompletionId = gpu_submit_on(0, bump, 1, N, N, &mut dv)
+    let w1: CompletionId = gpu_submit_on(1, bump, 1, N, N, &mut dz)
+    let w2: CompletionId = gpu_submit_on(2, bump, 1, N, N, &mut dy)
+    let w3: CompletionId = gpu_submit(bump, 1, N, N, &mut dx)
+    gpu_wait(w0)
+    gpu_wait(w1)
+    gpu_wait(w2)
+    gpu_wait(w3)
+    let w4: Completion[(ref_mut[Buffer[i64, (256,), device_global]],)] = gpu_launch_async(Queue.new(3), bump, 1, N, N, &mut dw)
+    w4.wait()
+    let a: CompletionId = gpu_submit_on(0, fill, 1, N, N, iters, magic, &mut dw)
+    let b: CompletionId = gpu_submit_on(0, bump, 1, N, N, &mut dw)
+    let c: CompletionId = gpu_submit_on(1, fill, 1, N, N, iters, magic, &mut dx)
+    let d: CompletionId = gpu_submit_on_after(2, c, twice, 1, N, N, &dx, &mut dy)
+    let e: CompletionId = gpu_submit_after(c, twice, 1, N, N, &dx, &mut dz)
+    let f: Completion[(ref_mut[Buffer[i64, (256,), device_global]],)] = gpu_launch_async(Queue.new(3), bump, 1, N, N, &mut dv)
+    # One wait per chain: `b` covers `a` (queue order), `d` and `e` cover `c`.
+    gpu_wait(b)
+    gpu_wait(d)
+    gpu_wait(e)
+    f.wait()
+    let w: Buffer[i64, (256,)] = buffer_to_host(dw)
+    let y: Buffer[i64, (256,)] = buffer_to_host(dy)
+    let z: Buffer[i64, (256,)] = buffer_to_host(dz)
+    let v: Buffer[i64, (256,)] = buffer_to_host(dv)
+    let mut bad: i64 = 0
+    for i: i64 in range(N):
+        if buffer_get(w, i) != i + 1001:
+            bad = bad + 1
+        if buffer_get(y, i) != (i + 1000) * 2:
+            bad = bad + 1
+        if buffer_get(z, i) != (i + 1000) * 2:
+            bad = bad + 1
+        if buffer_get(v, i) != 2:
+            bad = bad + 1
+    if bad != 0:
+        println!("rocm async launch: {bad} mismatches")
+        return 1
+    println!("rocm async launch: queue order, dependencies and the nominal handle match the host reference")
+    return 0

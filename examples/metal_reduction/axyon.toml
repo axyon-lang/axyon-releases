@@ -1,0 +1,15 @@
+[package]
+name = "metal_reduction"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# Workgroup reductions run on the Apple GPU through Metal (#2067).
+[target]
+gpu = ["metal-apple-gpu"]

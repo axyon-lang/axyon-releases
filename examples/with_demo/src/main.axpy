@@ -1,0 +1,47 @@
+# Python `with` statement via the `Context` trait (#1690).
+#
+# `with E as x: body` enters `E` (binding `x` to `enter()`'s result) and calls
+# `exit()` exactly once on every way out of the block: fall-through, `return`,
+# `break` and `continue`. Multiple items enter left to right, exit right to left.
+# `exit` does not run after a panic (the runtime does not unwind).
+
+from core.context import Context
+
+struct Span:
+    id: i64
+
+impl Context for Span:
+    type Target = i64
+
+    def enter(mut self) -> i64:
+        println!("enter {self.id}")
+        return self.id * 10
+
+    def exit(mut self) -> unit:
+        println!("exit {self.id}")
+
+def early(n: i64) -> i64:
+    with Span { id: 1 } as v:
+        if n > 0:
+            return v
+    return 0
+
+def looped() -> i64:
+    let mut total: i64 = 0
+    for i: i64 in range(4):
+        with Span { id: 2 }:
+            if i == 1:
+                continue
+            if i == 3:
+                break
+            total = total + 1
+    return total
+
+def main() -> i32:
+    with Span { id: 3 } as a, Span { id: 4 } as b:
+        println!("body {a} {b}")
+    let r: i64 = early(1)
+    println!("early -> {r}")
+    let t: i64 = looped()
+    println!("looped -> {t}")
+    return 0

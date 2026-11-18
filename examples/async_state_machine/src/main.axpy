@@ -1,0 +1,105 @@
+# `async def` compiles to a `Future` state machine (#201). This example drives
+# nested async functions by hand with a counting waker: there is no executor
+# in the standard library yet. `scaled` comes from a sibling module that has
+# its own private `pair`.
+
+from core.future import Future, Poll
+from core.task import Context, RawWaker, RawWakerVTable, Waker
+from scaled import scaled
+
+# A hand-written future: not ready the first `left` polls.
+struct Delay:
+    left: i64
+    value: i64
+
+impl Future for Delay:
+    type Output = i64
+
+    def poll(mut self, cx: ref_mut[Context]) -> Poll[i64]:
+        if self.left == 0:
+            return Poll.Ready(self.value)
+        self.left = self.left - 1
+        cx.waker().wake_by_ref()
+        return Poll.Pending
+
+def delay(left: i64, value: i64) -> Delay:
+    return Delay { left: left, value: value }
+
+async def pair(x: i64) -> i64:
+    let a: i64 = await delay(1, x)
+    let b: i64 = await delay(2, x + 1)
+    return a + b
+
+async def total(n: i64) -> i64:
+    let mut sum: i64 = 0
+    for i in range(0, n):
+        sum = sum + await pair(i)
+        sum = sum + await scaled(i)
+    return sum
+
+enum Pace:
+    Fast
+    Slow(i64)
+
+# Any future can be awaited, including one stored in a local, and an `await`
+# may sit in a `match` arm (#2206).
+async def paced(p: Pace) -> i64:
+    let first: Delay = delay(1, 5)
+    let base: i64 = await first
+    match p:
+        case Pace.Fast:
+            return base
+        case Pace.Slow(extra):
+            return base + await delay(extra, 7)
+
+# An `async def` may return `None`; awaiting it yields `()` (#2206).
+async def settle(steps: i64) -> None:
+    let done: i64 = await delay(steps, 0)
+    if done != 0:
+        return
+
+# A `string` is owned by the future (#2234): it lives across the `await` and
+# is dropped exactly once, when the body finishes or, if the future is
+# dropped while it waits, with the future.
+async def labelled(label: string, n: i64) -> i64:
+    let sum: i64 = await total(n) + await paced(Pace.Slow(2))
+    await settle(1)
+    println!("{label} = {sum}")
+    return sum
+
+@unsafe
+def nop_clone(data: ptr[unit]) -> ptr[unit]:
+    return data
+
+@unsafe
+def nop_wake(data: ptr[unit]) -> unit:
+    pass
+
+def noop_waker(data: ptr[unit], vt: ref[RawWakerVTable]) -> Waker:
+    unsafe:
+        return Waker.from_raw(RawWaker.new(data, vt))
+
+# Poll once; a separate function, so the context's borrow ends with the call.
+def poll_once(future: ref_mut[__Future_labelled], waker: ref[Waker]) -> i64:
+    let mut cx: Context = Context.from_waker(waker)
+    match future.poll(&mut cx):
+        case Poll.Ready(value):
+            return value
+        case Poll.Pending:
+            return -1
+
+def main() -> i32:
+    let clone_fn: unsafe fn(ptr[unit]) -> ptr[unit] = nop_clone
+    let wake_fn: unsafe fn(ptr[unit]) -> unit = nop_wake
+    let vtable: RawWakerVTable = RawWakerVTable.new(clone_fn, wake_fn, wake_fn, wake_fn)
+    let data: ptr_mut[u8] = global_alloc_zeroed(8, 8)
+    let waker: Waker = noop_waker(data as ptr[unit], ref(vtable))
+    let mut future = labelled(String.from("total"), 3)
+    let mut polls: i64 = 0
+    while True:
+        let result: i64 = poll_once(&mut future, ref(waker))
+        polls = polls + 1
+        if result != -1:
+            println!("ready after {polls} polls")
+            break
+    return 0

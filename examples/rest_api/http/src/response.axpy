@@ -1,0 +1,147 @@
+# HTTP/1.1 responses: a status, header fields and a body, serialized with a
+# `Content-Length` and `Connection: close` (the server does not keep
+# connections alive).
+
+from std.core import Option, Some, None_
+from .json import Json, Member, member, encode
+
+# A response. The header fields are kept as their wire bytes, one
+# `Name: value\r\n` line each; read one back with `response_header`.
+# Workaround (#3544): a `Vec[HeaderField]` (or any
+# `String`) field made `Router.dispatch`, instantiated in a dependent
+# package, reject returning the handler's response as a borrowed view
+# (AX0528), so the fields hold no `String`.
+@public
+struct Response:
+    @public
+    status: u16
+    @public
+    header_lines: Vec[u8]
+    @public
+    body: Vec[u8]
+
+impl Response:
+    # A response with no headers and an empty body.
+    @public
+    def new(status: u16) -> Response:
+        return Response { status: status, header_lines: Vec.new(), body: Vec.new() }
+
+# `r` with the header field `name: value` added.
+# (A free function taking `r` by value rather than a `mut self` method: a
+# dependent package that calls a `mut self` method with a `String` variable
+# argument keeps the receiver borrowed, AX0505, #3543.)
+@public
+def with_header(r: Response, name: String, value: String) -> Response:
+    let mut out: Response = r
+    let line: String = format!("{name}: {value}\r\n")
+    let bytes: Slice[u8] = line.as_bytes()
+    for i: usize in range(0, bytes.len()):
+        out.header_lines.push(bytes[i])
+    return out
+
+def lower(b: u8) -> u8:
+    if b >= 65 and b <= 90:
+        return b + 32
+    return b
+
+# The value of the first header field named `name` (any case) in `r`.
+@public
+def response_header(r: &Response, name: String) -> Option[String]:
+    let lines: Slice[u8] = r.header_lines.as_slice()
+    let key: Slice[u8] = name.as_bytes()
+    let mut start: usize = 0
+    while start < lines.len():
+        # Find the end of this line.
+        let mut end: usize = start
+        while end + 1 < lines.len() and not (lines[end] == 13 and lines[end + 1] == 10):
+            end = end + 1
+        let mut same: bool = end - start > key.len() + 1 and lines[start + key.len()] == 58
+        if same:
+            for k: usize in range(0, key.len()):
+                if lower(lines[start + k]) != lower(key[k]):
+                    same = False
+        if same:
+            let mut value: String = String.new()
+            for k: usize in range(start + key.len() + 2, end):
+                value.push(lines[k])
+            return Some(value)
+        start = end + 2
+    # Workaround (#3533): bare imported `None_` is AX0381.
+    return Option.None_
+
+# A response whose body is `text` as `text/plain`.
+@public
+def text_response(status: u16, text: String) -> Response:
+    let mut r: Response = with_header(Response.new(status), "Content-Type", "text/plain; charset=utf-8")
+    let bytes: Slice[u8] = text.as_bytes()
+    for i: usize in range(0, bytes.len()):
+        r.body.push(bytes[i])
+    return r
+
+# A response whose body is the JSON encoding of `value`.
+@public
+def json_response(status: u16, value: &Json) -> Response:
+    let mut r: Response = with_header(Response.new(status), "Content-Type", "application/json")
+    let text: String = encode(value)
+    let bytes: Slice[u8] = text.as_bytes()
+    for i: usize in range(0, bytes.len()):
+        r.body.push(bytes[i])
+    return r
+
+# A JSON error body `{"error": message}` with status `status`.
+@public
+def error_response(status: u16, message: String) -> Response:
+    let mut members: Vec[Member] = Vec.new()
+    members.push(member("error", Json.Str(message)))
+    let body: Json = Json.Obj(members)
+    return json_response(status, &body)
+
+# The reason phrase of the status codes this package sends.
+@public
+def reason_phrase(status: u16) -> String:
+    if status == 200:
+        return "OK"
+    if status == 201:
+        return "Created"
+    if status == 204:
+        return "No Content"
+    if status == 400:
+        return "Bad Request"
+    if status == 404:
+        return "Not Found"
+    if status == 405:
+        return "Method Not Allowed"
+    if status == 413:
+        return "Content Too Large"
+    if status == 431:
+        return "Request Header Fields Too Large"
+    if status == 500:
+        return "Internal Server Error"
+    if status == 501:
+        return "Not Implemented"
+    if status == 505:
+        return "HTTP Version Not Supported"
+    return "Unknown"
+
+def push_bytes(out: &mut Vec[u8], s: Slice[u8]) -> unit:
+    for i: usize in range(0, s.len()):
+        out.push(s[i])
+
+# The bytes of `r` on the wire. A 204 carries no body and no length.
+@public
+def serialize(r: &Response) -> Vec[u8]:
+    let status: u16 = r.status
+    let reason: String = reason_phrase(status)
+    let status_line: String = format!("HTTP/1.1 {status} {reason}\r\n")
+    let mut head: String = String.new()
+    if status != 204:
+        let n: usize = r.body.len()
+        head.push_str(format!("Content-Length: {n}\r\n"))
+    head.push_str("Connection: close\r\n\r\n")
+    let mut out: Vec[u8] = Vec.new()
+    push_bytes(&mut out, status_line.as_bytes())
+    push_bytes(&mut out, r.header_lines.as_slice())
+    push_bytes(&mut out, head.as_bytes())
+    if status != 204:
+        push_bytes(&mut out, r.body.as_slice())
+    return out

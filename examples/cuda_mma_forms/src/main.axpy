@@ -1,0 +1,362 @@
+# The other sm_80 tensor-core forms (issue #2928), each a tiled GEMM
+# checked against the host:
+#
+# - `f16` inputs into an `f16` accumulator (`mma.sync.m16n8k16`
+#   `.f16.f16.f16.f16`);
+# - `tf32` inputs into `f32` (`m16n8k8`): `f32` buffers, each element
+#   rounded to TF32 (10-bit mantissa, nearest, ties away from zero) by the
+#   product;
+# - `f64` (`m8n8k4`);
+# - `i8` and `u8` inputs into a saturating `i32` accumulator (`m16n8k32`
+#   `.satfinite`): the exact `a · b + c` of one `mma` is clamped to the
+#   `i32` range, never wrapped.
+#
+# Each warp computes one output tile (`TM x TN`): tile `t = WARPS * g + w`
+# of block `g`, warp `w`, at tile row `t >> sh` and tile column
+# `t & ((1 << sh) - 1)` (device code cannot divide by a run-time value).
+# Tails need no branch: an element outside its buffer loads as zero and is
+# never stored. Every case is bit-exact: its inputs make every product and
+# partial sum exact in the accumulator type (and in TF32), so the hardware's
+# summation order cannot show. Two more cases pin the TF32 rounding of one
+# input and the integer saturation at both ends of the `i32` range.
+#
+# Without a CUDA device the first device allocation stops the program with
+# an AXYON panic: there is no CPU fallback.
+
+const WARPS: i64 = 4
+const THREADS: i64 = 128
+
+@gpu(entry)
+@schedule(subgroup=32, max_threads=128, reduction="reassociate")
+def gemm_f16_acc16(sh: i64, a: &Buffer[f16, (M, K), device_global], b: &Buffer[f16, (K, N), device_global], c: &mut Buffer[f16, (M, N), device_global]) -> None:
+    let tile: i64 = gpu_block_id(0) * WARPS + gpu_thread_id(0) / 32
+    let row: i64 = (tile >> sh) * 16
+    let col: i64 = (tile & ((1 << sh) - 1)) * 8
+    let mut acc: MmaAcc[f16, (16, 8)] = mma_fill(0.0 as f16)
+    for kk: i64 in range((buffer_dim(a, 1) + 15) / 16):
+        let fa: MmaA[f16, (16, 16), RowMajor] = mma_load(a, row, kk * 16)
+        let fb: MmaB[f16, (16, 8), RowMajor] = mma_load(b, kk * 16, col)
+        acc = mma(fa, fb, acc)
+    mma_store(c, row, col, acc)
+
+@gpu(entry)
+@schedule(subgroup=32, max_threads=128, reduction="reassociate")
+def gemm_tf32(sh: i64, a: &Buffer[f32, (M, K), device_global], b: &Buffer[f32, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    let tile: i64 = gpu_block_id(0) * WARPS + gpu_thread_id(0) / 32
+    let row: i64 = (tile >> sh) * 16
+    let col: i64 = (tile & ((1 << sh) - 1)) * 8
+    let mut acc: MmaAcc[f32, (16, 8)] = mma_fill(0.0)
+    for kk: i64 in range((buffer_dim(a, 1) + 7) / 8):
+        let fa: MmaA[tf32, (16, 8), RowMajor] = mma_load(a, row, kk * 8)
+        let fb: MmaB[tf32, (8, 8), RowMajor] = mma_load(b, kk * 8, col)
+        acc = mma(fa, fb, acc)
+    mma_store(c, row, col, acc)
+
+@gpu(entry)
+@schedule(subgroup=32, max_threads=128, reduction="reassociate")
+def gemm_f64(sh: i64, a: &Buffer[f64, (M, K), device_global], b: &Buffer[f64, (K, N), device_global], c: &mut Buffer[f64, (M, N), device_global]) -> None:
+    let tile: i64 = gpu_block_id(0) * WARPS + gpu_thread_id(0) / 32
+    let row: i64 = (tile >> sh) * 8
+    let col: i64 = (tile & ((1 << sh) - 1)) * 8
+    let mut acc: MmaAcc[f64, (8, 8)] = mma_fill(0.0)
+    for kk: i64 in range((buffer_dim(a, 1) + 3) / 4):
+        let fa: MmaA[f64, (8, 4), RowMajor] = mma_load(a, row, kk * 4)
+        let fb: MmaB[f64, (4, 8), RowMajor] = mma_load(b, kk * 4, col)
+        acc = mma(fa, fb, acc)
+    mma_store(c, row, col, acc)
+
+# `c += a · b`: the accumulator starts from `c` (an `MmaAcc` load), so the
+# saturation cases can start next to the ends of the `i32` range.
+@gpu(entry)
+@schedule(subgroup=32, max_threads=128, reduction="reassociate")
+def gemm_i8(sh: i64, a: &Buffer[i8, (M, K), device_global], b: &Buffer[i8, (K, N), device_global], c: &mut Buffer[i32, (M, N), device_global]) -> None:
+    let tile: i64 = gpu_block_id(0) * WARPS + gpu_thread_id(0) / 32
+    let row: i64 = (tile >> sh) * 16
+    let col: i64 = (tile & ((1 << sh) - 1)) * 8
+    let mut acc: MmaAcc[i32, (16, 8)] = mma_load(c, row, col)
+    for kk: i64 in range((buffer_dim(a, 1) + 31) / 32):
+        let fa: MmaA[i8, (16, 32), RowMajor] = mma_load(a, row, kk * 32)
+        let fb: MmaB[i8, (32, 8), RowMajor] = mma_load(b, kk * 32, col)
+        acc = mma(fa, fb, acc)
+    mma_store(c, row, col, acc)
+
+# `b` stored transposed (`bt: N x K`, `ColMajor`).
+@gpu(entry)
+@schedule(subgroup=32, max_threads=128, reduction="reassociate")
+def gemm_u8_bt(sh: i64, a: &Buffer[u8, (M, K), device_global], bt: &Buffer[u8, (N, K), device_global], c: &mut Buffer[i32, (M, N), device_global]) -> None:
+    let tile: i64 = gpu_block_id(0) * WARPS + gpu_thread_id(0) / 32
+    let row: i64 = (tile >> sh) * 16
+    let col: i64 = (tile & ((1 << sh) - 1)) * 8
+    let mut acc: MmaAcc[i32, (16, 8)] = mma_load(c, row, col)
+    for kk: i64 in range((buffer_dim(a, 1) + 31) / 32):
+        let fa: MmaA[u8, (16, 32), RowMajor] = mma_load(a, row, kk * 32)
+        let fb: MmaB[u8, (32, 8), ColMajor] = mma_load(bt, col, kk * 32)
+        acc = mma(fa, fb, acc)
+    mma_store(c, row, col, acc)
+
+def next_seed(s: i64) -> i64:
+    return (s * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+
+# A pseudo-random integer in `[lo, lo + span)`, `span` a power of two.
+def draw(s: i64, lo: i64, span: i64) -> i64:
+    return ((s >> 33) & (span - 1)) + lo
+
+# The smallest `sh` with `1 << sh >= tiles`.
+def col_shift(tiles: i64) -> i64:
+    let mut sh: i64 = 0
+    while (1 << sh) < tiles:
+        sh = sh + 1
+    return sh
+
+# Blocks for an `m x n` output in `tm x tn` tiles.
+def grid_of(m: i64, n: i64, tm: i64, tn: i64) -> i64:
+    let tiles: i64 = ((m + tm - 1) / tm) << col_shift((n + tn - 1) / tn)
+    return (tiles + WARPS - 1) / WARPS
+
+def report(what: str, m: i64, n: i64, k: i64, bad: i64) -> i64:
+    if bad != 0:
+        println!("{what} {m}x{n}x{k}: {bad} mismatches")
+    return bad
+
+# `f16 -> f16`: inputs are multiples of 1/4 in [-1, 1), so with `k <= 128`
+# every partial sum is a multiple of 1/16 below 128 in magnitude: exact in
+# f16.
+def check_f16(m: i64, n: i64, k: i64, seed: i64) -> i64:
+    let mut s: i64 = seed
+    let mut ha: Buffer[f16, (M, K)] = buffer_alloc([m, k])
+    let mut hb: Buffer[f16, (K, N)] = buffer_alloc([k, n])
+    for i: i64 in range(m):
+        for p: i64 in range(k):
+            s = next_seed(s)
+            buffer_set(ha, i, p, (draw(s, -4, 8) as f64 / 4.0) as f16)
+    for p: i64 in range(k):
+        for j: i64 in range(n):
+            s = next_seed(s)
+            buffer_set(hb, p, j, (draw(s, -4, 8) as f64 / 4.0) as f16)
+    let mut want: Buffer[f64, (M, N)] = buffer_alloc([m, n])
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            let mut acc: f64 = 0.0
+            for p: i64 in range(k):
+                acc = acc + (buffer_get(ha, i, p) as f64) * (buffer_get(hb, p, j) as f64)
+            buffer_set(want, i, j, acc)
+    let mut hc: Buffer[f16, (M, N)] = buffer_alloc([m, n])
+    let da: Buffer[f16, (M, K), device_global] = buffer_to_device(ha)
+    let db: Buffer[f16, (K, N), device_global] = buffer_to_device(hb)
+    let mut dc: Buffer[f16, (M, N), device_global] = buffer_to_device(hc)
+    let sh: i64 = col_shift((n + 7) / 8)
+    gpu_launch(gemm_f16_acc16, grid_of(m, n, 16, 8), THREADS, sh, &da, &db, &mut dc)
+    let got: Buffer[f16, (M, N)] = buffer_to_host(dc)
+    let mut bad: i64 = 0
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            if (buffer_get(got, i, j) as f64) != buffer_get(want, i, j):
+                bad = bad + 1
+    return report("f16 -> f16", m, n, k, bad)
+
+# One `tf32` GEMM of the f32 buffers `ha`/`hb`.
+def run_tf32(m: i64, n: i64, k: i64, ha: Buffer[f32, (M, K)], hb: Buffer[f32, (K, N)]) -> Buffer[f32, (M, N)]:
+    let mut hc: Buffer[f32, (M, N)] = buffer_alloc([m, n])
+    let da: Buffer[f32, (M, K), device_global] = buffer_to_device(ha)
+    let db: Buffer[f32, (K, N), device_global] = buffer_to_device(hb)
+    let mut dc: Buffer[f32, (M, N), device_global] = buffer_to_device(hc)
+    let sh: i64 = col_shift((n + 7) / 8)
+    gpu_launch(gemm_tf32, grid_of(m, n, 16, 8), THREADS, sh, &da, &db, &mut dc)
+    return buffer_to_host(dc)
+
+# `tf32 -> f32`: inputs are multiples of 1/16 in [-4, 4) (7 significant
+# bits, so TF32 holds them exactly) and every sum is exact in f32.
+def check_tf32(m: i64, n: i64, k: i64, seed: i64) -> i64:
+    let mut s: i64 = seed
+    let mut ha: Buffer[f32, (M, K)] = buffer_alloc([m, k])
+    let mut hb: Buffer[f32, (K, N)] = buffer_alloc([k, n])
+    for i: i64 in range(m):
+        for p: i64 in range(k):
+            s = next_seed(s)
+            buffer_set(ha, i, p, (draw(s, -64, 128) as f64 / 16.0) as f32)
+    for p: i64 in range(k):
+        for j: i64 in range(n):
+            s = next_seed(s)
+            buffer_set(hb, p, j, (draw(s, -64, 128) as f64 / 16.0) as f32)
+    let mut want: Buffer[f64, (M, N)] = buffer_alloc([m, n])
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            let mut acc: f64 = 0.0
+            for p: i64 in range(k):
+                acc = acc + (buffer_get(ha, i, p) as f64) * (buffer_get(hb, p, j) as f64)
+            buffer_set(want, i, j, acc)
+    let got: Buffer[f32, (M, N)] = run_tf32(m, n, k, ha, hb)
+    let mut bad: i64 = 0
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            if (buffer_get(got, i, j) as f64) != buffer_get(want, i, j):
+                bad = bad + 1
+    return report("tf32 -> f32", m, n, k, bad)
+
+# The TF32 rounding of an input: `c[i, 0] = x_i * 1` for `x_i` in row `i`
+# of `a`, which TF32 rounds to nearest with ties away from zero (a
+# truncation would give `1` for the first and `-1` for the second).
+def check_tf32_rounding() -> i64:
+    let xs: Array[f64; 4] = [1.00048828125, -1.00048828125, 1.000244140625, 1.000732421875]
+    let wants: Array[f64; 4] = [1.0009765625, -1.0009765625, 1.0, 1.0009765625]
+    let mut ha: Buffer[f32, (M, K)] = buffer_alloc([16, 8])
+    let mut hb: Buffer[f32, (K, N)] = buffer_alloc([8, 8])
+    for i: i64 in range(16):
+        for p: i64 in range(8):
+            buffer_set(ha, i, p, 0.0 as f32)
+            if i < 8:
+                buffer_set(hb, i, p, 0.0 as f32)
+    for i: i64 in range(4):
+        buffer_set(ha, i, 0, xs[i] as f32)
+    buffer_set(hb, 0, 0, 1.0 as f32)
+    let got: Buffer[f32, (M, N)] = run_tf32(16, 8, 8, ha, hb)
+    let mut bad: i64 = 0
+    for i: i64 in range(4):
+        let g: f64 = buffer_get(got, i, 0) as f64
+        if g != wants[i]:
+            println!("tf32 rounding: {xs[i]} * 1 = {g}, want {wants[i]}")
+            bad = bad + 1
+    return bad
+
+# `f64`: inputs are multiples of 1/1024 in [-1, 1), so every sum is exact
+# in f64.
+def check_f64(m: i64, n: i64, k: i64, seed: i64) -> i64:
+    let mut s: i64 = seed
+    let mut ha: Buffer[f64, (M, K)] = buffer_alloc([m, k])
+    let mut hb: Buffer[f64, (K, N)] = buffer_alloc([k, n])
+    for i: i64 in range(m):
+        for p: i64 in range(k):
+            s = next_seed(s)
+            buffer_set(ha, i, p, draw(s, -1024, 2048) as f64 / 1024.0)
+    for p: i64 in range(k):
+        for j: i64 in range(n):
+            s = next_seed(s)
+            buffer_set(hb, p, j, draw(s, -1024, 2048) as f64 / 1024.0)
+    let mut want: Buffer[f64, (M, N)] = buffer_alloc([m, n])
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            let mut acc: f64 = 0.0
+            for p: i64 in range(k):
+                acc = acc + buffer_get(ha, i, p) * buffer_get(hb, p, j)
+            buffer_set(want, i, j, acc)
+    let mut hc: Buffer[f64, (M, N)] = buffer_alloc([m, n])
+    let da: Buffer[f64, (M, K), device_global] = buffer_to_device(ha)
+    let db: Buffer[f64, (K, N), device_global] = buffer_to_device(hb)
+    let mut dc: Buffer[f64, (M, N), device_global] = buffer_to_device(hc)
+    let sh: i64 = col_shift((n + 7) / 8)
+    gpu_launch(gemm_f64, grid_of(m, n, 8, 8), THREADS, sh, &da, &db, &mut dc)
+    let got: Buffer[f64, (M, N)] = buffer_to_host(dc)
+    let mut bad: i64 = 0
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            if buffer_get(got, i, j) != buffer_get(want, i, j):
+                bad = bad + 1
+    return report("f64", m, n, k, bad)
+
+const I32_MAX: i64 = 2147483647
+const I32_MIN: i64 = -2147483648
+
+def clamp_i32(x: i64) -> i64:
+    if x > I32_MAX:
+        return I32_MAX
+    if x < I32_MIN:
+        return I32_MIN
+    return x
+
+# `c += a · b` on `i8` (`unsigned` false) or `u8` (true, `b` transposed),
+# against the exact `i64` sum clamped to `i32` once per `mma`, i.e. per
+# 32-wide step of `k`. `a`, `b` and `c` are filled with `fill_a`,
+# `fill_b` and `fill_c` when `fixed`, and with random values otherwise.
+def check_int(unsigned: bool, m: i64, n: i64, k: i64, seed: i64, fixed: bool, fill_a: i64, fill_b: i64, fill_c: i64) -> i64:
+    let mut s: i64 = seed
+    let lo: i64 = 0 if unsigned else -128
+    let mut va: Buffer[i64, (M, K)] = buffer_alloc([m, k])
+    let mut vb: Buffer[i64, (K, N)] = buffer_alloc([k, n])
+    let mut vc: Buffer[i64, (M, N)] = buffer_alloc([m, n])
+    for i: i64 in range(m):
+        for p: i64 in range(k):
+            s = next_seed(s)
+            buffer_set(va, i, p, fill_a if fixed else draw(s, lo, 256))
+    for p: i64 in range(k):
+        for j: i64 in range(n):
+            s = next_seed(s)
+            buffer_set(vb, p, j, fill_b if fixed else draw(s, lo, 256))
+    let mut hc: Buffer[i32, (M, N)] = buffer_alloc([m, n])
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            s = next_seed(s)
+            let c0: i64 = fill_c if fixed else draw(s, -65536, 131072)
+            buffer_set(vc, i, j, c0)
+            buffer_set(hc, i, j, c0 as i32)
+    let mut dc: Buffer[i32, (M, N), device_global] = buffer_to_device(hc)
+    let sh: i64 = col_shift((n + 7) / 8)
+    let grid: i64 = grid_of(m, n, 16, 8)
+    if unsigned:
+        let mut ha: Buffer[u8, (M, K)] = buffer_alloc([m, k])
+        let mut hbt: Buffer[u8, (N, K)] = buffer_alloc([n, k])
+        for i: i64 in range(m):
+            for p: i64 in range(k):
+                buffer_set(ha, i, p, buffer_get(va, i, p) as u8)
+        for p: i64 in range(k):
+            for j: i64 in range(n):
+                buffer_set(hbt, j, p, buffer_get(vb, p, j) as u8)
+        let da: Buffer[u8, (M, K), device_global] = buffer_to_device(ha)
+        let dbt: Buffer[u8, (N, K), device_global] = buffer_to_device(hbt)
+        gpu_launch(gemm_u8_bt, grid, THREADS, sh, &da, &dbt, &mut dc)
+    else:
+        let mut ha: Buffer[i8, (M, K)] = buffer_alloc([m, k])
+        let mut hb: Buffer[i8, (K, N)] = buffer_alloc([k, n])
+        for i: i64 in range(m):
+            for p: i64 in range(k):
+                buffer_set(ha, i, p, buffer_get(va, i, p) as i8)
+        for p: i64 in range(k):
+            for j: i64 in range(n):
+                buffer_set(hb, p, j, buffer_get(vb, p, j) as i8)
+        let da: Buffer[i8, (M, K), device_global] = buffer_to_device(ha)
+        let db: Buffer[i8, (K, N), device_global] = buffer_to_device(hb)
+        gpu_launch(gemm_i8, grid, THREADS, sh, &da, &db, &mut dc)
+    let got: Buffer[i32, (M, N)] = buffer_to_host(dc)
+    let mut bad: i64 = 0
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            let mut want: i64 = buffer_get(vc, i, j)
+            let mut p0: i64 = 0
+            while p0 < k:
+                for p: i64 in range(p0, min(p0 + 32, k)):
+                    want = want + buffer_get(va, i, p) * buffer_get(vb, p, j)
+                want = clamp_i32(want)
+                p0 = p0 + 32
+            let g: i64 = buffer_get(got, i, j) as i64
+            if g != want:
+                if bad < 3:
+                    println!("int c[{i}, {j}] = {g}, want {want}")
+                bad = bad + 1
+    return report("u8 -> i32" if unsigned else "i8 -> i32", m, n, k, bad)
+
+def main() -> i32:
+    let mut bad: i64 = 0
+    let mut cases: i64 = 0
+    # (m, n, k): one tile, many tiles, and M/N/K tails.
+    let shapes: Array[i64; 18] = [16, 8, 16, 64, 64, 64, 128, 96, 128, 17, 9, 15, 50, 30, 70, 33, 100, 1]
+    for c: i64 in range(6):
+        let m: i64 = shapes[3 * c]
+        let n: i64 = shapes[3 * c + 1]
+        let k: i64 = shapes[3 * c + 2]
+        bad = bad + check_f16(m, n, k, 2928 + c)
+        bad = bad + check_tf32(m, n, k, 3929 + c)
+        bad = bad + check_f64(m, n, k, 4930 + c)
+        bad = bad + check_int(false, m, n, k, 5931 + c, false, 0, 0, 0)
+        bad = bad + check_int(true, m, n, k, 6932 + c, false, 0, 0, 0)
+        cases = cases + 5
+    bad = bad + check_tf32_rounding()
+    # Saturation at both ends of `i32`, over one and two `mma` steps.
+    bad = bad + check_int(false, 16, 8, 32, 1, true, 127, 127, I32_MAX - 100)
+    bad = bad + check_int(false, 16, 8, 64, 1, true, 127, -128, I32_MIN + 100)
+    bad = bad + check_int(true, 16, 8, 32, 1, true, 255, 255, I32_MAX - 5)
+    bad = bad + check_int(false, 17, 9, 40, 1, true, -128, -128, I32_MAX - 300000)
+    cases = cases + 5
+    if bad != 0:
+        println!("FAIL: {bad} mismatches")
+        return 1
+    println!("cuda_mma_forms: {cases} cases match the host reference")
+    return 0

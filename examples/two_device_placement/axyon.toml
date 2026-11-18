@@ -1,0 +1,15 @@
+[package]
+name = "two_device_placement"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# Explicit device placement (#2678) needs a runtime that places buffers on
+# explicit devices: CUDA.
+[target]
+gpu = ["nvptx-sm80"]

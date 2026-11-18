@@ -1,0 +1,15 @@
+# mathlib — A small math library crate
+#
+# Demonstrates a library crate within a workspace.
+# This crate is compiled first (no dependencies) and provides
+# utility functions for downstream workspace members.
+
+# Declare submodules
+@public from . import geometry
+@public from . import arithmetic
+
+# Re-export commonly used items
+@public from geometry import circle_area
+@public from geometry import rect_area
+@public from arithmetic import clamp
+@public from arithmetic import abs_diff

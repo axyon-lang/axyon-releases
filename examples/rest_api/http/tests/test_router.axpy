@@ -1,0 +1,118 @@
+# Unit tests for the router (method + path matching, `:name` parameters,
+# 404/405/500) and for response serialization.
+#
+# Failures are reported with `assert!`: a test that returns non-zero is
+# reported as passing (#3534).
+
+from std.core import Result, Ok, Err
+from http.request import Request
+from http.response import Response, text_response, serialize, response_header
+from http.router import Router, Param, param, split_path
+
+# Handler state: counts the calls that reached a handler.
+struct Calls:
+    @public
+    count: i64
+
+def get_item(state: &mut Calls, request: &Request, params: &Vec[Param]) -> Result[Response, String]:
+    state.count = state.count + 1
+    match param(params, "id"):
+        Some(id) => return Ok(text_response(200, id))
+        None_ => return Err("missing id")
+
+def list_items(state: &mut Calls, request: &Request, params: &Vec[Param]) -> Result[Response, String]:
+    state.count = state.count + 1
+    return Ok(text_response(200, "list"))
+
+def broken(state: &mut Calls, request: &Request, params: &Vec[Param]) -> Result[Response, String]:
+    state.count = state.count + 1
+    return Err("handler failed")
+
+def request(method: String, path: String) -> Request:
+    return Request { method: method, path: path, query: String.new(), headers: Vec.new(), body: Vec.new() }
+
+def body_text(r: &Response) -> String:
+    let mut s: String = String.new()
+    for i: usize in range(0, r.body.len()):
+        s.push(r.body[i])
+    return s
+
+def make_router() -> Router[Calls]:
+    let mut router: Router[Calls] = Router.new()
+    router.add("GET", "/items", list_items)
+    router.add("GET", "/items/:id", get_item)
+    router.add("DELETE", "/items/:id", get_item)
+    router.add("GET", "/broken", broken)
+    return router
+
+@test
+def test_split_path() -> i32:
+    let parts: Vec[String] = split_path("/a/bc/".as_bytes())
+    assert!(parts.len() == 3, "a trailing slash yields an empty last segment")
+    assert!(parts[0] == "a" and parts[1] == "bc" and parts[2] == "", "segments")
+    let root: Vec[String] = split_path("/".as_bytes())
+    assert!(root.len() == 1 and root[0] == "", "the root path is one empty segment")
+    return 0
+
+@test
+def test_dispatch_static_and_params() -> i32:
+    let router: Router[Calls] = make_router()
+    let mut calls: Calls = Calls { count: 0 }
+    let list: Response = router.dispatch(&mut calls, &request("GET", "/items"))
+    assert!(list.status == 200 and body_text(&list) == "list", "static route")
+    let item: Response = router.dispatch(&mut calls, &request("GET", "/items/42"))
+    assert!(item.status == 200 and body_text(&item) == "42", "the :id parameter is bound")
+    assert!(calls.count == 2, "both handlers ran with the shared state")
+    return 0
+
+@test
+def test_dispatch_not_found() -> i32:
+    let router: Router[Calls] = make_router()
+    let mut calls: Calls = Calls { count: 0 }
+    # A field of an owning call result cannot be read directly (AX0580), so
+    # each response is bound first.
+    let unknown: Response = router.dispatch(&mut calls, &request("GET", "/nothing"))
+    assert!(unknown.status == 404, "unknown path")
+    let deep: Response = router.dispatch(&mut calls, &request("GET", "/items/1/extra"))
+    assert!(deep.status == 404, "too many segments")
+    let empty: Response = router.dispatch(&mut calls, &request("GET", "/items/"))
+    assert!(empty.status == 404, "an empty segment does not bind :id")
+    assert!(calls.count == 0, "no handler ran")
+    return 0
+
+@test
+def test_dispatch_method_not_allowed() -> i32:
+    let router: Router[Calls] = make_router()
+    let mut calls: Calls = Calls { count: 0 }
+    let r: Response = router.dispatch(&mut calls, &request("POST", "/items/7"))
+    assert!(r.status == 405, "the path exists but not for POST")
+    match response_header(&r, "allow"):
+        Some(v) => assert!(v == "GET, DELETE", "Allow lists the methods of the path")
+        None_ => assert!(False, "405 carries an Allow header")
+    assert!(calls.count == 0, "no handler ran")
+    return 0
+
+@test
+def test_dispatch_handler_error() -> i32:
+    let router: Router[Calls] = make_router()
+    let mut calls: Calls = Calls { count: 0 }
+    let r: Response = router.dispatch(&mut calls, &request("GET", "/broken"))
+    assert!(r.status == 500, "a handler error is a 500")
+    assert!(body_text(&r) == "{\"error\":\"handler failed\"}", "the message is in the JSON body")
+    return 0
+
+@test
+def test_serialize_response() -> i32:
+    let r: Response = text_response(200, "hi")
+    let mut wire: String = String.new()
+    let bytes: Vec[u8] = serialize(&r)
+    for i: usize in range(0, bytes.len()):
+        wire.push(bytes[i])
+    assert!(wire == "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi", "status line, headers, length and body")
+    let empty: Response = Response.new(204)
+    let bytes204: Vec[u8] = serialize(&empty)
+    let mut wire204: String = String.new()
+    for i: usize in range(0, bytes204.len()):
+        wire204.push(bytes204[i])
+    assert!(wire204 == "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n", "204 has no length and no body")
+    return 0

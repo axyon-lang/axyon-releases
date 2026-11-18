@@ -1,0 +1,23 @@
+def main() -> i32:
+    let a: Array[i64; 4] = [1, 7, 12, 0]
+
+    # By value: `Copy` elements, counted loop over the array storage.
+    let mut total: i64 = 0
+    for x: i64 in a:
+        total += x
+    assert!(total == 20, "by-value sum")
+
+    # A literal as the iterable.
+    let mut lit: i64 = 0
+    for x in [1, 7, 12, 0]:
+        lit += x
+    assert!(lit == 20, "literal sum")
+
+    # Shared references to the elements.
+    let mut by_ref: i64 = 0
+    for r in a.iter():
+        by_ref += *r
+    assert!(by_ref == 20, "iter sum")
+
+    println!("sum = {total}")
+    return 0

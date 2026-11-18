@@ -1,0 +1,20 @@
+[package]
+name = "rocm_relaxed_math"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# Generated kernels run on an AMD GPU through ROCm/HIP with the opt-in
+# relaxed device math (#2865): device f32 `+ - *` may be reassociated and
+# contracted into `v_fma`/`v_fmac`, never flushed (`daz`), run under
+# `unsafe-math`/`finite-only` or approximated. Host math stays strict
+# (`[build] fast_math` is independent and stays off). Remove `gpu-math` (or
+# set it to "strict") for the strict device build of the same kernels.
+[target]
+gpu = ["rocdl-gfx942"]
+gpu-math = "relaxed"

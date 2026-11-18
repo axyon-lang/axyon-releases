@@ -1,0 +1,11 @@
+[package]
+name = "mut_ref_field_write"
+version = "0.1.0"
+edition = "2024"
+description = "Field writes through a &mut Struct parameter (#640)"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true

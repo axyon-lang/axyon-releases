@@ -1,0 +1,29 @@
+# Unicode Identifiers Demo (issue #2822)
+# Names follow UAX #31 (XID_Start then XID_Continue, as in Rust and Python) and
+# are normalized to NFC. Subscript digits and letters (`θ₀`, `x₁`) may continue
+# a name. Math operators (`∇`, `×`) are not identifiers. Symbols stay ASCII:
+# `def Σ` is emitted as `@_u3a3_`. `@export_c` / `@extern` names must be ASCII.
+
+struct Δ[Τ]:
+    ε: Τ
+
+struct Vec2:
+    x₁: f64
+    x₂: f64
+
+def Σ(α: f64, Δt: f64) -> f64:
+    return α + Δt
+
+def id[Τ](v: Τ) -> Τ:
+    return v
+
+def main() -> i32:
+    let θ₀: f64 = Σ(0.5, 1.5)
+    assert!(θ₀ == 2.0, "Σ")
+    let d: Δ[i32] = Δ { ε: id[i32](3) }
+    assert!(d.ε == 3, "generic parameter Τ")
+    let v: Vec2 = Vec2 { x₁: 3.0, x₂: 4.0 }
+    assert!(v.x₁ + v.x₂ == 7.0, "subscripted fields")
+    let 名前: i64 = 9
+    println!("unicode identifiers ok: {名前} {θ₀}")
+    return 0

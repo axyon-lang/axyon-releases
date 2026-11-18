@@ -1,0 +1,77 @@
+# Generic Enum Impl Demo for AXYON
+# Demonstrates inherent `impl` blocks on a generic enum (issue #844).
+#
+# `impl Maybe[T]:` resolves `T` from the enum, and every method is
+# monomorphized per instantiation (`Maybe__i32_unwrap_or`, ...). Methods can
+# `match self`, and can call sibling methods on `self` (`self.is_some()`);
+# the nested call is instantiated with the same type arguments.
+#
+# Supported: scalar, nested (`Maybe[Maybe[i32]]`) and `Vec[..]` arguments.
+# Not supported yet: a sibling-method call whose receiver is not `self`
+# (rejected with a spanned diagnostic), and user struct arguments for
+# *generic structs* (a pre-existing limitation, see
+# TODO_AND_KNOWN_LIMITATIONS.md).
+
+enum Maybe[T]:
+    Just(T)
+    Nothing
+
+impl Maybe[T]:
+    def is_just(self) -> bool:
+        match self:
+            case Maybe.Just(v):
+                return True
+            case Maybe.Nothing:
+                return False
+
+    def is_nothing(self) -> bool:
+        return not self.is_just()
+
+    def unwrap_or(self, fallback: T) -> T:
+        match self:
+            case Maybe.Just(v):
+                return v
+            case Maybe.Nothing:
+                return fallback
+
+    # `mut self` receiver (#2266): passed by address, `match self` reads in
+    # place. Only scalar payloads may be matched (owning payloads are rejected).
+    def get_or(mut self, fallback: T) -> T:
+        match self:
+            case Maybe.Just(v):
+                return v
+            case Maybe.Nothing:
+                return fallback
+
+@host
+def main() -> i32:
+    let a: Maybe[i32] = Maybe.Just(5)
+    let b: Maybe[i32] = Maybe.Nothing
+    let x: i32 = a.unwrap_or(1)
+    let y: i32 = b.unwrap_or(2)
+    println!("a.unwrap_or(1) = {x}, b.unwrap_or(2) = {y}")
+
+    let f: Maybe[f64] = Maybe.Just(1.5)
+    let z: f64 = f.unwrap_or(0.0)
+    println!("f.unwrap_or(0.0) = {z}")
+
+    let inner: Maybe[i32] = Maybe.Just(3)
+    let nested: Maybe[Maybe[i32]] = Maybe.Just(inner)
+    if nested.is_nothing():
+        println!("nested is empty")
+    else:
+        println!("nested holds a value")
+
+    let v0: Vec[i32] = Vec.new()
+    let owned: Maybe[Vec[i32]] = Maybe.Just(v0)
+    if owned.is_just():
+        println!("owned vec payload dropped once")
+    let mut m: Maybe[i64] = Maybe.Just(7)
+    let first: i64 = m.get_or(0)
+    let second: i64 = m.get_or(0)
+    assert!(first == 7, "first mut self call")
+    assert!(second == 7, "repeated mut self call on same receiver")
+    let mut n: Maybe[i64] = Maybe.Nothing
+    assert!(n.get_or(9) == 9, "mut self on empty variant")
+    println!("mut self: {first} {second}")
+    return 0

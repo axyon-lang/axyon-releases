@@ -1,0 +1,9 @@
+from .square import Square
+from .shapes import Shape
+
+def main() -> i32:
+    let sq: Square = Square { side: 3 }
+    let d: i64 = sq.double_area()
+    assert!(d == 18, "inherited default of an imported trait")
+    println!("double_area = {d}")
+    return 0

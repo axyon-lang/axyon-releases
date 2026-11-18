@@ -1,0 +1,7 @@
+# Hello World example for AXYON
+import axyon.debug as D
+
+def main() -> i32:
+    """Entry point for Hello World."""
+    D.println("Hello, world!")
+    return 0

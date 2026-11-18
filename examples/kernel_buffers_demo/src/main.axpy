@@ -1,0 +1,57 @@
+# A kernel on device buffers (issue #2382)
+#
+# With `nvptx-sm80` selected (see axyon.toml), a `@gpu(entry)` kernel borrows
+# `device_global` buffers: `&Buffer[T, (shape), device_global]` to read one,
+# `&mut Buffer[...]` to write it. Host code copies data to the device
+# (`buffer_to_device`), passes `&d` / `&mut d` to `gpu_launch`, and copies the
+# result back (`buffer_to_host`). The build embeds the kernel's PTX image in
+# the executable; `gpu_launch` loads it once, binds each buffer through the
+# CUDA runtime, launches the kernel and waits for it.
+#
+# Inside the kernel, `buffer_get` / `buffer_set` index the buffer like on the
+# host. An index outside the buffer stops the kernel, and the program ends
+# with an AXYON panic instead of touching other memory. This kernel's buffers
+# have a static shape; `examples/kernel_buffer_extents_demo` lets the length
+# be chosen at run time (#2634).
+#
+# Running it needs an NVIDIA GPU and driver; without one the first device
+# allocation stops the program with an AXYON panic.
+
+@gpu(entry)
+def saxpy(n: i64, a: f32, x: &Buffer[f32, (1024,), device_global], y: &mut Buffer[f32, (1024,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    # The grid may have more threads than elements: the tail lanes skip.
+    if i < n:
+        let xi: f32 = buffer_get(x, i)
+        let yi: f32 = buffer_get(y, i)
+        buffer_set(y, i, a * xi + yi)
+
+def main() -> i32:
+    let n: i64 = 1000
+    let mut hx: Buffer[f32, (1024,)] = buffer_alloc([1024])
+    let mut hy: Buffer[f32, (1024,)] = buffer_alloc([1024])
+    for i: i64 in range(1024):
+        buffer_set(hx, i, i as f32)
+        buffer_set(hy, i, 1.0)
+
+    # Host -> device. `buffer_to_device` takes ownership of the host buffer.
+    let dx: Buffer[f32, (1024,), device_global] = buffer_to_device(hx)
+    let mut dy: Buffer[f32, (1024,), device_global] = buffer_to_device(hy)
+
+    # 8 blocks of 128 threads cover the first 1000 elements.
+    let blocks: i64 = (n + 127) / 128
+    gpu_launch(saxpy, blocks, 128, n, 2.0, &dx, &mut dy)
+
+    # Device -> host: the download sees the kernel's writes.
+    let back: Buffer[f32, (1024,)] = buffer_to_host(dy)
+    for i: i64 in range(1024):
+        let got: f32 = buffer_get(back, i)
+        let mut want: f32 = 1.0
+        if i < n:
+            want = 2.0 * (i as f32) + 1.0
+        if got != want:
+            println!("mismatch at {i}: {got} != {want}")
+            return 1
+    let last: f32 = buffer_get(back, 999)
+    println!("saxpy on the GPU: y[999] = {last}")
+    return 0

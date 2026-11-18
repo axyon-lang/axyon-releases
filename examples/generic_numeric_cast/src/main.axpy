@@ -1,0 +1,32 @@
+# Numeric casts and literals on generic parameters (#784): `Numeric` is the
+# bound that provides `x as U` and an unsuffixed literal at type `T`.
+
+from core.marker import Numeric
+
+def widen[T: Numeric, U: Numeric](x: T) -> U:
+    return x as U
+
+def one_of[T: Numeric]() -> T:
+    let one: T = 1
+    return one
+
+def tenth[F: Numeric]() -> F:
+    let t: F = 0.1
+    return t
+
+def half[F: Numeric](x: F) -> F:
+    let y: f64 = x as f64
+    return (y * 0.5) as F
+
+@host
+def main() -> i32:
+    let a: i64 = widen[i32, i64](40)
+    let b: u8 = one_of[u8]()
+    let c: f32 = half(8.0_f32)
+    let d: i32 = one_of[i32]()
+    let t: f32 = tenth[f32]()
+    assert!((t * 10.0_f32) > 0.99_f32, "float literal at a parameter")
+    let total: i64 = a + (b as i64) + (c as i64) + (d as i64)
+    assert!(total == 46, "bounded generic casts and literals")
+    println!("total = {total}")
+    return 0

@@ -1,0 +1,14 @@
+[package]
+name = "cuda_reduction"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# Workgroup reductions run on CUDA (#2109).
+[target]
+gpu = ["nvptx-sm80"]

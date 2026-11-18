@@ -1,0 +1,1468 @@
+# Mixed-precision arithmetic, conversions and accumulation on an NVIDIA GPU
+# (issue #2111)
+#
+# Every kernel runs on the device and every result is compared bit for bit
+# (any NaN matches any NaN) with the strict host build of the same
+# expression, and, for the boundary cases, with an independent bit-pattern
+# fixture computed by exact rational arithmetic (`fixtures.py`):
+#
+# 1. Scalar arithmetic in f16, bf16, f32 and f64: `+ - * /`, `a * b + a`
+#    (two roundings, never fused), `math_sqrt`, negation, `math_fmin`/`fmax`
+#    (IEEE minimumNumber/maximumNumber) and the six comparisons, over every
+#    pair of a 20-value table per format (zeros of both signs, the smallest
+#    and largest subnormal, the smallest normal, 1 + ulp, the largest finite
+#    value, infinities, NaN) plus rounding-boundary fixtures: overflow ties,
+#    ties to even, gradual underflow (no flush to zero), cancellation,
+#    division by zero, invalid operations and signed zeros. Each operation
+#    is rounded once to its own type (numeric contract §7 rule 2).
+# 2. Conversions (`as`) from f16, bf16, f32, f64, i64 and u64 to all four
+#    float and eight integer types: float -> int truncates toward zero and
+#    saturates (NaN -> 0), int -> int wraps, every conversion to a float
+#    rounds once to nearest even (f64 -> bf16 and i64/u64 -> bf16 included,
+#    where a route through f32 would round twice). Each result is widened
+#    exactly (`as f64` / `as i64`) before it is stored.
+# 3. Explicit mixed accumulation: f16 and bf16 inputs accumulated in an f32
+#    accumulator (`acc = acc + (a as f32) * (b as f32)`, a dense matmul,
+#    untiled and through the #2110 workgroup-memory tiles with barriers, and
+#    row sums; a #2109 workgroup sum of `x as f32` in the strict tier, the
+#    #2680 sequential order), against the same reduction
+#    with a rounded f16 accumulator, which stalls at 2048 on a row of 4096
+#    ones. Mixing is never implicit: `f16 + f32` is a type error (AX0556).
+# 4. Constant/runtime agreement: compile-time folded f16/bf16/f32/f64
+#    expressions equal the GPU's results for the same operands.
+#
+# Strict math only: no fast math, no `.ftz`, no `.approx`, no contraction,
+# no TF32 (an NVIDIA device rejects relaxed host math at build time).
+
+const BLOCK: i64 = 128
+
+def blocks_for(n: i64) -> i64:
+    return (n + BLOCK - 1) / BLOCK
+
+# The same value: equal bit patterns, or both NaN (payloads are not part of
+# the contract). The bits keep the sign of zero.
+def same(x: f64, y: f64) -> bool:
+    if x != x:
+        return y != y
+    return x.to_bits() == y.to_bits()
+
+# `same`, except for the one variation the contract permits: `math_fmin`
+# (op 7) and `math_fmax` (op 8) are C `fmin`/`fmax` (IEEE minNum/maxNum),
+# which leave the sign of the result unspecified only when the operands
+# `xa`, `xb` are a `+0`/`-0` tie (the NVIDIA `min`/`max` instructions order
+# `-0 < +0`, x86 `minsd` returns an operand). Then both results must still
+# be zeros. Same-sign zero operands, a zero and a nonzero operand, every
+# other op, every NaN rule and every nonzero result stay exact. The
+# `min`/`max` builtins, which do order the zeros (numeric contract §5.3a),
+# are host-only today.
+def same_op(op: i64, xa: f64, xb: f64, x: f64, y: f64) -> bool:
+    if op >= 7 and xa == 0.0 and xb == 0.0 and xa.to_bits() != xb.to_bits():
+        return x == 0.0 and y == 0.0
+    return same(x, y)
+
+# The comparison must reject what the contract does not permit: a
+# zero-sign difference of `math_fmin`/`math_fmax` with same-sign zero
+# operands or a zero and a nonzero operand, and any sign difference of
+# another op. Returns the number of wrong verdicts.
+def check_same_op() -> i64:
+    let pz: f64 = 0.0
+    let nz: f64 = -0.0
+    let mut bad: i64 = 0
+    # Permitted: a +0/-0 operand tie, in either order, returns either zero.
+    if not same_op(7, pz, nz, pz, nz):
+        bad = bad + report("same_op (+0/-0 tie)", 7, 0, pz, nz)
+    if not same_op(8, nz, pz, nz, pz):
+        bad = bad + report("same_op (-0/+0 tie)", 8, 1, nz, pz)
+    # Even a tie must return a zero.
+    if same_op(7, pz, nz, 1.0, pz):
+        bad = bad + report("same_op (tie, nonzero result)", 7, 2, 1.0, pz)
+    # Same-sign zero operands: the sign is determined.
+    if same_op(7, nz, nz, pz, nz):
+        bad = bad + report("same_op (-0/-0)", 7, 3, pz, nz)
+    if same_op(8, pz, pz, nz, pz):
+        bad = bad + report("same_op (+0/+0)", 8, 4, nz, pz)
+    # A zero and a nonzero operand: `math_fmin(-0.0, 1.0)` is `-0.0`.
+    if same_op(7, nz, 1.0, pz, nz):
+        bad = bad + report("same_op (-0/1)", 7, 5, pz, nz)
+    if same_op(8, pz, -1.0, nz, pz):
+        bad = bad + report("same_op (+0/-1)", 8, 6, nz, pz)
+    # Another op with a +0/-0 tie stays exact (`+0 - -0` is `+0`).
+    if same_op(1, pz, nz, nz, pz):
+        bad = bad + report("same_op (sub tie)", 1, 7, nz, pz)
+    return bad
+
+# Print the first mismatches of a check; returns 1 (one mismatch).
+def report(what: str, op: i64, i: i64, got: f64, want: f64) -> i64:
+    println!("{what} mismatch: op {op} lane {i}: got {got}, want {want}")
+    return 1
+
+# Output sentinels: lanes past `n` keep them.
+def fill_f64(n: i64) -> Buffer[f64, (512,)]:
+    let mut b: Buffer[f64, (512,)] = buffer_alloc([512])
+    for i: i64 in range(n):
+        buffer_set(b, i, -7.0)
+    return b
+
+def fill_i64(n: i64) -> Buffer[i64, (1024,)]:
+    let mut b: Buffer[i64, (1024,)] = buffer_alloc([1024])
+    for i: i64 in range(n):
+        buffer_set(b, i, -7)
+    return b
+
+
+# BEGIN FIXTURES (generated by fixtures.py; do not edit by hand)
+def fx_table_f16(i: i64) -> u64:
+    let t: Array[u64; 20] = [0_u64, 9223372036854775808_u64, 4499096027743125504_u64, 4544123227923808256_u64, 4544132024016830464_u64, 4602678819172646912_u64, 4607182418800017408_u64, 4607186816846528512_u64, 4609434218613702656_u64, 4613937818241073152_u64, 13836183955189006336_u64, 4591868420848353280_u64, 4652007308841189376_u64, 4656722014701092864_u64, 4679235614791434240_u64, 13902607651646210048_u64, 9218868437227405312_u64, 18442240474082181120_u64, 9221120237041090560_u64, 4614254477589872640_u64]
+    return t[i]
+def fx_table_bf16(i: i64) -> u64:
+    let t: Array[u64; 20] = [0_u64, 9223372036854775808_u64, 4008203668359741440_u64, 4039658497007157248_u64, 4039728865751334912_u64, 4602678819172646912_u64, 4607182418800017408_u64, 4607217603172106240_u64, 4609434218613702656_u64, 4613937818241073152_u64, 13836183955189006336_u64, 4591877216941375488_u64, 4652007308841189376_u64, 4643211215818981376_u64, 5183607986731352064_u64, 14406980023586127872_u64, 9218868437227405312_u64, 18442240474082181120_u64, 9221120237041090560_u64, 4614254477589872640_u64]
+    return t[i]
+def fx_table_f32(i: i64) -> u64:
+    let t: Array[u64; 20] = [0_u64, 9223372036854775808_u64, 3936146074321813504_u64, 4039728864677593088_u64, 4039728865751334912_u64, 4602678819172646912_u64, 4607182418800017408_u64, 4607182419336888320_u64, 4609434218613702656_u64, 4613937818241073152_u64, 13836183955189006336_u64, 4591870180174331904_u64, 4652007308841189376_u64, 4715268809856909312_u64, 5183643170566569984_u64, 14407015207421345792_u64, 9218868437227405312_u64, 18442240474082181120_u64, 9221120237041090560_u64, 4614256656748904448_u64]
+    return t[i]
+def fx_table_f64(i: i64) -> u64:
+    let t: Array[u64; 20] = [0_u64, 9223372036854775808_u64, 1_u64, 4503599627370495_u64, 4503599627370496_u64, 4602678819172646912_u64, 4607182418800017408_u64, 4607182418800017409_u64, 4609434218613702656_u64, 4613937818241073152_u64, 13836183955189006336_u64, 4591870180066957722_u64, 4652007308841189376_u64, 4715268809856909312_u64, 9218868437227405311_u64, 18442240474082181119_u64, 9218868437227405312_u64, 18442240474082181120_u64, 9221120237041090560_u64, 4614256656552045848_u64]
+    return t[i]
+def fx_int_table(i: i64) -> u64:
+    let t: Array[u64; 22] = [0_u64, 1_u64, 18446744073709551615_u64, 127_u64, 128_u64, 18446744073709551488_u64, 18446744073709551487_u64, 255_u64, 256_u64, 32767_u64, 32768_u64, 18446744073709518847_u64, 65504_u64, 65519_u64, 65520_u64, 16777217_u64, 2147483647_u64, 2147483648_u64, 18446744071562067967_u64, 9007199254740993_u64, 9223372036854775807_u64, 9223372036854775808_u64]
+    return t[i]
+def fx_uint_table(i: i64) -> u64:
+    let t: Array[u64; 10] = [0_u64, 1_u64, 255_u64, 65535_u64, 4294967295_u64, 4294967296_u64, 9007199254740993_u64, 9223372036854775808_u64, 18446744073709551615_u64, 18446742974197923840_u64]
+    return t[i]
+const N_ARITH_FIX: i64 = 91
+def fx_arith_fmt(i: i64) -> i64:
+    let t: Array[i64; 91] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+    return t[i]
+def fx_arith_op(i: i64) -> i64:
+    let t: Array[i64; 91] = [0, 0, 2, 0, 0, 2, 2, 1, 3, 2, 1, 3, 3, 5, 4, 0, 0, 1, 2, 3, 3, 3, 3, 2, 1, 0, 5, 5, 6, 6, 7, 7, 8, 7, 8, 7, 0, 0, 2, 0, 0, 2, 2, 1, 3, 2, 1, 3, 3, 5, 4, 0, 0, 1, 2, 3, 3, 3, 3, 2, 1, 0, 5, 5, 6, 6, 7, 7, 8, 7, 8, 7, 3, 5, 2, 1, 0, 3, 0, 3, 3, 5, 2, 2, 1, 0, 0, 4, 3, 2, 3]
+    return t[i]
+def fx_arith_a(i: i64) -> u64:
+    let t: Array[u64; 91] = [4679235614791434240_u64, 4679235614791434240_u64, 4679235614791434240_u64, 4607182418800017408_u64, 4607182418800017408_u64, 4499096027743125504_u64, 4499096027743125504_u64, 4544132024016830464_u64, 4544132024016830464_u64, 4544132024016830464_u64, 4607186816846528512_u64, 4607182418800017408_u64, 4611686018427387904_u64, 4611686018427387904_u64, 4607186816846528512_u64, 0_u64, 9223372036854775808_u64, 4607182418800017408_u64, 13830554455654793216_u64, 4607182418800017408_u64, 13830554455654793216_u64, 4607182418800017408_u64, 0_u64, 9218868437227405312_u64, 9218868437227405312_u64, 9218868437227405312_u64, 13830554455654793216_u64, 9223372036854775808_u64, 0_u64, 18442240474082181120_u64, 0_u64, 9223372036854775808_u64, 9223372036854775808_u64, 9221120237041090560_u64, 13830554455654793216_u64, 9221120237041090560_u64, 5183607986731352064_u64, 5183607986731352064_u64, 5183607986731352064_u64, 4607182418800017408_u64, 4607182418800017408_u64, 4008203668359741440_u64, 4008203668359741440_u64, 4039728865751334912_u64, 4039728865751334912_u64, 4039728865751334912_u64, 4607217603172106240_u64, 4607182418800017408_u64, 4611686018427387904_u64, 4611686018427387904_u64, 4607217603172106240_u64, 0_u64, 9223372036854775808_u64, 4607182418800017408_u64, 13830554455654793216_u64, 4607182418800017408_u64, 13830554455654793216_u64, 4607182418800017408_u64, 0_u64, 9218868437227405312_u64, 9218868437227405312_u64, 9218868437227405312_u64, 13830554455654793216_u64, 9223372036854775808_u64, 0_u64, 18442240474082181120_u64, 0_u64, 9223372036854775808_u64, 9223372036854775808_u64, 9221120237041090560_u64, 13830554455654793216_u64, 9221120237041090560_u64, 4607182418800017408_u64, 4611686018427387904_u64, 3936146074321813504_u64, 4039728865751334912_u64, 5183643170566569984_u64, 0_u64, 9223372036854775808_u64, 4607182418800017408_u64, 4611686018427387904_u64, 4611686018427387904_u64, 1_u64, 1_u64, 4503599627370496_u64, 4607182418800017408_u64, 4607182418800017408_u64, 4607182418800017409_u64, 4607182418800017408_u64, 13830554455654793216_u64, 0_u64]
+    return t[i]
+def fx_arith_b(i: i64) -> u64:
+    let t: Array[u64; 91] = [4625196817309499392_u64, 4620693217682128896_u64, 4611686018427387904_u64, 4557642822898941952_u64, 4564398222339997696_u64, 4602678819172646912_u64, 4609434218613702656_u64, 4499096027743125504_u64, 4616189618054758400_u64, 4604930618986332160_u64, 4607182418800017408_u64, 4613937818241073152_u64, 4613937818241073152_u64, 0_u64, 4607186816846528512_u64, 9223372036854775808_u64, 9223372036854775808_u64, 4607182418800017408_u64, 0_u64, 0_u64, 0_u64, 9223372036854775808_u64, 0_u64, 0_u64, 9218868437227405312_u64, 13830554455654793216_u64, 0_u64, 0_u64, 0_u64, 0_u64, 9223372036854775808_u64, 0_u64, 0_u64, 4607182418800017408_u64, 9221120237041090560_u64, 9221120237041090560_u64, 5143110774457106432_u64, 5138607174829735936_u64, 4611686018427387904_u64, 4571153621781053440_u64, 4577909021222109184_u64, 4602678819172646912_u64, 4609434218613702656_u64, 4008203668359741440_u64, 4616189618054758400_u64, 4604930618986332160_u64, 4607182418800017408_u64, 4613937818241073152_u64, 4613937818241073152_u64, 0_u64, 4607217603172106240_u64, 9223372036854775808_u64, 9223372036854775808_u64, 4607182418800017408_u64, 0_u64, 0_u64, 0_u64, 9223372036854775808_u64, 0_u64, 0_u64, 9218868437227405312_u64, 13830554455654793216_u64, 0_u64, 0_u64, 0_u64, 0_u64, 9223372036854775808_u64, 0_u64, 0_u64, 4607182418800017408_u64, 9221120237041090560_u64, 9221120237041090560_u64, 4613937818241073152_u64, 0_u64, 4602678819172646912_u64, 3936146074321813504_u64, 5071053180419178496_u64, 0_u64, 9223372036854775808_u64, 4613937818241073152_u64, 4613937818241073152_u64, 0_u64, 4602678819172646912_u64, 4609434218613702656_u64, 1_u64, 4368491638549381120_u64, 4375247037990436864_u64, 4607182418800017409_u64, 0_u64, 0_u64, 0_u64]
+    return t[i]
+def fx_arith_expect(i: i64) -> u64:
+    let t: Array[u64; 91] = [9218868437227405312_u64, 4679235614791434240_u64, 9218868437227405312_u64, 4607182418800017408_u64, 4607191214893039616_u64, 0_u64, 4503599627370496000_u64, 4544123227923808256_u64, 4535124824762089472_u64, 4541880224203145216_u64, 4562146422526312448_u64, 4599674953405562880_u64, 4604178553032933376_u64, 4609047190520725504_u64, 4611694814520410112_u64, 0_u64, 9223372036854775808_u64, 0_u64, 9223372036854775808_u64, 9218868437227405312_u64, 18442240474082181120_u64, 18442240474082181120_u64, 9221120237041090560_u64, 9221120237041090560_u64, 9221120237041090560_u64, 9218868437227405312_u64, 9221120237041090560_u64, 9223372036854775808_u64, 9223372036854775808_u64, 9218868437227405312_u64, 9223372036854775808_u64, 9223372036854775808_u64, 0_u64, 4607182418800017408_u64, 13830554455654793216_u64, 9221120237041090560_u64, 9218868437227405312_u64, 5183607986731352064_u64, 9218868437227405312_u64, 4607182418800017408_u64, 4607252787544195072_u64, 0_u64, 4012707267987111936_u64, 4039658497007157248_u64, 4030721666496593920_u64, 4037477065937649664_u64, 4575657221408423936_u64, 4599688147545096192_u64, 4604191747172466688_u64, 4609047190520725504_u64, 4611756387171565568_u64, 0_u64, 9223372036854775808_u64, 0_u64, 9223372036854775808_u64, 9218868437227405312_u64, 18442240474082181120_u64, 18442240474082181120_u64, 9221120237041090560_u64, 9221120237041090560_u64, 9221120237041090560_u64, 9218868437227405312_u64, 9221120237041090560_u64, 9223372036854775808_u64, 9223372036854775808_u64, 9218868437227405312_u64, 9223372036854775808_u64, 9223372036854775808_u64, 0_u64, 4607182418800017408_u64, 13830554455654793216_u64, 9221120237041090560_u64, 4599676419600023552_u64, 4609047870736171008_u64, 0_u64, 4039728864677593088_u64, 9218868437227405312_u64, 9221120237041090560_u64, 9223372036854775808_u64, 4599676419421066581_u64, 4604180019048437077_u64, 4609047870845172685_u64, 0_u64, 2_u64, 4503599627370495_u64, 4607182418800017408_u64, 4607182418800017410_u64, 4611686018427387906_u64, 9218868437227405312_u64, 9223372036854775808_u64, 9221120237041090560_u64]
+    return t[i]
+const N_CVT_FIX: i64 = 77
+def fx_cvt_src(i: i64) -> i64:
+    let t: Array[i64; 77] = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5]
+    return t[i]
+def fx_cvt_dst(i: i64) -> i64:
+    let t: Array[i64; 77] = [8, 8, 8, 8, 8, 8, 5, 5, 5, 4, 7, 6, 9, 11, 10, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 3, 0, 1, 2, 2, 2, 2, 0, 8, 10, 11, 9, 2, 3, 8, 8, 8, 5, 5, 4, 1, 1, 0, 0, 0, 2, 10, 7, 1, 1, 0, 0, 0, 2, 2, 3, 3, 4, 4, 5, 6, 7, 8, 9, 11, 2, 1, 0, 3, 10, 4]
+    return t[i]
+def fx_cvt_in(i: i64) -> u64:
+    let t: Array[u64; 77] = [4748581863621132288_u64, 13971953900475908096_u64, 9221120237041090560_u64, 9218868437227405312_u64, 13828302655841107968_u64, 4612811918334230528_u64, 13830554455654793216_u64, 4643985272004935680_u64, 4643202419725959168_u64, 13864612927836782592_u64, 4679546776582094848_u64, 13899102408576860160_u64, 18442240474082181120_u64, 4906019910204099648_u64, 14114660445051763968_u64, 4679237813814689792_u64, 4679237676375736320_u64, 4494592428115755008_u64, 4496844227929440256_u64, 4607184617823272960_u64, 4607184618360143872_u64, 4607200010986061824_u64, 4607200011522932736_u64, 4003700068732370944_u64, 9223372036854775808_u64, 9221120237041090560_u64, 3936146074321813504_u64, 4607184617823277056_u64, 4607200010990256128_u64, 4607182419068452864_u64, 9094988921128908188_u64, 3931642474694443008_u64, 3933894274508128256_u64, 4679237813814689792_u64, 4746794007247454208_u64, 4890946611321988160_u64, 13840687554816376832_u64, 4751297606875873280_u64, 4499096027743125504_u64, 13767504060871606272_u64, 4679235614791434240_u64, 9218868437227405312_u64, 9221120237041090560_u64, 4643985272004935680_u64, 13830554455654793216_u64, 13864612927836782592_u64, 4607186816846528512_u64, 4679235614791434240_u64, 4517110426252607488_u64, 4472074429978902528_u64, 4697254411347427328_u64, 4008203668359741440_u64, 14145806429570727936_u64, 4679240012837945344_u64, 16842753_u64, 4311744513_u64, 65520_u64, 65519_u64, 18446744073709549567_u64, 16777217_u64, 16777219_u64, 9007199254740993_u64, 9223372036854775808_u64, 300_u64, 18446744073709551487_u64, 18446744073709551615_u64, 40000_u64, 18446744073709551615_u64, 4294967301_u64, 18446744073709551614_u64, 18446744073709551615_u64, 18446744073709551615_u64, 9259400833873739777_u64, 18446744073709551615_u64, 18446744073709551615_u64, 9223372036854775808_u64, 255_u64]
+    return t[i]
+def fx_cvt_expect(i: i64) -> u64:
+    let t: Array[u64; 77] = [2147483647_u64, 18446744071562067968_u64, 0_u64, 2147483647_u64, 0_u64, 2_u64, 0_u64, 255_u64, 255_u64, 18446744073709551488_u64, 65535_u64, 18446744073709518848_u64, 0_u64, 18446744073709551615_u64, 9223372036854775808_u64, 9218868437227405312_u64, 4679235614791434240_u64, 0_u64, 4499096027743125504_u64, 4607182418800017408_u64, 4607186816846528512_u64, 4607182418800017408_u64, 4607217603172106240_u64, 0_u64, 9223372036854775808_u64, 9221120237041090560_u64, 3936146074321813504_u64, 4607186816846528512_u64, 4607217603172106240_u64, 4607182418800017408_u64, 9218868437227405312_u64, 0_u64, 3936146074321813504_u64, 9218868437227405312_u64, 2147483647_u64, 9223372036854775807_u64, 0_u64, 4294967295_u64, 4499096027743125504_u64, 13767504060871606272_u64, 65504_u64, 2147483647_u64, 0_u64, 255_u64, 0_u64, 18446744073709551488_u64, 4607182418800017408_u64, 4679240012837945344_u64, 4517110426252607488_u64, 0_u64, 9218868437227405312_u64, 4008203668359741440_u64, 9223372036854775808_u64, 65535_u64, 4715303994228998144_u64, 4751332791247962112_u64, 9218868437227405312_u64, 4679235614791434240_u64, 13880094051555868672_u64, 4715268809856909312_u64, 4715268810930651136_u64, 4845873199050653696_u64, 14114281232179134464_u64, 44_u64, 127_u64, 255_u64, 18446744073709526080_u64, 65535_u64, 5_u64, 4294967294_u64, 18446744073709551615_u64, 4895412794951729152_u64, 4890944379696447488_u64, 9218868437227405312_u64, 4895412794951729152_u64, 9223372036854775808_u64, 18446744073709551615_u64]
+    return t[i]
+# END FIXTURES
+
+# ---- Section 1: scalar arithmetic, one rounding per operation ----
+
+@gpu(entry)
+def arith_f16(n: i64, a: &Buffer[f16, (512,), device_global], b: &Buffer[f16, (512,), device_global], out: &mut Buffer[f16, (4608,), device_global], cmp: &mut Buffer[i32, (512,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let x: f16 = buffer_get(a, i)
+        let y: f16 = buffer_get(b, i)
+        buffer_set(out, i, x + y)
+        buffer_set(out, 512 + i, x - y)
+        buffer_set(out, 1024 + i, x * y)
+        buffer_set(out, 1536 + i, x / y)
+        buffer_set(out, 2048 + i, x * y + x)
+        buffer_set(out, 2560 + i, math_sqrt(x))
+        buffer_set(out, 3072 + i, -x)
+        buffer_set(out, 3584 + i, math_fmin(x, y))
+        buffer_set(out, 4096 + i, math_fmax(x, y))
+        let mut c: i32 = 0
+        if x < y:
+            c = c + 1
+        if x <= y:
+            c = c + 2
+        if x == y:
+            c = c + 4
+        if x != y:
+            c = c + 8
+        if x > y:
+            c = c + 16
+        if x >= y:
+            c = c + 32
+        buffer_set(cmp, i, c)
+
+@gpu(entry)
+def arith_bf16(n: i64, a: &Buffer[bf16, (512,), device_global], b: &Buffer[bf16, (512,), device_global], out: &mut Buffer[bf16, (4608,), device_global], cmp: &mut Buffer[i32, (512,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let x: bf16 = buffer_get(a, i)
+        let y: bf16 = buffer_get(b, i)
+        buffer_set(out, i, x + y)
+        buffer_set(out, 512 + i, x - y)
+        buffer_set(out, 1024 + i, x * y)
+        buffer_set(out, 1536 + i, x / y)
+        buffer_set(out, 2048 + i, x * y + x)
+        buffer_set(out, 2560 + i, math_sqrt(x))
+        buffer_set(out, 3072 + i, -x)
+        buffer_set(out, 3584 + i, math_fmin(x, y))
+        buffer_set(out, 4096 + i, math_fmax(x, y))
+        let mut c: i32 = 0
+        if x < y:
+            c = c + 1
+        if x <= y:
+            c = c + 2
+        if x == y:
+            c = c + 4
+        if x != y:
+            c = c + 8
+        if x > y:
+            c = c + 16
+        if x >= y:
+            c = c + 32
+        buffer_set(cmp, i, c)
+
+@gpu(entry)
+def arith_f32(n: i64, a: &Buffer[f32, (512,), device_global], b: &Buffer[f32, (512,), device_global], out: &mut Buffer[f32, (4608,), device_global], cmp: &mut Buffer[i32, (512,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let x: f32 = buffer_get(a, i)
+        let y: f32 = buffer_get(b, i)
+        buffer_set(out, i, x + y)
+        buffer_set(out, 512 + i, x - y)
+        buffer_set(out, 1024 + i, x * y)
+        buffer_set(out, 1536 + i, x / y)
+        buffer_set(out, 2048 + i, x * y + x)
+        buffer_set(out, 2560 + i, math_sqrt(x))
+        buffer_set(out, 3072 + i, -x)
+        buffer_set(out, 3584 + i, math_fmin(x, y))
+        buffer_set(out, 4096 + i, math_fmax(x, y))
+        let mut c: i32 = 0
+        if x < y:
+            c = c + 1
+        if x <= y:
+            c = c + 2
+        if x == y:
+            c = c + 4
+        if x != y:
+            c = c + 8
+        if x > y:
+            c = c + 16
+        if x >= y:
+            c = c + 32
+        buffer_set(cmp, i, c)
+
+@gpu(entry)
+def arith_f64(n: i64, a: &Buffer[f64, (512,), device_global], b: &Buffer[f64, (512,), device_global], out: &mut Buffer[f64, (4608,), device_global], cmp: &mut Buffer[i32, (512,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let x: f64 = buffer_get(a, i)
+        let y: f64 = buffer_get(b, i)
+        buffer_set(out, i, x + y)
+        buffer_set(out, 512 + i, x - y)
+        buffer_set(out, 1024 + i, x * y)
+        buffer_set(out, 1536 + i, x / y)
+        buffer_set(out, 2048 + i, x * y + x)
+        buffer_set(out, 2560 + i, math_sqrt(x))
+        buffer_set(out, 3072 + i, -x)
+        buffer_set(out, 3584 + i, math_fmin(x, y))
+        buffer_set(out, 4096 + i, math_fmax(x, y))
+        let mut c: i32 = 0
+        if x < y:
+            c = c + 1
+        if x <= y:
+            c = c + 2
+        if x == y:
+            c = c + 4
+        if x != y:
+            c = c + 8
+        if x > y:
+            c = c + 16
+        if x >= y:
+            c = c + 32
+        buffer_set(cmp, i, c)
+
+# The strict host result of every op on `(x, y)`, stored at lane `i`.
+def ref_arith_f16(x: f16, y: f16, i: i64, out: Buffer[f16, (4608,)]) -> Buffer[f16, (4608,)]:
+    let mut o: Buffer[f16, (4608,)] = out
+    buffer_set(o, i, x + y)
+    buffer_set(o, 512 + i, x - y)
+    buffer_set(o, 1024 + i, x * y)
+    buffer_set(o, 1536 + i, x / y)
+    buffer_set(o, 2048 + i, x * y + x)
+    buffer_set(o, 2560 + i, math_sqrt(x))
+    buffer_set(o, 3072 + i, -x)
+    buffer_set(o, 3584 + i, math_fmin(x, y))
+    buffer_set(o, 4096 + i, math_fmax(x, y))
+    return o
+
+# The six comparisons of `(x, y)` as bits (1 <, 2 <=, 4 ==, 8 !=, 16 >, 32 >=).
+def ref_cmp_f16(x: f16, y: f16) -> i32:
+    let mut c: i32 = 0
+    if x < y:
+        c = c + 1
+    if x <= y:
+        c = c + 2
+    if x == y:
+        c = c + 4
+    if x != y:
+        c = c + 8
+    if x > y:
+        c = c + 16
+    if x >= y:
+        c = c + 32
+    return c
+
+# The strict host result of every op on `(x, y)`, stored at lane `i`.
+def ref_arith_bf16(x: bf16, y: bf16, i: i64, out: Buffer[bf16, (4608,)]) -> Buffer[bf16, (4608,)]:
+    let mut o: Buffer[bf16, (4608,)] = out
+    buffer_set(o, i, x + y)
+    buffer_set(o, 512 + i, x - y)
+    buffer_set(o, 1024 + i, x * y)
+    buffer_set(o, 1536 + i, x / y)
+    buffer_set(o, 2048 + i, x * y + x)
+    buffer_set(o, 2560 + i, math_sqrt(x))
+    buffer_set(o, 3072 + i, -x)
+    buffer_set(o, 3584 + i, math_fmin(x, y))
+    buffer_set(o, 4096 + i, math_fmax(x, y))
+    return o
+
+# The six comparisons of `(x, y)` as bits (1 <, 2 <=, 4 ==, 8 !=, 16 >, 32 >=).
+def ref_cmp_bf16(x: bf16, y: bf16) -> i32:
+    let mut c: i32 = 0
+    if x < y:
+        c = c + 1
+    if x <= y:
+        c = c + 2
+    if x == y:
+        c = c + 4
+    if x != y:
+        c = c + 8
+    if x > y:
+        c = c + 16
+    if x >= y:
+        c = c + 32
+    return c
+
+# The strict host result of every op on `(x, y)`, stored at lane `i`.
+def ref_arith_f32(x: f32, y: f32, i: i64, out: Buffer[f32, (4608,)]) -> Buffer[f32, (4608,)]:
+    let mut o: Buffer[f32, (4608,)] = out
+    buffer_set(o, i, x + y)
+    buffer_set(o, 512 + i, x - y)
+    buffer_set(o, 1024 + i, x * y)
+    buffer_set(o, 1536 + i, x / y)
+    buffer_set(o, 2048 + i, x * y + x)
+    buffer_set(o, 2560 + i, math_sqrt(x))
+    buffer_set(o, 3072 + i, -x)
+    buffer_set(o, 3584 + i, math_fmin(x, y))
+    buffer_set(o, 4096 + i, math_fmax(x, y))
+    return o
+
+# The six comparisons of `(x, y)` as bits (1 <, 2 <=, 4 ==, 8 !=, 16 >, 32 >=).
+def ref_cmp_f32(x: f32, y: f32) -> i32:
+    let mut c: i32 = 0
+    if x < y:
+        c = c + 1
+    if x <= y:
+        c = c + 2
+    if x == y:
+        c = c + 4
+    if x != y:
+        c = c + 8
+    if x > y:
+        c = c + 16
+    if x >= y:
+        c = c + 32
+    return c
+
+# The strict host result of every op on `(x, y)`, stored at lane `i`.
+def ref_arith_f64(x: f64, y: f64, i: i64, out: Buffer[f64, (4608,)]) -> Buffer[f64, (4608,)]:
+    let mut o: Buffer[f64, (4608,)] = out
+    buffer_set(o, i, x + y)
+    buffer_set(o, 512 + i, x - y)
+    buffer_set(o, 1024 + i, x * y)
+    buffer_set(o, 1536 + i, x / y)
+    buffer_set(o, 2048 + i, x * y + x)
+    buffer_set(o, 2560 + i, math_sqrt(x))
+    buffer_set(o, 3072 + i, -x)
+    buffer_set(o, 3584 + i, math_fmin(x, y))
+    buffer_set(o, 4096 + i, math_fmax(x, y))
+    return o
+
+# The six comparisons of `(x, y)` as bits (1 <, 2 <=, 4 ==, 8 !=, 16 >, 32 >=).
+def ref_cmp_f64(x: f64, y: f64) -> i32:
+    let mut c: i32 = 0
+    if x < y:
+        c = c + 1
+    if x <= y:
+        c = c + 2
+    if x == y:
+        c = c + 4
+    if x != y:
+        c = c + 8
+    if x > y:
+        c = c + 16
+    if x >= y:
+        c = c + 32
+    return c
+
+# Every op over every pair of the `f16` table plus the `f16` fixture lanes.
+def check_arith_f16() -> i64:
+    let mut a: Buffer[f16, (512,)] = buffer_alloc([512])
+    let mut b: Buffer[f16, (512,)] = buffer_alloc([512])
+    let mut want: Buffer[f16, (4608,)] = buffer_alloc([4608])
+    let mut wcmp: Buffer[i32, (512,)] = buffer_alloc([512])
+    let mut sentinel: Buffer[f16, (4608,)] = buffer_alloc([4608])
+    let mut csentinel: Buffer[i32, (512,)] = buffer_alloc([512])
+    let mut n: i64 = 0
+    for p: i64 in range(20):
+        for q: i64 in range(20):
+            let x: f16 = f64.from_bits(fx_table_f16(p)) as f16
+            let y: f16 = f64.from_bits(fx_table_f16(q)) as f16
+            buffer_set(a, n, x)
+            buffer_set(b, n, y)
+            want = ref_arith_f16(x, y, n, want)
+            buffer_set(wcmp, n, ref_cmp_f16(x, y))
+            n = n + 1
+    let first_fix: i64 = n
+    for f: i64 in range(N_ARITH_FIX):
+        if fx_arith_fmt(f) == 0:
+            let x: f16 = f64.from_bits(fx_arith_a(f)) as f16
+            let y: f16 = f64.from_bits(fx_arith_b(f)) as f16
+            buffer_set(a, n, x)
+            buffer_set(b, n, y)
+            want = ref_arith_f16(x, y, n, want)
+            buffer_set(wcmp, n, ref_cmp_f16(x, y))
+            n = n + 1
+    let da: Buffer[f16, (512,), device_global] = buffer_to_device(a)
+    let db: Buffer[f16, (512,), device_global] = buffer_to_device(b)
+    let mut dout: Buffer[f16, (4608,), device_global] = buffer_to_device(sentinel)
+    let mut dcmp: Buffer[i32, (512,), device_global] = buffer_to_device(csentinel)
+    gpu_launch(arith_f16, blocks_for(n), BLOCK, n, &da, &db, &mut dout, &mut dcmp)
+    let got: Buffer[f16, (4608,)] = buffer_to_host(dout)
+    let gcmp: Buffer[i32, (512,)] = buffer_to_host(dcmp)
+    # The operands, for the `math_fmin`/`math_fmax` zero-tie rule (`a` and
+    # `b` moved to the device).
+    let xa: Buffer[f16, (512,)] = buffer_to_host(da)
+    let xb: Buffer[f16, (512,)] = buffer_to_host(db)
+    let mut bad: i64 = 0
+    for op: i64 in range(9):
+        for i: i64 in range(n):
+            let g: f64 = buffer_get(got, op * 512 + i) as f64
+            let w: f64 = buffer_get(want, op * 512 + i) as f64
+            if not same_op(op, buffer_get(xa, i) as f64, buffer_get(xb, i) as f64, g, w):
+                bad = bad + report("f16", op, i, g, w)
+    for i: i64 in range(n):
+        if buffer_get(gcmp, i) != buffer_get(wcmp, i):
+            bad = bad + report("f16 compare", 0, i, 0.0, 1.0)
+    # The independent fixtures: the GPU and the host must both give the
+    # exact-rational result.
+    let mut k: i64 = first_fix
+    for f: i64 in range(N_ARITH_FIX):
+        if fx_arith_fmt(f) == 0:
+            let e: f64 = f64.from_bits(fx_arith_expect(f))
+            let g: f64 = buffer_get(got, fx_arith_op(f) * 512 + k) as f64
+            let w: f64 = buffer_get(want, fx_arith_op(f) * 512 + k) as f64
+            if not same_op(fx_arith_op(f), buffer_get(xa, k) as f64, buffer_get(xb, k) as f64, g, e):
+                bad = bad + report("f16 fixture (gpu)", fx_arith_op(f), f, g, e)
+            if not same_op(fx_arith_op(f), buffer_get(xa, k) as f64, buffer_get(xb, k) as f64, w, e):
+                bad = bad + report("f16 fixture (host)", fx_arith_op(f), f, w, e)
+            k = k + 1
+    return bad
+
+# Every op over every pair of the `bf16` table plus the `bf16` fixture lanes.
+def check_arith_bf16() -> i64:
+    let mut a: Buffer[bf16, (512,)] = buffer_alloc([512])
+    let mut b: Buffer[bf16, (512,)] = buffer_alloc([512])
+    let mut want: Buffer[bf16, (4608,)] = buffer_alloc([4608])
+    let mut wcmp: Buffer[i32, (512,)] = buffer_alloc([512])
+    let mut sentinel: Buffer[bf16, (4608,)] = buffer_alloc([4608])
+    let mut csentinel: Buffer[i32, (512,)] = buffer_alloc([512])
+    let mut n: i64 = 0
+    for p: i64 in range(20):
+        for q: i64 in range(20):
+            let x: bf16 = f64.from_bits(fx_table_bf16(p)) as bf16
+            let y: bf16 = f64.from_bits(fx_table_bf16(q)) as bf16
+            buffer_set(a, n, x)
+            buffer_set(b, n, y)
+            want = ref_arith_bf16(x, y, n, want)
+            buffer_set(wcmp, n, ref_cmp_bf16(x, y))
+            n = n + 1
+    let first_fix: i64 = n
+    for f: i64 in range(N_ARITH_FIX):
+        if fx_arith_fmt(f) == 1:
+            let x: bf16 = f64.from_bits(fx_arith_a(f)) as bf16
+            let y: bf16 = f64.from_bits(fx_arith_b(f)) as bf16
+            buffer_set(a, n, x)
+            buffer_set(b, n, y)
+            want = ref_arith_bf16(x, y, n, want)
+            buffer_set(wcmp, n, ref_cmp_bf16(x, y))
+            n = n + 1
+    let da: Buffer[bf16, (512,), device_global] = buffer_to_device(a)
+    let db: Buffer[bf16, (512,), device_global] = buffer_to_device(b)
+    let mut dout: Buffer[bf16, (4608,), device_global] = buffer_to_device(sentinel)
+    let mut dcmp: Buffer[i32, (512,), device_global] = buffer_to_device(csentinel)
+    gpu_launch(arith_bf16, blocks_for(n), BLOCK, n, &da, &db, &mut dout, &mut dcmp)
+    let got: Buffer[bf16, (4608,)] = buffer_to_host(dout)
+    let gcmp: Buffer[i32, (512,)] = buffer_to_host(dcmp)
+    # The operands, for the `math_fmin`/`math_fmax` zero-tie rule (`a` and
+    # `b` moved to the device).
+    let xa: Buffer[bf16, (512,)] = buffer_to_host(da)
+    let xb: Buffer[bf16, (512,)] = buffer_to_host(db)
+    let mut bad: i64 = 0
+    for op: i64 in range(9):
+        for i: i64 in range(n):
+            let g: f64 = buffer_get(got, op * 512 + i) as f64
+            let w: f64 = buffer_get(want, op * 512 + i) as f64
+            if not same_op(op, buffer_get(xa, i) as f64, buffer_get(xb, i) as f64, g, w):
+                bad = bad + report("bf16", op, i, g, w)
+    for i: i64 in range(n):
+        if buffer_get(gcmp, i) != buffer_get(wcmp, i):
+            bad = bad + report("bf16 compare", 0, i, 0.0, 1.0)
+    # The independent fixtures: the GPU and the host must both give the
+    # exact-rational result.
+    let mut k: i64 = first_fix
+    for f: i64 in range(N_ARITH_FIX):
+        if fx_arith_fmt(f) == 1:
+            let e: f64 = f64.from_bits(fx_arith_expect(f))
+            let g: f64 = buffer_get(got, fx_arith_op(f) * 512 + k) as f64
+            let w: f64 = buffer_get(want, fx_arith_op(f) * 512 + k) as f64
+            if not same_op(fx_arith_op(f), buffer_get(xa, k) as f64, buffer_get(xb, k) as f64, g, e):
+                bad = bad + report("bf16 fixture (gpu)", fx_arith_op(f), f, g, e)
+            if not same_op(fx_arith_op(f), buffer_get(xa, k) as f64, buffer_get(xb, k) as f64, w, e):
+                bad = bad + report("bf16 fixture (host)", fx_arith_op(f), f, w, e)
+            k = k + 1
+    return bad
+
+# Every op over every pair of the `f32` table plus the `f32` fixture lanes.
+def check_arith_f32() -> i64:
+    let mut a: Buffer[f32, (512,)] = buffer_alloc([512])
+    let mut b: Buffer[f32, (512,)] = buffer_alloc([512])
+    let mut want: Buffer[f32, (4608,)] = buffer_alloc([4608])
+    let mut wcmp: Buffer[i32, (512,)] = buffer_alloc([512])
+    let mut sentinel: Buffer[f32, (4608,)] = buffer_alloc([4608])
+    let mut csentinel: Buffer[i32, (512,)] = buffer_alloc([512])
+    let mut n: i64 = 0
+    for p: i64 in range(20):
+        for q: i64 in range(20):
+            let x: f32 = f64.from_bits(fx_table_f32(p)) as f32
+            let y: f32 = f64.from_bits(fx_table_f32(q)) as f32
+            buffer_set(a, n, x)
+            buffer_set(b, n, y)
+            want = ref_arith_f32(x, y, n, want)
+            buffer_set(wcmp, n, ref_cmp_f32(x, y))
+            n = n + 1
+    let first_fix: i64 = n
+    for f: i64 in range(N_ARITH_FIX):
+        if fx_arith_fmt(f) == 2:
+            let x: f32 = f64.from_bits(fx_arith_a(f)) as f32
+            let y: f32 = f64.from_bits(fx_arith_b(f)) as f32
+            buffer_set(a, n, x)
+            buffer_set(b, n, y)
+            want = ref_arith_f32(x, y, n, want)
+            buffer_set(wcmp, n, ref_cmp_f32(x, y))
+            n = n + 1
+    let da: Buffer[f32, (512,), device_global] = buffer_to_device(a)
+    let db: Buffer[f32, (512,), device_global] = buffer_to_device(b)
+    let mut dout: Buffer[f32, (4608,), device_global] = buffer_to_device(sentinel)
+    let mut dcmp: Buffer[i32, (512,), device_global] = buffer_to_device(csentinel)
+    gpu_launch(arith_f32, blocks_for(n), BLOCK, n, &da, &db, &mut dout, &mut dcmp)
+    let got: Buffer[f32, (4608,)] = buffer_to_host(dout)
+    let gcmp: Buffer[i32, (512,)] = buffer_to_host(dcmp)
+    # The operands, for the `math_fmin`/`math_fmax` zero-tie rule (`a` and
+    # `b` moved to the device).
+    let xa: Buffer[f32, (512,)] = buffer_to_host(da)
+    let xb: Buffer[f32, (512,)] = buffer_to_host(db)
+    let mut bad: i64 = 0
+    for op: i64 in range(9):
+        for i: i64 in range(n):
+            let g: f64 = buffer_get(got, op * 512 + i) as f64
+            let w: f64 = buffer_get(want, op * 512 + i) as f64
+            if not same_op(op, buffer_get(xa, i) as f64, buffer_get(xb, i) as f64, g, w):
+                bad = bad + report("f32", op, i, g, w)
+    for i: i64 in range(n):
+        if buffer_get(gcmp, i) != buffer_get(wcmp, i):
+            bad = bad + report("f32 compare", 0, i, 0.0, 1.0)
+    # The independent fixtures: the GPU and the host must both give the
+    # exact-rational result.
+    let mut k: i64 = first_fix
+    for f: i64 in range(N_ARITH_FIX):
+        if fx_arith_fmt(f) == 2:
+            let e: f64 = f64.from_bits(fx_arith_expect(f))
+            let g: f64 = buffer_get(got, fx_arith_op(f) * 512 + k) as f64
+            let w: f64 = buffer_get(want, fx_arith_op(f) * 512 + k) as f64
+            if not same_op(fx_arith_op(f), buffer_get(xa, k) as f64, buffer_get(xb, k) as f64, g, e):
+                bad = bad + report("f32 fixture (gpu)", fx_arith_op(f), f, g, e)
+            if not same_op(fx_arith_op(f), buffer_get(xa, k) as f64, buffer_get(xb, k) as f64, w, e):
+                bad = bad + report("f32 fixture (host)", fx_arith_op(f), f, w, e)
+            k = k + 1
+    return bad
+
+# Every op over every pair of the `f64` table plus the `f64` fixture lanes.
+def check_arith_f64() -> i64:
+    let mut a: Buffer[f64, (512,)] = buffer_alloc([512])
+    let mut b: Buffer[f64, (512,)] = buffer_alloc([512])
+    let mut want: Buffer[f64, (4608,)] = buffer_alloc([4608])
+    let mut wcmp: Buffer[i32, (512,)] = buffer_alloc([512])
+    let mut sentinel: Buffer[f64, (4608,)] = buffer_alloc([4608])
+    let mut csentinel: Buffer[i32, (512,)] = buffer_alloc([512])
+    let mut n: i64 = 0
+    for p: i64 in range(20):
+        for q: i64 in range(20):
+            let x: f64 = f64.from_bits(fx_table_f64(p)) as f64
+            let y: f64 = f64.from_bits(fx_table_f64(q)) as f64
+            buffer_set(a, n, x)
+            buffer_set(b, n, y)
+            want = ref_arith_f64(x, y, n, want)
+            buffer_set(wcmp, n, ref_cmp_f64(x, y))
+            n = n + 1
+    let first_fix: i64 = n
+    for f: i64 in range(N_ARITH_FIX):
+        if fx_arith_fmt(f) == 3:
+            let x: f64 = f64.from_bits(fx_arith_a(f)) as f64
+            let y: f64 = f64.from_bits(fx_arith_b(f)) as f64
+            buffer_set(a, n, x)
+            buffer_set(b, n, y)
+            want = ref_arith_f64(x, y, n, want)
+            buffer_set(wcmp, n, ref_cmp_f64(x, y))
+            n = n + 1
+    let da: Buffer[f64, (512,), device_global] = buffer_to_device(a)
+    let db: Buffer[f64, (512,), device_global] = buffer_to_device(b)
+    let mut dout: Buffer[f64, (4608,), device_global] = buffer_to_device(sentinel)
+    let mut dcmp: Buffer[i32, (512,), device_global] = buffer_to_device(csentinel)
+    gpu_launch(arith_f64, blocks_for(n), BLOCK, n, &da, &db, &mut dout, &mut dcmp)
+    let got: Buffer[f64, (4608,)] = buffer_to_host(dout)
+    let gcmp: Buffer[i32, (512,)] = buffer_to_host(dcmp)
+    # The operands, for the `math_fmin`/`math_fmax` zero-tie rule (`a` and
+    # `b` moved to the device).
+    let xa: Buffer[f64, (512,)] = buffer_to_host(da)
+    let xb: Buffer[f64, (512,)] = buffer_to_host(db)
+    let mut bad: i64 = 0
+    for op: i64 in range(9):
+        for i: i64 in range(n):
+            let g: f64 = buffer_get(got, op * 512 + i) as f64
+            let w: f64 = buffer_get(want, op * 512 + i) as f64
+            if not same_op(op, buffer_get(xa, i) as f64, buffer_get(xb, i) as f64, g, w):
+                bad = bad + report("f64", op, i, g, w)
+    for i: i64 in range(n):
+        if buffer_get(gcmp, i) != buffer_get(wcmp, i):
+            bad = bad + report("f64 compare", 0, i, 0.0, 1.0)
+    # The independent fixtures: the GPU and the host must both give the
+    # exact-rational result.
+    let mut k: i64 = first_fix
+    for f: i64 in range(N_ARITH_FIX):
+        if fx_arith_fmt(f) == 3:
+            let e: f64 = f64.from_bits(fx_arith_expect(f))
+            let g: f64 = buffer_get(got, fx_arith_op(f) * 512 + k) as f64
+            let w: f64 = buffer_get(want, fx_arith_op(f) * 512 + k) as f64
+            if not same_op(fx_arith_op(f), buffer_get(xa, k) as f64, buffer_get(xb, k) as f64, g, e):
+                bad = bad + report("f64 fixture (gpu)", fx_arith_op(f), f, g, e)
+            if not same_op(fx_arith_op(f), buffer_get(xa, k) as f64, buffer_get(xb, k) as f64, w, e):
+                bad = bad + report("f64 fixture (host)", fx_arith_op(f), f, w, e)
+            k = k + 1
+    return bad
+
+# ---- Section 2: conversions (`as`) ----
+
+@gpu(entry)
+def cvt_f16(n: i64, x: &Buffer[f16, (128,), device_global], fo: &mut Buffer[f64, (512,), device_global], io: &mut Buffer[i64, (1024,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let v: f16 = buffer_get(x, i)
+        buffer_set(fo, 0 + i, (v as f16) as f64)
+        buffer_set(fo, 128 + i, (v as bf16) as f64)
+        buffer_set(fo, 256 + i, (v as f32) as f64)
+        buffer_set(fo, 384 + i, (v as f64) as f64)
+        buffer_set(io, 0 + i, (v as i8) as i64)
+        buffer_set(io, 128 + i, (v as u8) as i64)
+        buffer_set(io, 256 + i, (v as i16) as i64)
+        buffer_set(io, 384 + i, (v as u16) as i64)
+        buffer_set(io, 512 + i, (v as i32) as i64)
+        buffer_set(io, 640 + i, (v as u32) as i64)
+        buffer_set(io, 768 + i, (v as i64) as i64)
+        buffer_set(io, 896 + i, (v as u64) as i64)
+
+@gpu(entry)
+def cvt_bf16(n: i64, x: &Buffer[bf16, (128,), device_global], fo: &mut Buffer[f64, (512,), device_global], io: &mut Buffer[i64, (1024,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let v: bf16 = buffer_get(x, i)
+        buffer_set(fo, 0 + i, (v as f16) as f64)
+        buffer_set(fo, 128 + i, (v as bf16) as f64)
+        buffer_set(fo, 256 + i, (v as f32) as f64)
+        buffer_set(fo, 384 + i, (v as f64) as f64)
+        buffer_set(io, 0 + i, (v as i8) as i64)
+        buffer_set(io, 128 + i, (v as u8) as i64)
+        buffer_set(io, 256 + i, (v as i16) as i64)
+        buffer_set(io, 384 + i, (v as u16) as i64)
+        buffer_set(io, 512 + i, (v as i32) as i64)
+        buffer_set(io, 640 + i, (v as u32) as i64)
+        buffer_set(io, 768 + i, (v as i64) as i64)
+        buffer_set(io, 896 + i, (v as u64) as i64)
+
+@gpu(entry)
+def cvt_f32(n: i64, x: &Buffer[f32, (128,), device_global], fo: &mut Buffer[f64, (512,), device_global], io: &mut Buffer[i64, (1024,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let v: f32 = buffer_get(x, i)
+        buffer_set(fo, 0 + i, (v as f16) as f64)
+        buffer_set(fo, 128 + i, (v as bf16) as f64)
+        buffer_set(fo, 256 + i, (v as f32) as f64)
+        buffer_set(fo, 384 + i, (v as f64) as f64)
+        buffer_set(io, 0 + i, (v as i8) as i64)
+        buffer_set(io, 128 + i, (v as u8) as i64)
+        buffer_set(io, 256 + i, (v as i16) as i64)
+        buffer_set(io, 384 + i, (v as u16) as i64)
+        buffer_set(io, 512 + i, (v as i32) as i64)
+        buffer_set(io, 640 + i, (v as u32) as i64)
+        buffer_set(io, 768 + i, (v as i64) as i64)
+        buffer_set(io, 896 + i, (v as u64) as i64)
+
+@gpu(entry)
+def cvt_f64(n: i64, x: &Buffer[f64, (128,), device_global], fo: &mut Buffer[f64, (512,), device_global], io: &mut Buffer[i64, (1024,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let v: f64 = buffer_get(x, i)
+        buffer_set(fo, 0 + i, (v as f16) as f64)
+        buffer_set(fo, 128 + i, (v as bf16) as f64)
+        buffer_set(fo, 256 + i, (v as f32) as f64)
+        buffer_set(fo, 384 + i, (v as f64) as f64)
+        buffer_set(io, 0 + i, (v as i8) as i64)
+        buffer_set(io, 128 + i, (v as u8) as i64)
+        buffer_set(io, 256 + i, (v as i16) as i64)
+        buffer_set(io, 384 + i, (v as u16) as i64)
+        buffer_set(io, 512 + i, (v as i32) as i64)
+        buffer_set(io, 640 + i, (v as u32) as i64)
+        buffer_set(io, 768 + i, (v as i64) as i64)
+        buffer_set(io, 896 + i, (v as u64) as i64)
+
+@gpu(entry)
+def cvt_i64(n: i64, x: &Buffer[i64, (128,), device_global], fo: &mut Buffer[f64, (512,), device_global], io: &mut Buffer[i64, (1024,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let v: i64 = buffer_get(x, i)
+        buffer_set(fo, 0 + i, (v as f16) as f64)
+        buffer_set(fo, 128 + i, (v as bf16) as f64)
+        buffer_set(fo, 256 + i, (v as f32) as f64)
+        buffer_set(fo, 384 + i, (v as f64) as f64)
+        buffer_set(io, 0 + i, (v as i8) as i64)
+        buffer_set(io, 128 + i, (v as u8) as i64)
+        buffer_set(io, 256 + i, (v as i16) as i64)
+        buffer_set(io, 384 + i, (v as u16) as i64)
+        buffer_set(io, 512 + i, (v as i32) as i64)
+        buffer_set(io, 640 + i, (v as u32) as i64)
+        buffer_set(io, 768 + i, (v as i64) as i64)
+        buffer_set(io, 896 + i, (v as u64) as i64)
+
+@gpu(entry)
+def cvt_u64(n: i64, x: &Buffer[u64, (128,), device_global], fo: &mut Buffer[f64, (512,), device_global], io: &mut Buffer[i64, (1024,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let v: u64 = buffer_get(x, i)
+        buffer_set(fo, 0 + i, (v as f16) as f64)
+        buffer_set(fo, 128 + i, (v as bf16) as f64)
+        buffer_set(fo, 256 + i, (v as f32) as f64)
+        buffer_set(fo, 384 + i, (v as f64) as f64)
+        buffer_set(io, 0 + i, (v as i8) as i64)
+        buffer_set(io, 128 + i, (v as u8) as i64)
+        buffer_set(io, 256 + i, (v as i16) as i64)
+        buffer_set(io, 384 + i, (v as u16) as i64)
+        buffer_set(io, 512 + i, (v as i32) as i64)
+        buffer_set(io, 640 + i, (v as u32) as i64)
+        buffer_set(io, 768 + i, (v as i64) as i64)
+        buffer_set(io, 896 + i, (v as u64) as i64)
+
+def ref_cvtf_f16(v: f16, i: i64, fo: Buffer[f64, (512,)]) -> Buffer[f64, (512,)]:
+    let mut o: Buffer[f64, (512,)] = fo
+    buffer_set(o, 0 + i, (v as f16) as f64)
+    buffer_set(o, 128 + i, (v as bf16) as f64)
+    buffer_set(o, 256 + i, (v as f32) as f64)
+    buffer_set(o, 384 + i, (v as f64) as f64)
+    return o
+
+def ref_cvti_f16(v: f16, i: i64, io: Buffer[i64, (1024,)]) -> Buffer[i64, (1024,)]:
+    let mut o: Buffer[i64, (1024,)] = io
+    buffer_set(o, 0 + i, (v as i8) as i64)
+    buffer_set(o, 128 + i, (v as u8) as i64)
+    buffer_set(o, 256 + i, (v as i16) as i64)
+    buffer_set(o, 384 + i, (v as u16) as i64)
+    buffer_set(o, 512 + i, (v as i32) as i64)
+    buffer_set(o, 640 + i, (v as u32) as i64)
+    buffer_set(o, 768 + i, (v as i64) as i64)
+    buffer_set(o, 896 + i, (v as u64) as i64)
+    return o
+
+def ref_cvtf_bf16(v: bf16, i: i64, fo: Buffer[f64, (512,)]) -> Buffer[f64, (512,)]:
+    let mut o: Buffer[f64, (512,)] = fo
+    buffer_set(o, 0 + i, (v as f16) as f64)
+    buffer_set(o, 128 + i, (v as bf16) as f64)
+    buffer_set(o, 256 + i, (v as f32) as f64)
+    buffer_set(o, 384 + i, (v as f64) as f64)
+    return o
+
+def ref_cvti_bf16(v: bf16, i: i64, io: Buffer[i64, (1024,)]) -> Buffer[i64, (1024,)]:
+    let mut o: Buffer[i64, (1024,)] = io
+    buffer_set(o, 0 + i, (v as i8) as i64)
+    buffer_set(o, 128 + i, (v as u8) as i64)
+    buffer_set(o, 256 + i, (v as i16) as i64)
+    buffer_set(o, 384 + i, (v as u16) as i64)
+    buffer_set(o, 512 + i, (v as i32) as i64)
+    buffer_set(o, 640 + i, (v as u32) as i64)
+    buffer_set(o, 768 + i, (v as i64) as i64)
+    buffer_set(o, 896 + i, (v as u64) as i64)
+    return o
+
+def ref_cvtf_f32(v: f32, i: i64, fo: Buffer[f64, (512,)]) -> Buffer[f64, (512,)]:
+    let mut o: Buffer[f64, (512,)] = fo
+    buffer_set(o, 0 + i, (v as f16) as f64)
+    buffer_set(o, 128 + i, (v as bf16) as f64)
+    buffer_set(o, 256 + i, (v as f32) as f64)
+    buffer_set(o, 384 + i, (v as f64) as f64)
+    return o
+
+def ref_cvti_f32(v: f32, i: i64, io: Buffer[i64, (1024,)]) -> Buffer[i64, (1024,)]:
+    let mut o: Buffer[i64, (1024,)] = io
+    buffer_set(o, 0 + i, (v as i8) as i64)
+    buffer_set(o, 128 + i, (v as u8) as i64)
+    buffer_set(o, 256 + i, (v as i16) as i64)
+    buffer_set(o, 384 + i, (v as u16) as i64)
+    buffer_set(o, 512 + i, (v as i32) as i64)
+    buffer_set(o, 640 + i, (v as u32) as i64)
+    buffer_set(o, 768 + i, (v as i64) as i64)
+    buffer_set(o, 896 + i, (v as u64) as i64)
+    return o
+
+def ref_cvtf_f64(v: f64, i: i64, fo: Buffer[f64, (512,)]) -> Buffer[f64, (512,)]:
+    let mut o: Buffer[f64, (512,)] = fo
+    buffer_set(o, 0 + i, (v as f16) as f64)
+    buffer_set(o, 128 + i, (v as bf16) as f64)
+    buffer_set(o, 256 + i, (v as f32) as f64)
+    buffer_set(o, 384 + i, (v as f64) as f64)
+    return o
+
+def ref_cvti_f64(v: f64, i: i64, io: Buffer[i64, (1024,)]) -> Buffer[i64, (1024,)]:
+    let mut o: Buffer[i64, (1024,)] = io
+    buffer_set(o, 0 + i, (v as i8) as i64)
+    buffer_set(o, 128 + i, (v as u8) as i64)
+    buffer_set(o, 256 + i, (v as i16) as i64)
+    buffer_set(o, 384 + i, (v as u16) as i64)
+    buffer_set(o, 512 + i, (v as i32) as i64)
+    buffer_set(o, 640 + i, (v as u32) as i64)
+    buffer_set(o, 768 + i, (v as i64) as i64)
+    buffer_set(o, 896 + i, (v as u64) as i64)
+    return o
+
+def ref_cvtf_i64(v: i64, i: i64, fo: Buffer[f64, (512,)]) -> Buffer[f64, (512,)]:
+    let mut o: Buffer[f64, (512,)] = fo
+    buffer_set(o, 0 + i, (v as f16) as f64)
+    buffer_set(o, 128 + i, (v as bf16) as f64)
+    buffer_set(o, 256 + i, (v as f32) as f64)
+    buffer_set(o, 384 + i, (v as f64) as f64)
+    return o
+
+def ref_cvti_i64(v: i64, i: i64, io: Buffer[i64, (1024,)]) -> Buffer[i64, (1024,)]:
+    let mut o: Buffer[i64, (1024,)] = io
+    buffer_set(o, 0 + i, (v as i8) as i64)
+    buffer_set(o, 128 + i, (v as u8) as i64)
+    buffer_set(o, 256 + i, (v as i16) as i64)
+    buffer_set(o, 384 + i, (v as u16) as i64)
+    buffer_set(o, 512 + i, (v as i32) as i64)
+    buffer_set(o, 640 + i, (v as u32) as i64)
+    buffer_set(o, 768 + i, (v as i64) as i64)
+    buffer_set(o, 896 + i, (v as u64) as i64)
+    return o
+
+def ref_cvtf_u64(v: u64, i: i64, fo: Buffer[f64, (512,)]) -> Buffer[f64, (512,)]:
+    let mut o: Buffer[f64, (512,)] = fo
+    buffer_set(o, 0 + i, (v as f16) as f64)
+    buffer_set(o, 128 + i, (v as bf16) as f64)
+    buffer_set(o, 256 + i, (v as f32) as f64)
+    buffer_set(o, 384 + i, (v as f64) as f64)
+    return o
+
+def ref_cvti_u64(v: u64, i: i64, io: Buffer[i64, (1024,)]) -> Buffer[i64, (1024,)]:
+    let mut o: Buffer[i64, (1024,)] = io
+    buffer_set(o, 0 + i, (v as i8) as i64)
+    buffer_set(o, 128 + i, (v as u8) as i64)
+    buffer_set(o, 256 + i, (v as i16) as i64)
+    buffer_set(o, 384 + i, (v as u16) as i64)
+    buffer_set(o, 512 + i, (v as i32) as i64)
+    buffer_set(o, 640 + i, (v as u32) as i64)
+    buffer_set(o, 768 + i, (v as i64) as i64)
+    buffer_set(o, 896 + i, (v as u64) as i64)
+    return o
+
+def check_cvt_f16() -> i64:
+    let mut x: Buffer[f16, (128,)] = buffer_alloc([128])
+    let mut want_f: Buffer[f64, (512,)] = buffer_alloc([512])
+    let mut want_i: Buffer[i64, (1024,)] = buffer_alloc([1024])
+    let mut n: i64 = 0
+    for p: i64 in range(20):
+        let v: f16 = f64.from_bits(fx_table_f16(p)) as f16
+        buffer_set(x, n, v)
+        want_f = ref_cvtf_f16(v, n, want_f)
+        want_i = ref_cvti_f16(v, n, want_i)
+        n = n + 1
+    let first_fix: i64 = n
+    for f: i64 in range(N_CVT_FIX):
+        if fx_cvt_src(f) == 0:
+            let v: f16 = f64.from_bits(fx_cvt_in(f)) as f16
+            buffer_set(x, n, v)
+            want_f = ref_cvtf_f16(v, n, want_f)
+            want_i = ref_cvti_f16(v, n, want_i)
+            n = n + 1
+    let dx: Buffer[f16, (128,), device_global] = buffer_to_device(x)
+    let mut dfo: Buffer[f64, (512,), device_global] = buffer_to_device(fill_f64(512))
+    let mut dio: Buffer[i64, (1024,), device_global] = buffer_to_device(fill_i64(1024))
+    gpu_launch(cvt_f16, blocks_for(n), BLOCK, n, &dx, &mut dfo, &mut dio)
+    let got_f: Buffer[f64, (512,)] = buffer_to_host(dfo)
+    let got_i: Buffer[i64, (1024,)] = buffer_to_host(dio)
+    return compare_cvt(0, n, first_fix, got_f, got_i, want_f, want_i)
+
+def check_cvt_bf16() -> i64:
+    let mut x: Buffer[bf16, (128,)] = buffer_alloc([128])
+    let mut want_f: Buffer[f64, (512,)] = buffer_alloc([512])
+    let mut want_i: Buffer[i64, (1024,)] = buffer_alloc([1024])
+    let mut n: i64 = 0
+    for p: i64 in range(20):
+        let v: bf16 = f64.from_bits(fx_table_bf16(p)) as bf16
+        buffer_set(x, n, v)
+        want_f = ref_cvtf_bf16(v, n, want_f)
+        want_i = ref_cvti_bf16(v, n, want_i)
+        n = n + 1
+    let first_fix: i64 = n
+    for f: i64 in range(N_CVT_FIX):
+        if fx_cvt_src(f) == 1:
+            let v: bf16 = f64.from_bits(fx_cvt_in(f)) as bf16
+            buffer_set(x, n, v)
+            want_f = ref_cvtf_bf16(v, n, want_f)
+            want_i = ref_cvti_bf16(v, n, want_i)
+            n = n + 1
+    let dx: Buffer[bf16, (128,), device_global] = buffer_to_device(x)
+    let mut dfo: Buffer[f64, (512,), device_global] = buffer_to_device(fill_f64(512))
+    let mut dio: Buffer[i64, (1024,), device_global] = buffer_to_device(fill_i64(1024))
+    gpu_launch(cvt_bf16, blocks_for(n), BLOCK, n, &dx, &mut dfo, &mut dio)
+    let got_f: Buffer[f64, (512,)] = buffer_to_host(dfo)
+    let got_i: Buffer[i64, (1024,)] = buffer_to_host(dio)
+    return compare_cvt(1, n, first_fix, got_f, got_i, want_f, want_i)
+
+def check_cvt_f32() -> i64:
+    let mut x: Buffer[f32, (128,)] = buffer_alloc([128])
+    let mut want_f: Buffer[f64, (512,)] = buffer_alloc([512])
+    let mut want_i: Buffer[i64, (1024,)] = buffer_alloc([1024])
+    let mut n: i64 = 0
+    for p: i64 in range(20):
+        let v: f32 = f64.from_bits(fx_table_f32(p)) as f32
+        buffer_set(x, n, v)
+        want_f = ref_cvtf_f32(v, n, want_f)
+        want_i = ref_cvti_f32(v, n, want_i)
+        n = n + 1
+    let first_fix: i64 = n
+    for f: i64 in range(N_CVT_FIX):
+        if fx_cvt_src(f) == 2:
+            let v: f32 = f64.from_bits(fx_cvt_in(f)) as f32
+            buffer_set(x, n, v)
+            want_f = ref_cvtf_f32(v, n, want_f)
+            want_i = ref_cvti_f32(v, n, want_i)
+            n = n + 1
+    let dx: Buffer[f32, (128,), device_global] = buffer_to_device(x)
+    let mut dfo: Buffer[f64, (512,), device_global] = buffer_to_device(fill_f64(512))
+    let mut dio: Buffer[i64, (1024,), device_global] = buffer_to_device(fill_i64(1024))
+    gpu_launch(cvt_f32, blocks_for(n), BLOCK, n, &dx, &mut dfo, &mut dio)
+    let got_f: Buffer[f64, (512,)] = buffer_to_host(dfo)
+    let got_i: Buffer[i64, (1024,)] = buffer_to_host(dio)
+    return compare_cvt(2, n, first_fix, got_f, got_i, want_f, want_i)
+
+def check_cvt_f64() -> i64:
+    let mut x: Buffer[f64, (128,)] = buffer_alloc([128])
+    let mut want_f: Buffer[f64, (512,)] = buffer_alloc([512])
+    let mut want_i: Buffer[i64, (1024,)] = buffer_alloc([1024])
+    let mut n: i64 = 0
+    for p: i64 in range(20):
+        let v: f64 = f64.from_bits(fx_table_f64(p))
+        buffer_set(x, n, v)
+        want_f = ref_cvtf_f64(v, n, want_f)
+        want_i = ref_cvti_f64(v, n, want_i)
+        n = n + 1
+    let first_fix: i64 = n
+    for f: i64 in range(N_CVT_FIX):
+        if fx_cvt_src(f) == 3:
+            let v: f64 = f64.from_bits(fx_cvt_in(f))
+            buffer_set(x, n, v)
+            want_f = ref_cvtf_f64(v, n, want_f)
+            want_i = ref_cvti_f64(v, n, want_i)
+            n = n + 1
+    let dx: Buffer[f64, (128,), device_global] = buffer_to_device(x)
+    let mut dfo: Buffer[f64, (512,), device_global] = buffer_to_device(fill_f64(512))
+    let mut dio: Buffer[i64, (1024,), device_global] = buffer_to_device(fill_i64(1024))
+    gpu_launch(cvt_f64, blocks_for(n), BLOCK, n, &dx, &mut dfo, &mut dio)
+    let got_f: Buffer[f64, (512,)] = buffer_to_host(dfo)
+    let got_i: Buffer[i64, (1024,)] = buffer_to_host(dio)
+    return compare_cvt(3, n, first_fix, got_f, got_i, want_f, want_i)
+
+def check_cvt_i64() -> i64:
+    let mut x: Buffer[i64, (128,)] = buffer_alloc([128])
+    let mut want_f: Buffer[f64, (512,)] = buffer_alloc([512])
+    let mut want_i: Buffer[i64, (1024,)] = buffer_alloc([1024])
+    let mut n: i64 = 0
+    for p: i64 in range(22):
+        let v: i64 = fx_int_table(p) as i64
+        buffer_set(x, n, v)
+        want_f = ref_cvtf_i64(v, n, want_f)
+        want_i = ref_cvti_i64(v, n, want_i)
+        n = n + 1
+    let first_fix: i64 = n
+    for f: i64 in range(N_CVT_FIX):
+        if fx_cvt_src(f) == 4:
+            let v: i64 = fx_cvt_in(f) as i64
+            buffer_set(x, n, v)
+            want_f = ref_cvtf_i64(v, n, want_f)
+            want_i = ref_cvti_i64(v, n, want_i)
+            n = n + 1
+    let dx: Buffer[i64, (128,), device_global] = buffer_to_device(x)
+    let mut dfo: Buffer[f64, (512,), device_global] = buffer_to_device(fill_f64(512))
+    let mut dio: Buffer[i64, (1024,), device_global] = buffer_to_device(fill_i64(1024))
+    gpu_launch(cvt_i64, blocks_for(n), BLOCK, n, &dx, &mut dfo, &mut dio)
+    let got_f: Buffer[f64, (512,)] = buffer_to_host(dfo)
+    let got_i: Buffer[i64, (1024,)] = buffer_to_host(dio)
+    return compare_cvt(4, n, first_fix, got_f, got_i, want_f, want_i)
+
+def check_cvt_u64() -> i64:
+    let mut x: Buffer[u64, (128,)] = buffer_alloc([128])
+    let mut want_f: Buffer[f64, (512,)] = buffer_alloc([512])
+    let mut want_i: Buffer[i64, (1024,)] = buffer_alloc([1024])
+    let mut n: i64 = 0
+    for p: i64 in range(10):
+        let v: u64 = fx_uint_table(p)
+        buffer_set(x, n, v)
+        want_f = ref_cvtf_u64(v, n, want_f)
+        want_i = ref_cvti_u64(v, n, want_i)
+        n = n + 1
+    let first_fix: i64 = n
+    for f: i64 in range(N_CVT_FIX):
+        if fx_cvt_src(f) == 5:
+            let v: u64 = fx_cvt_in(f)
+            buffer_set(x, n, v)
+            want_f = ref_cvtf_u64(v, n, want_f)
+            want_i = ref_cvti_u64(v, n, want_i)
+            n = n + 1
+    let dx: Buffer[u64, (128,), device_global] = buffer_to_device(x)
+    let mut dfo: Buffer[f64, (512,), device_global] = buffer_to_device(fill_f64(512))
+    let mut dio: Buffer[i64, (1024,), device_global] = buffer_to_device(fill_i64(1024))
+    gpu_launch(cvt_u64, blocks_for(n), BLOCK, n, &dx, &mut dfo, &mut dio)
+    let got_f: Buffer[f64, (512,)] = buffer_to_host(dfo)
+    let got_i: Buffer[i64, (1024,)] = buffer_to_host(dio)
+    return compare_cvt(5, n, first_fix, got_f, got_i, want_f, want_i)
+
+# Compare one conversion run with the host and with the fixtures of source
+# `src` (fixture lanes start at `first_fix`).
+def compare_cvt(src: i64, n: i64, first_fix: i64, got_f: Buffer[f64, (512,)], got_i: Buffer[i64, (1024,)], want_f: Buffer[f64, (512,)], want_i: Buffer[i64, (1024,)]) -> i64:
+    let mut bad: i64 = 0
+    for d: i64 in range(4):
+        for i: i64 in range(n):
+            let g: f64 = buffer_get(got_f, d * 128 + i)
+            let w: f64 = buffer_get(want_f, d * 128 + i)
+            if not same(g, w):
+                bad = bad + report("conversion", d, i, g, w)
+    for d: i64 in range(8):
+        for i: i64 in range(n):
+            let g: i64 = buffer_get(got_i, d * 128 + i)
+            let w: i64 = buffer_get(want_i, d * 128 + i)
+            if g != w:
+                bad = bad + report("conversion", d + 4, i, g as f64, w as f64)
+    let mut k: i64 = first_fix
+    for f: i64 in range(N_CVT_FIX):
+        if fx_cvt_src(f) == src:
+            let d: i64 = fx_cvt_dst(f)
+            if d < 4:
+                let e: f64 = f64.from_bits(fx_cvt_expect(f))
+                let g: f64 = buffer_get(got_f, d * 128 + k)
+                let w: f64 = buffer_get(want_f, d * 128 + k)
+                if not same(g, e):
+                    bad = bad + report("conversion fixture (gpu)", d, f, g, e)
+                if not same(w, e):
+                    bad = bad + report("conversion fixture (host)", d, f, w, e)
+            else:
+                let e: i64 = fx_cvt_expect(f) as i64
+                let g: i64 = buffer_get(got_i, (d - 4) * 128 + k)
+                let w: i64 = buffer_get(want_i, (d - 4) * 128 + k)
+                if g != e:
+                    bad = bad + report("conversion fixture (gpu)", d, f, g as f64, e as f64)
+                if w != e:
+                    bad = bad + report("conversion fixture (host)", d, f, w as f64, e as f64)
+            k = k + 1
+    return bad
+
+# ---- Section 3: explicit mixed accumulation ----
+
+# c = a x b for 64 x 64 matrices of f16, each product and sum in an f32
+# accumulator (the inputs widen exactly), the result stored in f32 and
+# rounded once to f16. One thread per element of c.
+@gpu(entry)
+def matmul_f16_acc_f32(a: &Buffer[f16, (4096,), device_global], b: &Buffer[f16, (4096,), device_global], c32: &mut Buffer[f32, (4096,), device_global], c16: &mut Buffer[f16, (4096,), device_global]) -> None:
+    let t: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if t < 4096:
+        let i: i64 = t >> 6
+        let j: i64 = t & 63
+        let mut acc: f32 = 0.0
+        for p: i64 in range(64):
+            acc = acc + (buffer_get(a, i * 64 + p) as f32) * (buffer_get(b, p * 64 + j) as f32)
+        buffer_set(c32, t, acc)
+        buffer_set(c16, t, acc as f16)
+
+@gpu(entry)
+def matmul_bf16_acc_f32(a: &Buffer[bf16, (4096,), device_global], b: &Buffer[bf16, (4096,), device_global], c32: &mut Buffer[f32, (4096,), device_global], c16: &mut Buffer[bf16, (4096,), device_global]) -> None:
+    let t: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if t < 4096:
+        let i: i64 = t >> 6
+        let j: i64 = t & 63
+        let mut acc: f32 = 0.0
+        for p: i64 in range(64):
+            acc = acc + (buffer_get(a, i * 64 + p) as f32) * (buffer_get(b, p * 64 + j) as f32)
+        buffer_set(c32, t, acc)
+        buffer_set(c16, t, acc as bf16)
+
+# The same products through the shared-memory tiled path of #2110: 16 x 16
+# tiles in workgroup memory, staged as `x as f32` (exact: every f16/bf16 is
+# an f32; workgroup memory has no half element type, AX0652), each product
+# formed in f32 and added in the same `p` order as the untiled kernel (tile
+# `t`, then `q`, is `p = 16 t + q`), so both match the host loop bit for
+# bit. Block `g` computes tile row
+# `g >> 2`, tile column `g & 3` of the 64 x 64 result; 64 is a whole number
+# of tiles, so no lane is padding.
+@gpu(entry)
+def matmul_f16_tiled_acc_f32(a: &Buffer[f16, (4096,), device_global], b: &Buffer[f16, (4096,), device_global], c32: &mut Buffer[f32, (4096,), device_global], c16: &mut Buffer[f16, (4096,), device_global]) -> None:
+    let ta: &mut Buffer[f32, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let tb: &mut Buffer[f32, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let ty: i64 = gpu_thread_id(0) / 16
+    let tx: i64 = gpu_thread_id(0) % 16
+    let row: i64 = (gpu_block_id(0) >> 2) * 16 + ty
+    let col: i64 = (gpu_block_id(0) & 3) * 16 + tx
+    let mut acc: f32 = 0.0
+    for t: i64 in range(4):
+        buffer_set(ta, ty, tx, buffer_get(a, row * 64 + t * 16 + tx) as f32)
+        buffer_set(tb, ty, tx, buffer_get(b, (t * 16 + ty) * 64 + col) as f32)
+        # Both tiles are complete before anyone reads them.
+        gpu_barrier()
+        for q: i64 in range(16):
+            acc = acc + buffer_get(ta, ty, q) * buffer_get(tb, q, tx)
+        # Everyone is done reading before the next tile overwrites them.
+        gpu_barrier()
+    buffer_set(c32, row * 64 + col, acc)
+    buffer_set(c16, row * 64 + col, acc as f16)
+
+@gpu(entry)
+def matmul_bf16_tiled_acc_f32(a: &Buffer[bf16, (4096,), device_global], b: &Buffer[bf16, (4096,), device_global], c32: &mut Buffer[f32, (4096,), device_global], c16: &mut Buffer[bf16, (4096,), device_global]) -> None:
+    let ta: &mut Buffer[f32, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let tb: &mut Buffer[f32, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let ty: i64 = gpu_thread_id(0) / 16
+    let tx: i64 = gpu_thread_id(0) % 16
+    let row: i64 = (gpu_block_id(0) >> 2) * 16 + ty
+    let col: i64 = (gpu_block_id(0) & 3) * 16 + tx
+    let mut acc: f32 = 0.0
+    for t: i64 in range(4):
+        buffer_set(ta, ty, tx, buffer_get(a, row * 64 + t * 16 + tx) as f32)
+        buffer_set(tb, ty, tx, buffer_get(b, (t * 16 + ty) * 64 + col) as f32)
+        gpu_barrier()
+        for q: i64 in range(16):
+            acc = acc + buffer_get(ta, ty, q) * buffer_get(tb, q, tx)
+        gpu_barrier()
+    buffer_set(c32, row * 64 + col, acc)
+    buffer_set(c16, row * 64 + col, acc as bf16)
+
+# Row sums of an 8 x 4096 f16 matrix, one thread per row: rounded in an f16
+# accumulator (each `+` rounds to f16) versus an explicit f32 accumulator.
+@gpu(entry)
+def rowsum_f16_acc_f16(x: &Buffer[f16, (32768,), device_global], out: &mut Buffer[f16, (8,), device_global]) -> None:
+    let r: i64 = gpu_thread_id(0)
+    if r < 8:
+        let mut acc: f16 = 0.0
+        for p: i64 in range(4096):
+            acc = acc + buffer_get(x, r * 4096 + p)
+        buffer_set(out, r, acc)
+
+@gpu(entry)
+def rowsum_f16_acc_f32(x: &Buffer[f16, (32768,), device_global], out: &mut Buffer[f32, (8,), device_global]) -> None:
+    let r: i64 = gpu_thread_id(0)
+    if r < 8:
+        let mut acc: f32 = 0.0
+        for p: i64 in range(4096):
+            acc = acc + (buffer_get(x, r * 4096 + p) as f32)
+        buffer_set(out, r, acc)
+
+# A workgroup sum of f16 inputs widened explicitly to f32 (the collective
+# takes f32, not f16): the strict tier folds in thread order.
+@gpu(entry)
+@schedule(max_threads=256)
+def wgsum_f16_acc_f32(x: &Buffer[f16, (256,), device_global], out: &mut Buffer[f32, (1,), device_global]) -> None:
+    let v: f32 = buffer_get(x, gpu_thread_id(0)) as f32
+    let s: f32 = gpu_workgroup_sum(v)
+    if gpu_thread_id(0) == 0:
+        buffer_set(out, 0, s)
+
+def next_seed(s: i64) -> i64:
+    return (s * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+
+# A value in [-4, 4) with 1/256 steps: exact in f16 and in bf16 (9 bits of
+# magnitude would not fit bf16, so the bf16 run uses 1/32 steps).
+def small(s: i64, steps: i64) -> f32:
+    return (((s >> 33) & 2047) - 1024) as f32 / steps as f32
+
+def check_matmul_f16() -> i64:
+    let mut s: i64 = 2111
+    let mut a: Buffer[f16, (4096,)] = buffer_alloc([4096])
+    let mut b: Buffer[f16, (4096,)] = buffer_alloc([4096])
+    let mut w32: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut w16: Buffer[f16, (4096,)] = buffer_alloc([4096])
+    for t: i64 in range(4096):
+        s = next_seed(s)
+        buffer_set(a, t, small(s, 256) as f16)
+        s = next_seed(s)
+        buffer_set(b, t, small(s, 256) as f16)
+    for t: i64 in range(4096):
+        let i: i64 = t >> 6
+        let j: i64 = t & 63
+        let mut acc: f32 = 0.0
+        for p: i64 in range(64):
+            acc = acc + (buffer_get(a, i * 64 + p) as f32) * (buffer_get(b, p * 64 + j) as f32)
+        buffer_set(w32, t, acc)
+        buffer_set(w16, t, acc as f16)
+    let mut z32: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut z16: Buffer[f16, (4096,)] = buffer_alloc([4096])
+    let da: Buffer[f16, (4096,), device_global] = buffer_to_device(a)
+    let db: Buffer[f16, (4096,), device_global] = buffer_to_device(b)
+    let mut d32: Buffer[f32, (4096,), device_global] = buffer_to_device(z32)
+    let mut d16: Buffer[f16, (4096,), device_global] = buffer_to_device(z16)
+    gpu_launch(matmul_f16_acc_f32, 32, BLOCK, &da, &db, &mut d32, &mut d16)
+    let g32: Buffer[f32, (4096,)] = buffer_to_host(d32)
+    let g16: Buffer[f16, (4096,)] = buffer_to_host(d16)
+    let mut y32: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut y16: Buffer[f16, (4096,)] = buffer_alloc([4096])
+    let mut e32: Buffer[f32, (4096,), device_global] = buffer_to_device(y32)
+    let mut e16: Buffer[f16, (4096,), device_global] = buffer_to_device(y16)
+    gpu_launch(matmul_f16_tiled_acc_f32, 16, 256, &da, &db, &mut e32, &mut e16)
+    let t32: Buffer[f32, (4096,)] = buffer_to_host(e32)
+    let t16: Buffer[f16, (4096,)] = buffer_to_host(e16)
+    let mut bad: i64 = 0
+    for t: i64 in range(4096):
+        let g: f64 = buffer_get(g32, t) as f64
+        let w: f64 = buffer_get(w32, t) as f64
+        if not same(g, w):
+            bad = bad + report("f16 matmul (f32 acc)", 0, t, g, w)
+        let h: f64 = buffer_get(g16, t) as f64
+        let v: f64 = buffer_get(w16, t) as f64
+        if not same(h, v):
+            bad = bad + report("f16 matmul (f16 out)", 1, t, h, v)
+        let tg: f64 = buffer_get(t32, t) as f64
+        if not same(tg, w):
+            bad = bad + report("f16 tiled matmul (f32 acc)", 2, t, tg, w)
+        let th: f64 = buffer_get(t16, t) as f64
+        if not same(th, v):
+            bad = bad + report("f16 tiled matmul (f16 out)", 3, t, th, v)
+    return bad
+
+def check_matmul_bf16() -> i64:
+    let mut s: i64 = 4222
+    let mut a: Buffer[bf16, (4096,)] = buffer_alloc([4096])
+    let mut b: Buffer[bf16, (4096,)] = buffer_alloc([4096])
+    let mut w32: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut w16: Buffer[bf16, (4096,)] = buffer_alloc([4096])
+    for t: i64 in range(4096):
+        s = next_seed(s)
+        buffer_set(a, t, small(s >> 3, 32) as bf16)
+        s = next_seed(s)
+        buffer_set(b, t, small(s >> 3, 32) as bf16)
+    for t: i64 in range(4096):
+        let i: i64 = t >> 6
+        let j: i64 = t & 63
+        let mut acc: f32 = 0.0
+        for p: i64 in range(64):
+            acc = acc + (buffer_get(a, i * 64 + p) as f32) * (buffer_get(b, p * 64 + j) as f32)
+        buffer_set(w32, t, acc)
+        buffer_set(w16, t, acc as bf16)
+    let mut z32: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut z16: Buffer[bf16, (4096,)] = buffer_alloc([4096])
+    let da: Buffer[bf16, (4096,), device_global] = buffer_to_device(a)
+    let db: Buffer[bf16, (4096,), device_global] = buffer_to_device(b)
+    let mut d32: Buffer[f32, (4096,), device_global] = buffer_to_device(z32)
+    let mut d16: Buffer[bf16, (4096,), device_global] = buffer_to_device(z16)
+    gpu_launch(matmul_bf16_acc_f32, 32, BLOCK, &da, &db, &mut d32, &mut d16)
+    let g32: Buffer[f32, (4096,)] = buffer_to_host(d32)
+    let g16: Buffer[bf16, (4096,)] = buffer_to_host(d16)
+    let mut y32: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut y16: Buffer[bf16, (4096,)] = buffer_alloc([4096])
+    let mut e32: Buffer[f32, (4096,), device_global] = buffer_to_device(y32)
+    let mut e16: Buffer[bf16, (4096,), device_global] = buffer_to_device(y16)
+    gpu_launch(matmul_bf16_tiled_acc_f32, 16, 256, &da, &db, &mut e32, &mut e16)
+    let t32: Buffer[f32, (4096,)] = buffer_to_host(e32)
+    let t16: Buffer[bf16, (4096,)] = buffer_to_host(e16)
+    let mut bad: i64 = 0
+    for t: i64 in range(4096):
+        let g: f64 = buffer_get(g32, t) as f64
+        let w: f64 = buffer_get(w32, t) as f64
+        if not same(g, w):
+            bad = bad + report("bf16 matmul (f32 acc)", 0, t, g, w)
+        let h: f64 = buffer_get(g16, t) as f64
+        let v: f64 = buffer_get(w16, t) as f64
+        if not same(h, v):
+            bad = bad + report("bf16 matmul (bf16 out)", 1, t, h, v)
+        let tg: f64 = buffer_get(t32, t) as f64
+        if not same(tg, w):
+            bad = bad + report("bf16 tiled matmul (f32 acc)", 2, t, tg, w)
+        let th: f64 = buffer_get(t16, t) as f64
+        if not same(th, v):
+            bad = bad + report("bf16 tiled matmul (bf16 out)", 3, t, th, v)
+    return bad
+
+# Row 0 is 4096 ones: the rounded f16 accumulator stalls at 2048 (2048 + 1
+# ties to even, back to 2048) while the f32 accumulator reaches 4096. The
+# other rows are pseudo-random and compared with the host.
+def check_rowsums() -> i64:
+    let mut s: i64 = 6333
+    let mut x: Buffer[f16, (32768,)] = buffer_alloc([32768])
+    for p: i64 in range(4096):
+        buffer_set(x, p, 1.0)
+    for t: i64 in range(4096, 32768):
+        s = next_seed(s)
+        buffer_set(x, t, small(s, 256) as f16)
+    let mut w16: Buffer[f16, (8,)] = buffer_alloc([8])
+    let mut w32: Buffer[f32, (8,)] = buffer_alloc([8])
+    for r: i64 in range(8):
+        let mut acc16: f16 = 0.0
+        let mut acc32: f32 = 0.0
+        for p: i64 in range(4096):
+            acc16 = acc16 + buffer_get(x, r * 4096 + p)
+            acc32 = acc32 + (buffer_get(x, r * 4096 + p) as f32)
+        buffer_set(w16, r, acc16)
+        buffer_set(w32, r, acc32)
+    let mut z16: Buffer[f16, (8,)] = buffer_alloc([8])
+    let mut z32: Buffer[f32, (8,)] = buffer_alloc([8])
+    let dx: Buffer[f16, (32768,), device_global] = buffer_to_device(x)
+    let mut d16: Buffer[f16, (8,), device_global] = buffer_to_device(z16)
+    let mut d32: Buffer[f32, (8,), device_global] = buffer_to_device(z32)
+    gpu_launch(rowsum_f16_acc_f16, 1, 32, &dx, &mut d16)
+    gpu_launch(rowsum_f16_acc_f32, 1, 32, &dx, &mut d32)
+    let g16: Buffer[f16, (8,)] = buffer_to_host(d16)
+    let g32: Buffer[f32, (8,)] = buffer_to_host(d32)
+    let mut bad: i64 = 0
+    for r: i64 in range(8):
+        let a: f64 = buffer_get(g16, r) as f64
+        let b: f64 = buffer_get(w16, r) as f64
+        if not same(a, b):
+            bad = bad + report("row sum (f16 acc)", 0, r, a, b)
+        let c: f64 = buffer_get(g32, r) as f64
+        let d: f64 = buffer_get(w32, r) as f64
+        if not same(c, d):
+            bad = bad + report("row sum (f32 acc)", 1, r, c, d)
+    let stalled: f64 = buffer_get(g16, 0) as f64
+    let full: f64 = buffer_get(g32, 0) as f64
+    if stalled != 2048.0:
+        bad = bad + report("row of ones (f16 acc)", 0, 0, stalled, 2048.0)
+    if full != 4096.0:
+        bad = bad + report("row of ones (f32 acc)", 1, 0, full, 4096.0)
+    return bad
+
+# Inputs that tell the strict fold apart from any other order: even lanes
+# are large (16384..32752, multiples of 16, exact in f16), odd lanes small
+# (k/256 in [-4, 4), exact in f16), so the running f32 sum climbs past 2^21
+# where its ulp (0.25) rounds away part of each small term, and how much is
+# lost depends on the order. Every input and the sum are finite, so `same()`
+# compares bits, never "both NaN". The host also folds the same values as a
+# pairwise tree (the shape a reassociated reduction takes) and fails the
+# check if that differs from the sequential fold by less than a bit: if the
+# inputs ever stopped discriminating, the check would say so, not pass.
+# Seed 8444: sequential 3150440.5, tree 3150441.0, reversed and per-warp
+# folds 3150441.25 / 3150440.75, exact sum 3150441.14453125.
+def check_wgsum() -> i64:
+    let mut s: i64 = 8444
+    let mut x: Buffer[f16, (256,)] = buffer_alloc([256])
+    let mut tree: Buffer[f32, (256,)] = buffer_alloc([256])
+    let mut want: f32 = 0.0
+    for t: i64 in range(256):
+        s = next_seed(s)
+        let mut v: f16 = small(s, 256) as f16
+        if t % 2 == 0:
+            v = ((((s >> 33) & 1023) * 16 + 16384) as f32) as f16
+        buffer_set(x, t, v)
+        buffer_set(tree, t, v as f32)
+        want = want + (v as f32)
+    for lvl: i64 in range(8):
+        let width: i64 = 128 >> lvl
+        for i: i64 in range(width):
+            buffer_set(tree, i, buffer_get(tree, 2 * i) + buffer_get(tree, 2 * i + 1))
+    let w: f64 = want as f64
+    let other: f64 = buffer_get(tree, 0) as f64
+    let mut bad: i64 = 0
+    if not (w - w == 0.0):
+        bad = bad + report("workgroup sum input (not finite)", 0, 0, w, w)
+    if same(w, other):
+        bad = bad + report("workgroup sum input (order-blind)", 0, 0, other, w)
+    let mut z: Buffer[f32, (1,)] = buffer_alloc([1])
+    let dx: Buffer[f16, (256,), device_global] = buffer_to_device(x)
+    let mut d: Buffer[f32, (1,), device_global] = buffer_to_device(z)
+    gpu_launch(wgsum_f16_acc_f32, 1, 256, &dx, &mut d)
+    let g: Buffer[f32, (1,)] = buffer_to_host(d)
+    let got: f64 = buffer_get(g, 0) as f64
+    if not same(got, w):
+        bad = bad + report("workgroup sum (f32 acc)", 0, 0, got, w)
+    return bad
+
+# ---- Section 4: constant/runtime agreement ----
+
+# Folded at compile time by the strict constant evaluator.
+const THIRD_F16: f16 = 1.0_f16 / 3.0_f16
+const THIRD_BF16: bf16 = (1.0 as bf16) / (3.0 as bf16)
+const THIRD_F32: f32 = 1.0_f32 / 3.0_f32
+const THIRD_F64: f64 = 1.0 / 3.0
+const TIE_F16: f16 = 1.0_f16 + 0.00048828125_f16
+const TIE_BF16: bf16 = (1.0 as bf16) + (0.00390625 as bf16)
+const MULADD_F16: f16 = 1.0009765625_f16 * 1.0009765625_f16 + 1.0009765625_f16
+
+@gpu(entry)
+def runtime_values(x: &Buffer[f64, (4,), device_global], out: &mut Buffer[f64, (8,), device_global]) -> None:
+    if gpu_thread_id(0) == 0:
+        let one: f64 = buffer_get(x, 0)
+        let three: f64 = buffer_get(x, 1)
+        let hulp16: f64 = buffer_get(x, 2)
+        let hulpb: f64 = buffer_get(x, 3)
+        buffer_set(out, 0, ((one as f16) / (three as f16)) as f64)
+        buffer_set(out, 1, ((one as bf16) / (three as bf16)) as f64)
+        buffer_set(out, 2, ((one as f32) / (three as f32)) as f64)
+        buffer_set(out, 3, one / three)
+        buffer_set(out, 4, ((one as f16) + (hulp16 as f16)) as f64)
+        buffer_set(out, 5, ((one as bf16) + (hulpb as bf16)) as f64)
+        let m: f16 = (one as f16) + (hulp16 as f16) * 2.0_f16
+        buffer_set(out, 6, (m * m + m) as f64)
+
+def check_constants() -> i64:
+    let mut x: Buffer[f64, (4,)] = buffer_alloc([4])
+    buffer_set(x, 0, 1.0)
+    buffer_set(x, 1, 3.0)
+    buffer_set(x, 2, 0.00048828125)
+    buffer_set(x, 3, 0.00390625)
+    let mut z: Buffer[f64, (8,)] = buffer_alloc([8])
+    let dx: Buffer[f64, (4,), device_global] = buffer_to_device(x)
+    let mut d: Buffer[f64, (8,), device_global] = buffer_to_device(z)
+    gpu_launch(runtime_values, 1, 32, &dx, &mut d)
+    let g: Buffer[f64, (8,)] = buffer_to_host(d)
+    let want: Array[f64; 7] = [THIRD_F16 as f64, THIRD_BF16 as f64, THIRD_F32 as f64, THIRD_F64, TIE_F16 as f64, TIE_BF16 as f64, MULADD_F16 as f64]
+    let mut bad: i64 = 0
+    for i: i64 in range(7):
+        let got: f64 = buffer_get(g, i)
+        if not same(got, want[i]):
+            bad = bad + report("constant vs gpu", i, 0, got, want[i])
+    return bad
+
+def main() -> i32:
+    let arith: i64 = check_same_op() + check_arith_f16() + check_arith_bf16() + check_arith_f32() + check_arith_f64()
+    let cvt: i64 = check_cvt_f16() + check_cvt_bf16() + check_cvt_f32() + check_cvt_f64() + check_cvt_i64() + check_cvt_u64()
+    let acc: i64 = check_matmul_f16() + check_matmul_bf16() + check_rowsums() + check_wgsum()
+    let consts: i64 = check_constants()
+    println!("arithmetic: {arith} mismatches")
+    println!("conversions: {cvt} mismatches")
+    println!("accumulation: {acc} mismatches")
+    println!("constants: {consts} mismatches")
+    if arith + cvt + acc + consts != 0:
+        return 1
+    println!("numeric: f16, bf16, f32 and f64 arithmetic, conversions and f32 accumulation match the strict host and the fixtures")
+    return 0

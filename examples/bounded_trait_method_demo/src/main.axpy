@@ -1,0 +1,43 @@
+# Bounded trait methods (#3239). A trait method may bound its own type
+# parameters (`feed[S: Sink]`). An impl may declare fewer bounds than the
+# trait, and a call proves the bound for its arguments: through a bound
+# (`f.feed(..)` with `F: Feed`) or directly on a concrete receiver. A generic
+# body forwarding its own parameter must declare the bound itself.
+
+trait Sink:
+    def put(mut self, v: i32) -> unit
+
+trait Feed:
+    def feed[S: Sink](self: ref[Self], sink: ref_mut[S]) -> unit
+
+struct Acc:
+    total: i32
+
+impl Sink for Acc:
+    def put(mut self, v: i32) -> unit:
+        self.total = self.total + v
+
+struct One:
+    v: i32
+
+impl Feed for One:
+    def feed[S: Sink](self: ref[Self], sink: ref_mut[S]) -> unit:
+        sink.put(self.v)
+
+def run[F: Feed](f: ref[F]) -> i32:
+    let mut a: Acc = Acc { total: 0 }
+    f.feed(ref_mut(a))
+    return a.total
+
+def forward[S: Sink](o: ref[One], sink: ref_mut[S]) -> unit:
+    o.feed(sink)
+
+def main() -> i32:
+    let o: One = One { v: 3 }
+    if run(ref(o)) != 3:
+        return 1
+    let mut a: Acc = Acc { total: 1 }
+    forward(ref(o), ref_mut(a))
+    if a.total != 4:
+        return 2
+    return 0

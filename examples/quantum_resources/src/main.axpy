@@ -1,0 +1,105 @@
+# Quantum resources: ownership, typestate and session identity (issue #481).
+#
+# A quantum operation is a body-less `@intrinsic` stub with a reserved
+# `axyon_q_*` name and the signature the specification requires; the structs it
+# takes and returns are the resource types (`Qubit`, `QSession`, `Pending`).
+# They are opaque: no struct literal, no field access.
+#
+# What the compiler checks (`axyon check`):
+#   * a qubit is consumed exactly once, by `release` / `reset_release`
+#     (AX1002 if it may leave scope otherwise -- there is no implicit release);
+#   * gates need an unmeasured qubit (AX1006), nothing is used after `release`
+#     (AX1007), plain `release` needs a measured/zero qubit (AX1008);
+#   * both operands of a two-qubit gate belong to the same session (AX1003).
+#
+# `axyon run` links the local state-vector simulator of `axyon-runtime`
+# (issue #482). It is a simulator, not hardware. Measurement outcomes are
+# reproducible: the seed comes from `AXYON_Q_SEED` (decimal u64, default 0).
+struct QSession:
+    id: i64
+
+struct Qubit:
+    id: i64
+
+struct Pending:
+    id: i64
+
+@intrinsic
+def axyon_q_session_sim() -> QSession:
+    pass
+
+@intrinsic
+def axyon_q_alloc(s: &mut QSession) -> Qubit:
+    pass
+
+@intrinsic
+def axyon_q_h(q: &mut Qubit) -> None:
+    pass
+
+@intrinsic
+def axyon_q_x(q: &mut Qubit) -> None:
+    pass
+
+@intrinsic
+def axyon_q_ry(q: &mut Qubit, theta: f64) -> None:
+    pass
+
+@intrinsic
+def axyon_q_cx(c: &mut Qubit, t: &mut Qubit) -> None:
+    pass
+
+@intrinsic
+def axyon_q_measure(q: &mut Qubit) -> Pending:
+    pass
+
+@intrinsic
+def axyon_q_flush(s: &mut QSession, p: Pending) -> i64:
+    pass
+
+@intrinsic
+def axyon_q_reset(q: &mut Qubit) -> None:
+    pass
+
+@intrinsic
+def axyon_q_release(q: Qubit) -> None:
+    pass
+
+@intrinsic
+def axyon_q_reset_release(q: Qubit) -> None:
+    pass
+
+@host
+def bell() -> i64:
+    let mut s: QSession = axyon_q_session_sim()
+    let mut a: Qubit = axyon_q_alloc(&mut s)
+    let mut b: Qubit = axyon_q_alloc(&mut s)
+    axyon_q_h(&mut a)
+    axyon_q_cx(&mut a, &mut b)
+    let pa: Pending = axyon_q_measure(&mut a)
+    let pb: Pending = axyon_q_measure(&mut b)
+    let ra: i64 = axyon_q_flush(&mut s, pa)
+    let rb: i64 = axyon_q_flush(&mut s, pb)
+    # Measured qubits may be released, or reset and reused.
+    axyon_q_release(a)
+    axyon_q_release(b)
+    return ra + rb
+
+@host
+def reuse(theta: f64) -> i64:
+    let mut s: QSession = axyon_q_session_sim()
+    let mut q: Qubit = axyon_q_alloc(&mut s)
+    axyon_q_ry(&mut q, theta)
+    let p: Pending = axyon_q_measure(&mut q)
+    let r: i64 = axyon_q_flush(&mut s, p)
+    axyon_q_reset(&mut q)
+    axyon_q_x(&mut q)
+    axyon_q_reset_release(q)
+    return r
+
+@host
+def main() -> i32:
+    let a: i64 = bell()
+    let b: i64 = reuse(0.5)
+    # Bell outcomes are perfectly correlated: the two bits sum to 0 or 2.
+    assert!(a == 0 or a == 2, "Bell pair outcomes must agree")
+    return (b * 0) as i32

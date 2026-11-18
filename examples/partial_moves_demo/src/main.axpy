@@ -1,0 +1,56 @@
+# Partial moves of struct fields (#763).
+#
+# Moving one field out of a struct leaves the other fields owned by the
+# struct. The compiler drops what is left field by field, with one run-time
+# drop flag per tracked field, so every `Noisy` prints
+# "drop <id>" exactly once.
+
+struct Noisy:
+    id: i64
+
+impl Drop for Noisy:
+    def drop(self) -> unit:
+        println!("drop {self.id}")
+
+struct Pair:
+    a: Noisy
+    b: Noisy
+
+def consume(n: Noisy) -> i64:
+    return n.id
+
+def make_pair(x: i64, y: i64) -> Pair:
+    return Pair { a: Noisy { id: x }, b: Noisy { id: y } }
+
+# `s.a` is moved; only `s.b` is dropped at the end of the scope.
+def move_one() -> unit:
+    let s: Pair = make_pair(1, 2)
+    consume(s.a)
+
+# Assigning the moved field back makes `s` whole again.
+def refill() -> unit:
+    let mut s: Pair = make_pair(3, 4)
+    consume(s.a)
+    s.a = Noisy { id: 5 }
+
+# A move on one branch only is decided at run time by the field's drop flag.
+def maybe(c: bool) -> unit:
+    let s: Pair = make_pair(6, 7)
+    if c:
+        consume(s.a)
+
+# A field moved out of a `Box` (#2461): the other field drops, then the
+# allocation is freed once.
+def boxed(c: bool) -> unit:
+    let b: Box[Pair] = Box.new(make_pair(8, 9))
+    if c:
+        consume((*b).a)
+
+def main() -> i32:
+    move_one()
+    refill()
+    maybe(true)
+    maybe(false)
+    boxed(true)
+    boxed(false)
+    return 0

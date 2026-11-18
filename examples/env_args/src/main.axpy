@@ -1,0 +1,28 @@
+# env_args - read command-line arguments by index (issue #2813).
+#
+#   axyon run -- cases/jet_m09.cfg out/run3
+#
+# prints the argument count and every user argument. Run without arguments it
+# prints `argc: 1` only (argv[0] is the program name).
+
+from std.env import args, Args, arg_into, VarStatus
+from std.alloc import Vec, String
+
+def main() -> i32:
+    let a: Args = args()
+    let n: i64 = a.len()
+    println!("argc: {n}")
+    let mut i: i64 = 1
+    while i < n:
+        let s: String = a.get(i)
+        println!("arg {i}: {s}")
+        i = i + 1
+    # Past the end: `get` yields an empty String, `arg_into` reports it.
+    let past: String = a.get(n)
+    let plen: i64 = past.len() as i64
+    println!("past end len: {plen}")
+    let mut buf: Vec[u8] = Vec.new()
+    let st: VarStatus = arg_into(n, ref_mut(buf))
+    if st == VarStatus.NotPresent:
+        println!("past end: not present")
+    return 0

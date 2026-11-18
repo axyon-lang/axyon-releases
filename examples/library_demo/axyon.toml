@@ -1,0 +1,14 @@
+[package]
+name = "library_demo"
+version = "0.1.0"
+edition = "2024"
+
+# Build as both an AXYON crate bundle and a native static library
+[lib]
+crate_type = ["rlib", "static"]
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true

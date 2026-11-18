@@ -1,0 +1,568 @@
+# Dense row-major matmul on an NVIDIA GPU (issue #2110)
+#
+# Runs every kernel below (f32 and f64, untiled and tiled) over
+# zero, identity, random and cancellation matrices at zero, one, odd,
+# rectangular and tile-boundary shapes. The host fills the inputs from a
+# fixed-seed generator, copies them to the device, launches the
+# compiler-generated PTX kernel, copies `c` back and compares every element
+# with a sequential host loop, bit for bit: the kernels' accumulation order
+# and rounding are the host's (see the kernels), so the strict reference
+# is exact equality, signed zeros and cancellation included.
+#
+# Run with an argument (`cuda_matmul bench`) the executable instead runs the
+# benchmark sweep at the end of this file.
+#
+# Set `AXYON_GPU_LAUNCH_EVIDENCE=1` to see, for each launch, the backend and
+# the device it ran on. Without a CUDA device the first device allocation
+# stops the program with an AXYON panic: there is no CPU fallback.
+
+from std.env import argc
+from std.time import Instant
+
+# `c = a · b` with `a: M x K`, `b: K x N` and `c: M x N`, every buffer a
+# contiguous row-major `device_global` buffer with run-time extents. Two
+# kernels per element type:
+#
+# - `*_naive`: one thread per output element, reading `a` and `b` straight
+#   from global memory. The untiled baseline: the simplest correct kernel,
+#   the reference the tiled one is compared with, and the variant
+#   `TILED_MIN_WORK` selects below its crossover (see `docs/src/reference/
+#   cuda-matmul.md` for the measurements behind it).
+# - `*_tiled`: the same arithmetic staged through two 16 x 16 workgroup
+#   (shared-memory) tiles, with a workgroup barrier after loading a tile and
+#   after consuming it. Rectangular shapes and M/N/K tails are handled by
+#   bounds checks on every global load, never by assuming divisibility.
+#
+# Numerical semantics are strict and identical for both kernels: each
+# output is `((0 + a[i,0]*b[0,j]) + a[i,1]*b[1,j]) + ...` in increasing `p`,
+# with every product and every sum rounded to nearest-even in the element
+# type (PTX `mul.rn` + `add.rn`; no fused multiply-add, no flush-to-zero, no
+# TF32 or tensor-core operation). The tiled kernel adds exactly the same
+# terms in the same order (its last tile stops at `K`, so no padding term is
+# added), so both match a sequential host loop bit for bit.
+#
+# Launch shape: the grid is 1-D. Block `g` computes the 16 x 16 output tile
+# at tile row `g >> sh` and tile column `g & ((1 << sh) - 1)`, where `1 << sh`
+# is the tile-column count rounded up to a power of two: device code cannot
+# divide by a run-time value (`AX0626`), and a shift and a mask need no
+# divisor. Blocks whose tile column is past `N` (the padding) compute
+# nothing. Thread `t` of the 256-thread block covers row `t / 16`, column
+# `t % 16` of its tile.
+
+const TILE: i64 = 16
+const TILE_THREADS: i64 = 256
+
+# The most blocks a 1-D grid may have on the pinned profile (sm_80: x up to
+# 2^31 - 1).
+const MAX_GRID: i64 = 2147483647
+
+# Below this many multiply-adds (M * N * K) the untiled kernel is used. On
+# the A100 (`docs/src/reference/cuda-matmul.md`, best warm sample of two
+# runs) the untiled kernel is ~3% faster at 16^3 (both launch-bound at
+# ~43 us: the tiled kernel's zero-fill and barriers are pure overhead for one
+# tile), and the tiled kernel is faster from 32^3 (1.07x) up to 2048^3
+# (2.2x) and 4096 x 64 x 4096 (3x). The crossover is therefore 32^3.
+const TILED_MIN_WORK: i64 = 32768
+
+@gpu(entry)
+def matmul_f32_naive(sh: i64, a: &Buffer[f32, (M, K), device_global], b: &Buffer[f32, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    let row: i64 = (gpu_block_id(0) >> sh) * TILE + gpu_thread_id(0) / TILE
+    let col: i64 = (gpu_block_id(0) & ((1 << sh) - 1)) * TILE + gpu_thread_id(0) % TILE
+    if row < buffer_dim(c, 0) and col < buffer_dim(c, 1):
+        let mut acc: f32 = 0.0
+        for p: i64 in range(buffer_dim(a, 1)):
+            acc = acc + buffer_get(a, row, p) * buffer_get(b, p, col)
+        buffer_set(c, row, col, acc)
+
+@gpu(entry)
+def matmul_f64_naive(sh: i64, a: &Buffer[f64, (M, K), device_global], b: &Buffer[f64, (K, N), device_global], c: &mut Buffer[f64, (M, N), device_global]) -> None:
+    let row: i64 = (gpu_block_id(0) >> sh) * TILE + gpu_thread_id(0) / TILE
+    let col: i64 = (gpu_block_id(0) & ((1 << sh) - 1)) * TILE + gpu_thread_id(0) % TILE
+    if row < buffer_dim(c, 0) and col < buffer_dim(c, 1):
+        let mut acc: f64 = 0.0
+        for p: i64 in range(buffer_dim(a, 1)):
+            acc = acc + buffer_get(a, row, p) * buffer_get(b, p, col)
+        buffer_set(c, row, col, acc)
+
+@gpu(entry)
+def matmul_f32_tiled(sh: i64, a: &Buffer[f32, (M, K), device_global], b: &Buffer[f32, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    # Both tiles start zeroed (the workgroup buffer contract).
+    let ta: &mut Buffer[f32, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let tb: &mut Buffer[f32, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let ty: i64 = gpu_thread_id(0) / TILE
+    let tx: i64 = gpu_thread_id(0) % TILE
+    let row: i64 = (gpu_block_id(0) >> sh) * TILE + ty
+    let col: i64 = (gpu_block_id(0) & ((1 << sh) - 1)) * TILE + tx
+    let m: i64 = buffer_dim(c, 0)
+    let n: i64 = buffer_dim(c, 1)
+    let k: i64 = buffer_dim(a, 1)
+    let mut acc: f32 = 0.0
+    # Padding blocks (tile column past `N`) skip the whole loop. The
+    # condition and the trip count are the same for every thread of the
+    # block, so every thread reaches every barrier.
+    if (gpu_block_id(0) & ((1 << sh) - 1)) * TILE < buffer_dim(c, 1):
+        for t: i64 in range((buffer_dim(a, 1) + TILE - 1) / TILE):
+            # Stage a[row, t*16 + tx] and b[t*16 + ty, col]; out-of-range
+            # elements load as zero and are never added (`lim` below).
+            let pa: i64 = t * TILE + tx
+            let mut va: f32 = 0.0
+            if row < m and pa < k:
+                va = buffer_get(a, row, pa)
+            buffer_set(ta, ty, tx, va)
+            let pb: i64 = t * TILE + ty
+            let mut vb: f32 = 0.0
+            if pb < k and col < n:
+                vb = buffer_get(b, pb, col)
+            buffer_set(tb, ty, tx, vb)
+            # Both tiles are complete before anyone reads them.
+            gpu_barrier()
+            let mut lim: i64 = k - t * TILE
+            if lim > TILE:
+                lim = TILE
+            for q: i64 in range(lim):
+                acc = acc + buffer_get(ta, ty, q) * buffer_get(tb, q, tx)
+            # Everyone is done reading before the next tile overwrites them.
+            gpu_barrier()
+    if row < m and col < n:
+        buffer_set(c, row, col, acc)
+
+@gpu(entry)
+def matmul_f64_tiled(sh: i64, a: &Buffer[f64, (M, K), device_global], b: &Buffer[f64, (K, N), device_global], c: &mut Buffer[f64, (M, N), device_global]) -> None:
+    # Both tiles start zeroed (the workgroup buffer contract).
+    let ta: &mut Buffer[f64, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let tb: &mut Buffer[f64, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let ty: i64 = gpu_thread_id(0) / TILE
+    let tx: i64 = gpu_thread_id(0) % TILE
+    let row: i64 = (gpu_block_id(0) >> sh) * TILE + ty
+    let col: i64 = (gpu_block_id(0) & ((1 << sh) - 1)) * TILE + tx
+    let m: i64 = buffer_dim(c, 0)
+    let n: i64 = buffer_dim(c, 1)
+    let k: i64 = buffer_dim(a, 1)
+    let mut acc: f64 = 0.0
+    # Padding blocks (tile column past `N`) skip the whole loop. The
+    # condition and the trip count are the same for every thread of the
+    # block, so every thread reaches every barrier.
+    if (gpu_block_id(0) & ((1 << sh) - 1)) * TILE < buffer_dim(c, 1):
+        for t: i64 in range((buffer_dim(a, 1) + TILE - 1) / TILE):
+            # Stage a[row, t*16 + tx] and b[t*16 + ty, col]; out-of-range
+            # elements load as zero and are never added (`lim` below).
+            let pa: i64 = t * TILE + tx
+            let mut va: f64 = 0.0
+            if row < m and pa < k:
+                va = buffer_get(a, row, pa)
+            buffer_set(ta, ty, tx, va)
+            let pb: i64 = t * TILE + ty
+            let mut vb: f64 = 0.0
+            if pb < k and col < n:
+                vb = buffer_get(b, pb, col)
+            buffer_set(tb, ty, tx, vb)
+            # Both tiles are complete before anyone reads them.
+            gpu_barrier()
+            let mut lim: i64 = k - t * TILE
+            if lim > TILE:
+                lim = TILE
+            for q: i64 in range(lim):
+                acc = acc + buffer_get(ta, ty, q) * buffer_get(tb, q, tx)
+            # Everyone is done reading before the next tile overwrites them.
+            gpu_barrier()
+    if row < m and col < n:
+        buffer_set(c, row, col, acc)
+
+# The smallest `sh` with `1 << sh >= tiles`: the tile-column count rounded
+# up to a power of two.
+def col_shift(tiles: i64) -> i64:
+    let mut sh: i64 = 0
+    while (1 << sh) < tiles:
+        sh = sh + 1
+    return sh
+
+# Validate the extents of `c = a · b` (`a: m x k`, `b: k x n`, `c: m x n`)
+# and return the launch's column shift. Host code cannot read the extents of
+# a `device_global` buffer (`buffer_dim` is device-only on them, `AX0623`),
+# so the caller passes the extents it allocated with; the kernels read the
+# real extents from the buffers themselves and every element access is
+# bounds-checked, so a caller passing the wrong extents gets a trap or an
+# incomplete `c`, never an out-of-bounds access. Every rejection below stops
+# the program with an AXYON panic before anything is launched: negative
+# extents and shapes whose grid would not fit one 1-D launch. A zero extent
+# is valid: `m = 0` or `n = 0` gives an empty grid (`grid_for`), so no block
+# runs, and `k = 0` writes zeros.
+def checked_shift(m: i64, n: i64, k: i64) -> i64:
+    assert!(m >= 0 and n >= 0 and k >= 0, "matmul: extents are non-negative")
+    # Extents come from live allocations, so they are far below 2^62:
+    # `x + TILE - 1` cannot overflow.
+    let tiles_m: i64 = (m + TILE - 1) / TILE
+    let sh: i64 = col_shift((n + TILE - 1) / TILE)
+    assert!(sh < 31, "matmul: too many output columns for one launch")
+    assert!(tiles_m <= (MAX_GRID >> sh), "matmul: too many output tiles for one launch")
+    return sh
+
+# The block count of the launch for an `m x n` output with column shift
+# `sh`. Every wrapper launches through this, so an empty output (`m = 0` or
+# `n = 0`) is a zero-block grid, which the runtime treats as zero work: no
+# block runs and no buffer is touched. `col_shift(0)` is 0, so without the
+# `n = 0` test the grid would be `ceil(m / TILE)` blocks that compute nothing.
+def grid_for(m: i64, n: i64, sh: i64) -> i64:
+    if m == 0 or n == 0:
+        return 0
+    return ((m + TILE - 1) / TILE) << sh
+
+# `c = a · b` in f32 with the untiled kernel.
+def matmul_f32_untiled(m: i64, n: i64, k: i64, a: &Buffer[f32, (M, K), device_global], b: &Buffer[f32, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    let sh: i64 = checked_shift(m, n, k)
+    gpu_launch(matmul_f32_naive, grid_for(m, n, sh), TILE_THREADS, sh, a, b, c)
+
+# `c = a · b` in f64 with the untiled kernel.
+def matmul_f64_untiled(m: i64, n: i64, k: i64, a: &Buffer[f64, (M, K), device_global], b: &Buffer[f64, (K, N), device_global], c: &mut Buffer[f64, (M, N), device_global]) -> None:
+    let sh: i64 = checked_shift(m, n, k)
+    gpu_launch(matmul_f64_naive, grid_for(m, n, sh), TILE_THREADS, sh, a, b, c)
+
+# `c = a · b` in f32 with the tiled kernel.
+def matmul_f32_tiled_launch(m: i64, n: i64, k: i64, a: &Buffer[f32, (M, K), device_global], b: &Buffer[f32, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    let sh: i64 = checked_shift(m, n, k)
+    gpu_launch(matmul_f32_tiled, grid_for(m, n, sh), TILE_THREADS, sh, a, b, c)
+
+# `c = a · b` in f32: the untiled kernel below `TILED_MIN_WORK` multiply-adds,
+# the tiled one from there on. Both give the same bits.
+def matmul_f32(m: i64, n: i64, k: i64, a: &Buffer[f32, (M, K), device_global], b: &Buffer[f32, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    # Saturating M * N * K: extents are far below 2^62, so each product
+    # step is checked against the threshold before it can overflow.
+    let mn: i64 = m * n
+    if k > 0 and mn >= (TILED_MIN_WORK + k - 1) / k:
+        matmul_f32_tiled_launch(m, n, k, a, b, c)
+    else:
+        matmul_f32_untiled(m, n, k, a, b, c)
+
+# `c = a · b` in f64 with the tiled kernel.
+def matmul_f64_tiled_launch(m: i64, n: i64, k: i64, a: &Buffer[f64, (M, K), device_global], b: &Buffer[f64, (K, N), device_global], c: &mut Buffer[f64, (M, N), device_global]) -> None:
+    let sh: i64 = checked_shift(m, n, k)
+    gpu_launch(matmul_f64_tiled, grid_for(m, n, sh), TILE_THREADS, sh, a, b, c)
+
+# `c = a · b` in f64: the untiled kernel below `TILED_MIN_WORK` multiply-adds,
+# the tiled one from there on. Both give the same bits.
+def matmul_f64(m: i64, n: i64, k: i64, a: &Buffer[f64, (M, K), device_global], b: &Buffer[f64, (K, N), device_global], c: &mut Buffer[f64, (M, N), device_global]) -> None:
+    # Saturating M * N * K: extents are far below 2^62, so each product
+    # step is checked against the threshold before it can overflow.
+    let mn: i64 = m * n
+    if k > 0 and mn >= (TILED_MIN_WORK + k - 1) / k:
+        matmul_f64_tiled_launch(m, n, k, a, b, c)
+    else:
+        matmul_f64_untiled(m, n, k, a, b, c)
+
+
+# A fixed-seed linear congruential generator: the same inputs every run.
+def next_seed(s: i64) -> i64:
+    return (s * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+
+# Input element `idx` of matrix `which` (0 = a, 1 = b) for `kind`:
+# 0 zero, 1 identity (`b` only; `a` random), 2 random, 3 cancellation.
+# `r` is a fresh random value from the generator.
+def value(kind: i64, which: i64, row: i64, col: i64, r: i64) -> f64:
+    # Multiples of 1/3 in [-2^10, 2^10): products and sums round.
+    let rand: f64 = (((r >> 20) & 2097151) - 1048576) as f64 / 3072.0
+    if kind == 0:
+        return 0.0
+    if kind == 1 and which == 1:
+        if row == col:
+            return 1.0
+        return 0.0
+    if kind == 3 and which == 0:
+        # Huge terms of alternating sign around small ones: the result
+        # depends on the summation order and on fused or separate rounding.
+        let phase: i64 = col % 3
+        if phase == 0:
+            return 100000000.0
+        if phase == 1:
+            return rand
+        return -100000000.0
+    if kind == 3 and which == 1:
+        return 1.0 + rand / 1048576.0
+    return rand
+
+# Exact equality: the same value with the same sign of zero, or both NaN.
+def same_f32(x: f32, y: f32) -> bool:
+    if x != x:
+        return y != y
+    if x != y:
+        return false
+    if x != 0.0:
+        return true
+    return 1.0 / x == 1.0 / y
+
+def same_f64(x: f64, y: f64) -> bool:
+    if x != x:
+        return y != y
+    if x != y:
+        return false
+    if x != 0.0:
+        return true
+    return 1.0 / x == 1.0 / y
+
+# Run `c = a · b` in f32 for an `m x k` by `k x n` product of `kind`, with
+# the untiled (`variant` 0), tiled (1) or automatically selected (2)
+# kernel; returns the number of elements that differ from the host loop.
+def check_f32(m: i64, n: i64, k: i64, kind: i64, seed: i64, variant: i64) -> i64:
+    let mut s: i64 = seed
+    let mut ha: Buffer[f32, (M, K)] = buffer_alloc([m, k])
+    let mut hb: Buffer[f32, (K, N)] = buffer_alloc([k, n])
+    let mut hc: Buffer[f32, (M, N)] = buffer_alloc([m, n])
+    for i: i64 in range(m):
+        for p: i64 in range(k):
+            s = next_seed(s)
+            buffer_set(ha, i, p, value(kind, 0, i, p, s) as f32)
+    for p: i64 in range(k):
+        for j: i64 in range(n):
+            s = next_seed(s)
+            buffer_set(hb, p, j, value(kind, 1, p, j, s) as f32)
+    # Sentinels: every element must be overwritten.
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            buffer_set(hc, i, j, -7.0)
+    # The strict reference: a sequential loop in increasing `p`, every
+    # product and sum rounded in f32.
+    let mut r: Buffer[f32, (M, N)] = buffer_alloc([m, n])
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            let mut acc: f32 = 0.0
+            for p: i64 in range(k):
+                let prod: f32 = buffer_get(ha, i, p) * buffer_get(hb, p, j)
+                acc = acc + prod
+            buffer_set(r, i, j, acc)
+    let da: Buffer[f32, (M, K), device_global] = buffer_to_device(ha)
+    let db: Buffer[f32, (K, N), device_global] = buffer_to_device(hb)
+    let mut dc: Buffer[f32, (M, N), device_global] = buffer_to_device(hc)
+    if variant == 0:
+        matmul_f32_untiled(m, n, k, &da, &db, &mut dc)
+    elif variant == 1:
+        matmul_f32_tiled_launch(m, n, k, &da, &db, &mut dc)
+    else:
+        matmul_f32(m, n, k, &da, &db, &mut dc)
+    let out: Buffer[f32, (M, N)] = buffer_to_host(dc)
+    let mut bad: i64 = 0
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            let got: f32 = buffer_get(out, i, j)
+            let want: f32 = buffer_get(r, i, j)
+            if not same_f32(got, want):
+                bad = bad + 1
+    return bad
+
+# `check_f32` in f64.
+def check_f64(m: i64, n: i64, k: i64, kind: i64, seed: i64, variant: i64) -> i64:
+    let mut s: i64 = seed
+    let mut ha: Buffer[f64, (M, K)] = buffer_alloc([m, k])
+    let mut hb: Buffer[f64, (K, N)] = buffer_alloc([k, n])
+    let mut hc: Buffer[f64, (M, N)] = buffer_alloc([m, n])
+    for i: i64 in range(m):
+        for p: i64 in range(k):
+            s = next_seed(s)
+            buffer_set(ha, i, p, value(kind, 0, i, p, s))
+    for p: i64 in range(k):
+        for j: i64 in range(n):
+            s = next_seed(s)
+            buffer_set(hb, p, j, value(kind, 1, p, j, s))
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            buffer_set(hc, i, j, -7.0)
+    let mut r: Buffer[f64, (M, N)] = buffer_alloc([m, n])
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            let mut acc: f64 = 0.0
+            for p: i64 in range(k):
+                let prod: f64 = buffer_get(ha, i, p) * buffer_get(hb, p, j)
+                acc = acc + prod
+            buffer_set(r, i, j, acc)
+    let da: Buffer[f64, (M, K), device_global] = buffer_to_device(ha)
+    let db: Buffer[f64, (K, N), device_global] = buffer_to_device(hb)
+    let mut dc: Buffer[f64, (M, N), device_global] = buffer_to_device(hc)
+    if variant == 0:
+        matmul_f64_untiled(m, n, k, &da, &db, &mut dc)
+    elif variant == 1:
+        matmul_f64_tiled_launch(m, n, k, &da, &db, &mut dc)
+    else:
+        matmul_f64(m, n, k, &da, &db, &mut dc)
+    let out: Buffer[f64, (M, N)] = buffer_to_host(dc)
+    let mut bad: i64 = 0
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            let got: f64 = buffer_get(out, i, j)
+            let want: f64 = buffer_get(r, i, j)
+            if not same_f64(got, want):
+                bad = bad + 1
+    return bad
+
+# ---------------------------------------------------------------------------
+# Benchmark sweep (`cuda_matmul bench`, driven by
+# `benches/cuda_matmul/run_cuda_matmul.py`). Every timed phase prints one raw
+# sample line `sample,<dtype>,<variant>,<m>,<n>,<k>,<phase>,<rep>,<ns>`:
+# `upload` (the three host-to-device copies), `cold` (the first launch of
+# this kernel and shape), `warm` (each of `reps` later launches; a launch
+# waits for the kernel, so a sample is the host-observed launch-to-completion
+# time) and `download` (the copy of `c` back). `jit` is the process's first
+# launch, which also loads and JIT-compiles the PTX image. A `check` line
+# records whether the result equals the untiled kernel's bit for bit.
+
+def emit(dtype: i64, variant: i64, m: i64, n: i64, k: i64, phase: i64, rep: i64, ns: i64) -> None:
+    let mut d: i64 = 32
+    if dtype == 1:
+        d = 64
+    # Phases: 0 upload, 1 cold, 2 warm, 3 download, 4 jit, 5 check.
+    if phase == 0:
+        println!("sample,f{d},{variant},{m},{n},{k},upload,{rep},{ns}")
+    elif phase == 1:
+        println!("sample,f{d},{variant},{m},{n},{k},cold,{rep},{ns}")
+    elif phase == 2:
+        println!("sample,f{d},{variant},{m},{n},{k},warm,{rep},{ns}")
+    elif phase == 3:
+        println!("sample,f{d},{variant},{m},{n},{k},download,{rep},{ns}")
+    elif phase == 4:
+        println!("sample,f{d},{variant},{m},{n},{k},jit,{rep},{ns}")
+    else:
+        println!("sample,f{d},{variant},{m},{n},{k},check,{rep},{ns}")
+
+# Time one f32 shape with `variant` (0 untiled, 1 tiled); returns 1 when its
+# result differs from the untiled kernel's.
+def bench_f32(m: i64, n: i64, k: i64, variant: i64, reps: i64) -> i64:
+    let mut ha: Buffer[f32, (M, K)] = buffer_alloc([m, k])
+    let mut sha: i64 = 11
+    for i: i64 in range(m):
+        for j: i64 in range(k):
+            sha = next_seed(sha)
+            buffer_set(ha, i, j, value(2, 0, i, j, sha) as f32)
+    let mut hb: Buffer[f32, (K, N)] = buffer_alloc([k, n])
+    let mut shb: i64 = 12
+    for i: i64 in range(k):
+        for j: i64 in range(n):
+            shb = next_seed(shb)
+            buffer_set(hb, i, j, value(2, 0, i, j, shb) as f32)
+    let hc: Buffer[f32, (M, N)] = buffer_alloc([m, n])
+    let hr: Buffer[f32, (M, N)] = buffer_alloc([m, n])
+    let mut t0: Instant = Instant.now()
+    let da: Buffer[f32, (M, K), device_global] = buffer_to_device(ha)
+    let db: Buffer[f32, (K, N), device_global] = buffer_to_device(hb)
+    let mut dc: Buffer[f32, (M, N), device_global] = buffer_to_device(hc)
+    emit(0, variant, m, n, k, 0, 0, t0.elapsed().as_nanos())
+    let mut dr: Buffer[f32, (M, N), device_global] = buffer_to_device(hr)
+    for rep: i64 in range(reps + 1):
+        t0 = Instant.now()
+        if variant == 0:
+            matmul_f32_untiled(m, n, k, &da, &db, &mut dc)
+        else:
+            matmul_f32_tiled_launch(m, n, k, &da, &db, &mut dc)
+        let ns: i64 = t0.elapsed().as_nanos()
+        if rep == 0:
+            emit(0, variant, m, n, k, 1, 0, ns)
+        else:
+            emit(0, variant, m, n, k, 2, rep - 1, ns)
+    matmul_f32_untiled(m, n, k, &da, &db, &mut dr)
+    t0 = Instant.now()
+    let out: Buffer[f32, (M, N)] = buffer_to_host(dc)
+    emit(0, variant, m, n, k, 3, 0, t0.elapsed().as_nanos())
+    let want: Buffer[f32, (M, N)] = buffer_to_host(dr)
+    let mut bad: i64 = 0
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            if not same_f32(buffer_get(out, i, j), buffer_get(want, i, j)):
+                bad = 1
+    emit(0, variant, m, n, k, 5, 0, bad)
+    return bad
+
+def bench_f64(m: i64, n: i64, k: i64, variant: i64, reps: i64) -> i64:
+    let mut ha: Buffer[f64, (M, K)] = buffer_alloc([m, k])
+    let mut sha: i64 = 11
+    for i: i64 in range(m):
+        for j: i64 in range(k):
+            sha = next_seed(sha)
+            buffer_set(ha, i, j, value(2, 0, i, j, sha))
+    let mut hb: Buffer[f64, (K, N)] = buffer_alloc([k, n])
+    let mut shb: i64 = 12
+    for i: i64 in range(k):
+        for j: i64 in range(n):
+            shb = next_seed(shb)
+            buffer_set(hb, i, j, value(2, 0, i, j, shb))
+    let hc: Buffer[f64, (M, N)] = buffer_alloc([m, n])
+    let hr: Buffer[f64, (M, N)] = buffer_alloc([m, n])
+    let mut t0: Instant = Instant.now()
+    let da: Buffer[f64, (M, K), device_global] = buffer_to_device(ha)
+    let db: Buffer[f64, (K, N), device_global] = buffer_to_device(hb)
+    let mut dc: Buffer[f64, (M, N), device_global] = buffer_to_device(hc)
+    emit(1, variant, m, n, k, 0, 0, t0.elapsed().as_nanos())
+    let mut dr: Buffer[f64, (M, N), device_global] = buffer_to_device(hr)
+    for rep: i64 in range(reps + 1):
+        t0 = Instant.now()
+        if variant == 0:
+            matmul_f64_untiled(m, n, k, &da, &db, &mut dc)
+        else:
+            matmul_f64_tiled_launch(m, n, k, &da, &db, &mut dc)
+        let ns: i64 = t0.elapsed().as_nanos()
+        if rep == 0:
+            emit(1, variant, m, n, k, 1, 0, ns)
+        else:
+            emit(1, variant, m, n, k, 2, rep - 1, ns)
+    matmul_f64_untiled(m, n, k, &da, &db, &mut dr)
+    t0 = Instant.now()
+    let out: Buffer[f64, (M, N)] = buffer_to_host(dc)
+    emit(1, variant, m, n, k, 3, 0, t0.elapsed().as_nanos())
+    let want: Buffer[f64, (M, N)] = buffer_to_host(dr)
+    let mut bad: i64 = 0
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            if not same_f64(buffer_get(out, i, j), buffer_get(want, i, j)):
+                bad = 1
+    emit(1, variant, m, n, k, 5, 0, bad)
+    return bad
+
+def run_bench() -> i32:
+    # The process's first launch loads and JIT-compiles the image.
+    let mut hja: Buffer[f32, (M, K)] = buffer_alloc([1, 1])
+    buffer_set(hja, 0, 0, 1.0)
+    let mut hjb: Buffer[f32, (K, N)] = buffer_alloc([1, 1])
+    buffer_set(hjb, 0, 0, 2.0)
+    let hjc: Buffer[f32, (M, N)] = buffer_alloc([1, 1])
+    let ja: Buffer[f32, (M, K), device_global] = buffer_to_device(hja)
+    let jb: Buffer[f32, (K, N), device_global] = buffer_to_device(hjb)
+    let mut jc: Buffer[f32, (M, N), device_global] = buffer_to_device(hjc)
+    let t0: Instant = Instant.now()
+    matmul_f32_untiled(1, 1, 1, &ja, &jb, &mut jc)
+    emit(0, 0, 1, 1, 1, 4, 0, t0.elapsed().as_nanos())
+    # Launch-bound to compute-bound squares, odd and rectangular shapes, and
+    # the SmolLM2-135M projection shapes of `benches/ml_kernels`.
+    let ms: Array[i64; 14] = [16, 32, 64, 128, 256, 512, 1024, 2048, 1000, 1025, 128, 128, 1, 4096]
+    let ns: Array[i64; 14] = [16, 32, 64, 128, 256, 512, 1024, 2048, 1000, 1025, 576, 1536, 1536, 64]
+    let ks: Array[i64; 14] = [16, 32, 64, 128, 256, 512, 1024, 2048, 1000, 1025, 576, 576, 576, 4096]
+    let mut bad: i64 = 0
+    for t: i64 in range(14):
+        for variant: i64 in range(2):
+            bad = bad + bench_f32(ms[t], ns[t], ks[t], variant, 20)
+            if ms[t] * ns[t] * ks[t] <= 1073741824:
+                bad = bad + bench_f64(ms[t], ns[t], ks[t], variant, 20)
+    if bad != 0:
+        return 1
+    return 0
+
+def main() -> i32:
+    if argc() > 1:
+        return run_bench()
+    # (M, N, K): zero extents, one, odd, rectangular (wide, tall, deep),
+    # tile-exact and tile + 1 / tile - 1 boundaries, and a shape whose
+    # tile-column count (5) is not a power of two (padding blocks).
+    let ms: Array[i64; 16] = [0, 5, 4, 1, 7, 16, 17, 15, 32, 33, 1, 70, 3, 48, 31, 64]
+    let ns: Array[i64; 16] = [5, 0, 4, 1, 9, 16, 17, 15, 48, 31, 70, 1, 2, 80, 47, 64]
+    let ks: Array[i64; 16] = [3, 3, 0, 1, 5, 16, 17, 15, 16, 47, 300, 33, 129, 17, 65, 64]
+    let mut total: i64 = 0
+    for t: i64 in range(16):
+        let m: i64 = ms[t]
+        let n: i64 = ns[t]
+        let k: i64 = ks[t]
+        for kind: i64 in range(4):
+            for variant: i64 in range(3):
+                let seed: i64 = 2110 + t * 16 + kind * 4 + variant
+                let b32: i64 = check_f32(m, n, k, kind, seed, variant)
+                let b64: i64 = check_f64(m, n, k, kind, seed, variant)
+                if b32 + b64 != 0:
+                    println!("m={m} n={n} k={k} kind={kind} variant={variant}: f32 {b32}, f64 {b64} mismatches")
+                total = total + b32 + b64
+    if total != 0:
+        return 1
+    println!("matmul: f32 and f64, untiled and tiled, match the strict host reference at every shape")
+    return 0

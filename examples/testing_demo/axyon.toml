@@ -1,0 +1,11 @@
+[package]
+name = "testing_demo"
+version = "0.1.0"
+edition = "2024"
+description = "Demonstrates the @test decorator for unit testing"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true

@@ -1,0 +1,236 @@
+# Opt-in relaxed device math on an AMD GPU (issue #2865)
+#
+# The AMD counterpart of `examples/cuda_relaxed_math` (#2830). The same
+# kernels run under either device math mode of `[target] gpu-math` (this
+# package selects "relaxed"; delete the line for "strict"). The AMD lowering
+# has validated float arithmetic at `f32` only (relaxed float division is
+# AX0622, #2957), so every case is `f32`. Every device result is compared
+# with the strict host build of the same expression, in three classes:
+#
+# 1. Contractible arithmetic: `a * b + c` and a length-64 dot product
+#    accumulated in a loop. Strict device math rounds every operation
+#    (bit-identical to the host). Relaxed device math may fuse each
+#    `a * b + c` into one `v_fma_f32`/`v_fmac_f32` and reassociate the dot
+#    product, so each result must lie within its documented tolerance of
+#    the strict host value (u = 2^-24):
+#      a * b + c:  |dev - host| <= 4u (|a b| + |c|)
+#      dot (K=64): |dev - host| <= 2 (K + 1) u sum_k |x_k y_k|
+#    The count of results that differ from the host is printed: 0 under
+#    strict, nonzero under relaxed (the contraction really happened).
+# 2. A single correctly rounded operation: `math_sqrt`. Relaxed math never
+#    approximates (the square root stays correctly rounded, `correct-sqrt=on`),
+#    so it is bit-exact in both modes.
+# 3. A conversion (`as`): f32 -> i32 (truncating). A tolerance never waives
+#    a cast: it is bit-exact in both modes.
+#
+# Any value outside its class's rule fails the run. A NaN or infinite result
+# is outside every tolerance (`within`, checked by `check_within`).
+#
+# Set `AXYON_GPU_LAUNCH_EVIDENCE=1` to see, for each launch, the backend, the
+# device it ran on and a fingerprint of the HSACO image. Without a usable AMD
+# device the first device allocation stops the program with an AXYON panic:
+# there is no CPU fallback.
+
+const N: i64 = 4096
+const M: i64 = 256
+const K: i64 = 64
+const BLOCK: i64 = 128
+const U32: f64 = 0.000000059604644775390625
+
+@gpu(entry)
+def fma_f32(n: i64, a: &Buffer[f32, (4096,), device_global], b: &Buffer[f32, (4096,), device_global], c: &Buffer[f32, (4096,), device_global], out: &mut Buffer[f32, (4096,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, buffer_get(a, i) * buffer_get(b, i) + buffer_get(c, i))
+
+@gpu(entry)
+def dot_f32(m: i64, x: &Buffer[f32, (16384,), device_global], y: &Buffer[f32, (64,), device_global], out: &mut Buffer[f32, (256,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < m:
+        let mut acc: f32 = 0.0
+        for k: i64 in range(64):
+            acc = acc + buffer_get(x, i * 64 + k) * buffer_get(y, k)
+        buffer_set(out, i, acc)
+
+@gpu(entry)
+def exact_f32(n: i64, b: &Buffer[f32, (4096,), device_global], r: &mut Buffer[f32, (4096,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(r, i, math_sqrt(buffer_get(b, i)))
+
+@gpu(entry)
+def casts(n: i64, a: &Buffer[f32, (4096,), device_global], oi: &mut Buffer[i32, (4096,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let x: f32 = buffer_get(a, i)
+        buffer_set(oi, i, (x * 1000.0) as i32)
+
+# A fixed-seed linear congruential generator: the same inputs every run.
+def next_seed(s: i64) -> i64:
+    return (s * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+
+# A value in [-1, 1) from a seed (53 random bits).
+def unit(s: i64) -> f64:
+    return ((s >> 10) as f64) / 4503599627370496.0 - 1.0
+
+# A value in [0.5, 2) from a seed: a positive divisor and radicand.
+def positive(s: i64) -> f64:
+    return ((s >> 10) as f64) / 6004799503160661.0 + 0.5
+
+def blocks_for(n: i64) -> i64:
+    return (n + BLOCK - 1) / BLOCK
+
+def absf(x: f64) -> f64:
+    if x < 0.0:
+        return -x
+    return x
+
+# The same value: equal bit patterns (no NaN arises from these inputs).
+def same(x: f64, y: f64) -> bool:
+    return x.to_bits() == y.to_bits()
+
+# Whether `got` is within `tol` of `want`. Written as `<=` so an unordered
+# comparison is a failure: a NaN (or an infinity minus itself) is never
+# within any tolerance. Every tolerance check of this file goes through it.
+def within(got: f64, want: f64, tol: f64) -> bool:
+    return absf(got - want) <= tol
+
+# `within` rejects NaN and infinite results and accepts the bounds it
+# states; any other answer is a violation.
+def check_within() -> i64:
+    let zero: f64 = 0.0
+    let nan: f64 = zero / zero
+    let inf: f64 = 1.0 / zero
+    let mut bad: i64 = 0
+    if within(nan, 1.0, 1.0) or within(1.0, nan, 1.0) or within(nan, nan, inf):
+        println!("relaxed-math: a NaN result passed the tolerance check")
+        bad = bad + 1
+    if within(inf, inf, 1.0) or within(inf, 1.0, 1.0):
+        println!("relaxed-math: an infinite result passed the tolerance check")
+        bad = bad + 1
+    if not within(1.5, 1.0, 0.5) or within(1.5, 1.0, 0.25):
+        println!("relaxed-math: the tolerance check misjudged a finite result")
+        bad = bad + 1
+    return bad
+
+def report(what: str, i: i64, got: f64, want: f64, tol: f64) -> i64:
+    println!("{what} lane {i}: got {got}, want {want} (tolerance {tol})")
+    return 1
+
+# Contractible f32 `a * b + c` and dot product, then the exact square root.
+# Returns (violations, results that differ from the strict host).
+def check_f32(seed: i64) -> Array[i64; 2]:
+    let mut s: i64 = seed
+    let mut a: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut b: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut c: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut p: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut o: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut r: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut x: Buffer[f32, (16384,)] = buffer_alloc([16384])
+    let mut y: Buffer[f32, (64,)] = buffer_alloc([64])
+    let mut d: Buffer[f32, (256,)] = buffer_alloc([256])
+    for i: i64 in range(N):
+        s = next_seed(s)
+        buffer_set(a, i, unit(s) as f32)
+        s = next_seed(s)
+        buffer_set(b, i, unit(s) as f32)
+        s = next_seed(s)
+        buffer_set(c, i, unit(s) as f32)
+        s = next_seed(s)
+        buffer_set(p, i, positive(s) as f32)
+    for i: i64 in range(M * K):
+        s = next_seed(s)
+        buffer_set(x, i, unit(s) as f32)
+    for k: i64 in range(K):
+        s = next_seed(s)
+        buffer_set(y, k, unit(s) as f32)
+    # The strict host references and tolerances, before the inputs move.
+    let mut want_fma: Array[f32; 4096] = [0.0_f32; 4096]
+    let mut tol_fma: Array[f64; 4096] = [0.0; 4096]
+    let mut want_r: Array[f32; 4096] = [0.0_f32; 4096]
+    for i: i64 in range(N):
+        let ai: f32 = buffer_get(a, i)
+        let bi: f32 = buffer_get(b, i)
+        let ci: f32 = buffer_get(c, i)
+        want_fma[i] = ai * bi + ci
+        tol_fma[i] = 4.0 * U32 * (absf((ai as f64) * (bi as f64)) + absf(ci as f64))
+        want_r[i] = math_sqrt(buffer_get(p, i))
+    let mut want_dot: Array[f32; 256] = [0.0_f32; 256]
+    let mut tol_dot: Array[f64; 256] = [0.0; 256]
+    for i: i64 in range(M):
+        let mut acc: f32 = 0.0
+        let mut mag: f64 = 0.0
+        for k: i64 in range(K):
+            acc = acc + buffer_get(x, i * K + k) * buffer_get(y, k)
+            mag = mag + absf((buffer_get(x, i * K + k) as f64) * (buffer_get(y, k) as f64))
+        want_dot[i] = acc
+        tol_dot[i] = 2.0 * ((K + 1) as f64) * U32 * mag
+    let da: Buffer[f32, (4096,), device_global] = buffer_to_device(a)
+    let db: Buffer[f32, (4096,), device_global] = buffer_to_device(b)
+    let dc: Buffer[f32, (4096,), device_global] = buffer_to_device(c)
+    let dp: Buffer[f32, (4096,), device_global] = buffer_to_device(p)
+    let mut d_o: Buffer[f32, (4096,), device_global] = buffer_to_device(o)
+    let mut dr: Buffer[f32, (4096,), device_global] = buffer_to_device(r)
+    let dx: Buffer[f32, (16384,), device_global] = buffer_to_device(x)
+    let dy: Buffer[f32, (64,), device_global] = buffer_to_device(y)
+    let mut dd: Buffer[f32, (256,), device_global] = buffer_to_device(d)
+    gpu_launch(fma_f32, blocks_for(N), BLOCK, N, &da, &db, &dc, &mut d_o)
+    gpu_launch(dot_f32, blocks_for(M), BLOCK, M, &dx, &dy, &mut dd)
+    gpu_launch(exact_f32, blocks_for(N), BLOCK, N, &dp, &mut dr)
+    let ho: Buffer[f32, (4096,)] = buffer_to_host(d_o)
+    let hd: Buffer[f32, (256,)] = buffer_to_host(dd)
+    let hr: Buffer[f32, (4096,)] = buffer_to_host(dr)
+    let mut bad: i64 = 0
+    let mut differ: i64 = 0
+    for i: i64 in range(N):
+        let got: f64 = buffer_get(ho, i) as f64
+        let want: f64 = want_fma[i] as f64
+        if not same(got, want):
+            differ = differ + 1
+            if not within(got, want, tol_fma[i]):
+                bad = bad + report("f32 a * b + c", i, got, want, tol_fma[i])
+        let gr: f64 = buffer_get(hr, i) as f64
+        if not same(gr, want_r[i] as f64):
+            bad = bad + report("f32 math_sqrt (exact)", i, gr, want_r[i] as f64, 0.0)
+    for i: i64 in range(M):
+        let got: f64 = buffer_get(hd, i) as f64
+        let want: f64 = want_dot[i] as f64
+        if not same(got, want):
+            differ = differ + 1
+            if not within(got, want, tol_dot[i]):
+                bad = bad + report("f32 dot", i, got, want, tol_dot[i])
+    return [bad, differ]
+
+# The conversion: bit-exact in both modes, never covered by a tolerance.
+def check_casts(seed: i64) -> i64:
+    let mut s: i64 = seed
+    let mut a: Buffer[f32, (4096,)] = buffer_alloc([4096])
+    let mut oi: Buffer[i32, (4096,)] = buffer_alloc([4096])
+    for i: i64 in range(N):
+        s = next_seed(s)
+        buffer_set(a, i, unit(s) as f32)
+    let mut want_i: Array[i32; 4096] = [0_i32; 4096]
+    for i: i64 in range(N):
+        let x: f32 = buffer_get(a, i)
+        want_i[i] = (x * 1000.0) as i32
+    let da: Buffer[f32, (4096,), device_global] = buffer_to_device(a)
+    let mut doi: Buffer[i32, (4096,), device_global] = buffer_to_device(oi)
+    gpu_launch(casts, blocks_for(N), BLOCK, N, &da, &mut doi)
+    let hi: Buffer[i32, (4096,)] = buffer_to_host(doi)
+    let mut bad: i64 = 0
+    for i: i64 in range(N):
+        if buffer_get(hi, i) != want_i[i]:
+            bad = bad + report("f32 -> i32 (exact)", i, buffer_get(hi, i) as f64, want_i[i] as f64, 0.0)
+    return bad
+
+def main() -> i32:
+    let r32: Array[i64; 2] = check_f32(2865)
+    let casts: i64 = check_casts(7)
+    let bad: i64 = r32[0] + casts + check_within()
+    println!("relaxed-math: {r32[1]} f32 contractible results differ from the strict host")
+    println!("relaxed-math: {bad} results outside their tolerance or exactness rule")
+    if bad != 0:
+        return 1
+    println!("relaxed-math: contractible results within tolerance, square roots and casts bit-exact")
+    return 0

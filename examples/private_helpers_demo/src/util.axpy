@@ -1,0 +1,8 @@
+# `helper` is private to this module. `main.axpy` also defines a private
+# `helper`; the compiler module-qualifies both (issue #467).
+def helper() -> i64:
+    return 10
+
+@public
+def scaled(x: i64) -> i64:
+    return x * helper()

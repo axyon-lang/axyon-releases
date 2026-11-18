@@ -1,0 +1,292 @@
+# Tiled GEMM on AMD matrix cores with typed MMA fragments (issue #2519)
+#
+# `c = a · b` with `a: M x K` and `b: K x N` in f16 or bf16 and `c: M x N`
+# in f32. The fragment API is the one of `examples/cuda_mma_gemm` (#2513);
+# only the tile shapes and the subgroup width are AMD's: each 64-lane
+# wavefront computes one 16 x 16 tile of `c` (one 32 x 32 tile in the
+# `gemm32_*` kernels), loading 16 x 16 tiles of `a` and `b` (32 x 8 and
+# 8 x 32) and multiplying them into an f32 accumulator with one `mma` per
+# 16-wide (8-wide) step of `K`. On `rocdl-gfx942` the fragments are the
+# registers of `v_mfma_f32_16x16x16_{f16,bf16}` (`v_mfma_f32_32x32x8_*`) and
+# `mma` is that one instruction.
+#
+# Tails need no branch: a fragment element outside its buffer loads as zero
+# and is never stored, so `M`, `N` and `K` need not be multiples of the
+# tile. The kernels declare `reduction="reassociate"`: a matrix-core product
+# sums its K terms in a hardware-defined order and rounding.
+#
+# The host checks every element of `c` against a sequential f64 loop over
+# the same half-precision inputs:
+#
+# - exact cases: inputs are multiples of 1/16 in [-4, 4), so every product
+#   and every partial sum is exact in f32 whatever the order; `c` must equal
+#   the reference bit for bit;
+# - random cases: inputs are multiples of 1/1024 in [-1, 1); `c` must be
+#   within `(K + 1) * 2^-20` of the reference.
+#
+# Shapes cover one tile, many tiles, and M, N and K tails; one more kernel
+# stages `a` through workgroup (LDS) memory before loading the fragment.
+# Without an AMD device the first device allocation stops the program with an
+# AXYON panic: there is no CPU fallback.
+
+# Wavefronts (output tiles) per block.
+const WAVES: i64 = 4
+const THREADS: i64 = 256
+
+# Block `g`, wave `w` computes the tile with index `t = WAVES * g + w`, at
+# tile row `t >> sh` and tile column `t & ((1 << sh) - 1)`, where `1 << sh`
+# is the tile-column count rounded up to a power of two (device code cannot
+# divide by a run-time value). Tiles past the end read and write nothing.
+@gpu(entry)
+@schedule(subgroup=64, max_threads=256, reduction="reassociate")
+def gemm_f16(sh: i64, a: &Buffer[f16, (M, K), device_global], b: &Buffer[f16, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    let tile: i64 = gpu_block_id(0) * WAVES + gpu_thread_id(0) / 64
+    let row: i64 = (tile >> sh) * 16
+    let col: i64 = (tile & ((1 << sh) - 1)) * 16
+    let mut acc: MmaAcc[f32, (16, 16)] = mma_fill(0.0)
+    for kk: i64 in range((buffer_dim(a, 1) + 15) / 16):
+        let fa: MmaA[f16, (16, 16), RowMajor] = mma_load(a, row, kk * 16)
+        let fb: MmaB[f16, (16, 16), RowMajor] = mma_load(b, kk * 16, col)
+        acc = mma(fa, fb, acc)
+    mma_store(c, row, col, acc)
+
+@gpu(entry)
+@schedule(subgroup=64, max_threads=256, reduction="reassociate")
+def gemm_bf16(sh: i64, a: &Buffer[bf16, (M, K), device_global], b: &Buffer[bf16, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    let tile: i64 = gpu_block_id(0) * WAVES + gpu_thread_id(0) / 64
+    let row: i64 = (tile >> sh) * 16
+    let col: i64 = (tile & ((1 << sh) - 1)) * 16
+    let mut acc: MmaAcc[f32, (16, 16)] = mma_fill(0.0)
+    for kk: i64 in range((buffer_dim(a, 1) + 15) / 16):
+        let fa: MmaA[bf16, (16, 16), RowMajor] = mma_load(a, row, kk * 16)
+        let fb: MmaB[bf16, (16, 16), RowMajor] = mma_load(b, kk * 16, col)
+        acc = mma(fa, fb, acc)
+    mma_store(c, row, col, acc)
+
+# `b` stored transposed (`bt: N x K`): the `ColMajor` layout reads
+# `b[k, n]` from `bt[n, k]`.
+@gpu(entry)
+@schedule(subgroup=64, max_threads=256, reduction="reassociate")
+def gemm_f16_bt(sh: i64, a: &Buffer[f16, (M, K), device_global], bt: &Buffer[f16, (N, K), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    let tile: i64 = gpu_block_id(0) * WAVES + gpu_thread_id(0) / 64
+    let row: i64 = (tile >> sh) * 16
+    let col: i64 = (tile & ((1 << sh) - 1)) * 16
+    let mut acc: MmaAcc[f32, (16, 16)] = mma_fill(0.0)
+    for kk: i64 in range((buffer_dim(a, 1) + 15) / 16):
+        let fa: MmaA[f16, (16, 16), RowMajor] = mma_load(a, row, kk * 16)
+        let fb: MmaB[f16, (16, 16), ColMajor] = mma_load(bt, col, kk * 16)
+        acc = mma(fa, fb, acc)
+    mma_store(c, row, col, acc)
+
+# The 32 x 32 x 8 form (`v_mfma_f32_32x32x8_f16`): 32 x 32 output tiles.
+@gpu(entry)
+@schedule(subgroup=64, max_threads=256, reduction="reassociate")
+def gemm32_f16(sh: i64, a: &Buffer[f16, (M, K), device_global], b: &Buffer[f16, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    let tile: i64 = gpu_block_id(0) * WAVES + gpu_thread_id(0) / 64
+    let row: i64 = (tile >> sh) * 32
+    let col: i64 = (tile & ((1 << sh) - 1)) * 32
+    let mut acc: MmaAcc[f32, (32, 32)] = mma_fill(0.0)
+    for kk: i64 in range((buffer_dim(a, 1) + 7) / 8):
+        let fa: MmaA[f16, (32, 8), RowMajor] = mma_load(a, row, kk * 8)
+        let fb: MmaB[f16, (8, 32), RowMajor] = mma_load(b, kk * 8, col)
+        acc = mma(fa, fb, acc)
+    mma_store(c, row, col, acc)
+
+@gpu(entry)
+@schedule(subgroup=64, max_threads=256, reduction="reassociate")
+def gemm32_bf16(sh: i64, a: &Buffer[bf16, (M, K), device_global], b: &Buffer[bf16, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    let tile: i64 = gpu_block_id(0) * WAVES + gpu_thread_id(0) / 64
+    let row: i64 = (tile >> sh) * 32
+    let col: i64 = (tile & ((1 << sh) - 1)) * 32
+    let mut acc: MmaAcc[f32, (32, 32)] = mma_fill(0.0)
+    for kk: i64 in range((buffer_dim(a, 1) + 7) / 8):
+        let fa: MmaA[bf16, (32, 8), RowMajor] = mma_load(a, row, kk * 8)
+        let fb: MmaB[bf16, (8, 32), RowMajor] = mma_load(b, kk * 8, col)
+        acc = mma(fa, fb, acc)
+    mma_store(c, row, col, acc)
+
+# One wavefront, one 16 x 16 x 16 product, with `a` staged through a
+# workgroup (LDS) tile first: `mma_load` reads a workgroup buffer exactly
+# like a device buffer.
+@gpu(entry)
+@schedule(subgroup=64, max_threads=64, reduction="reassociate")
+def gemm_f16_shared(a: &Buffer[f16, (16, 16), device_global], b: &Buffer[f16, (16, 16), device_global], c: &mut Buffer[f32, (16, 16), device_global]) -> None:
+    let ta: &mut Buffer[f16, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let lane: i64 = gpu_thread_id(0)
+    for e: i64 in range(4):
+        let idx: i64 = lane * 4 + e
+        buffer_set(ta, idx / 16, idx % 16, buffer_get(a, idx / 16, idx % 16))
+    gpu_barrier()
+    let fa: MmaA[f16, (16, 16), RowMajor] = mma_load(ta, 0, 0)
+    let fb: MmaB[f16, (16, 16), RowMajor] = mma_load(b, 0, 0)
+    let acc: MmaAcc[f32, (16, 16)] = mma_fill(0.0)
+    let d: MmaAcc[f32, (16, 16)] = mma(fa, fb, acc)
+    mma_store(c, 0, 0, d)
+
+# The staged kernel on one exact 16 x 16 x 16 case.
+def check_shared() -> i64:
+    let mut s: i64 = 2828
+    let mut va: Buffer[f64, (16, 16)] = buffer_alloc([16, 16])
+    let mut vb: Buffer[f64, (16, 16)] = buffer_alloc([16, 16])
+    let mut ha: Buffer[f16, (16, 16)] = buffer_alloc([16, 16])
+    let mut hb: Buffer[f16, (16, 16)] = buffer_alloc([16, 16])
+    for i: i64 in range(16):
+        for p: i64 in range(16):
+            s = next_seed(s)
+            buffer_set(va, i, p, value(true, s))
+            buffer_set(ha, i, p, value(true, s) as f16)
+    for p: i64 in range(16):
+        for j: i64 in range(16):
+            s = next_seed(s)
+            buffer_set(vb, p, j, value(true, s))
+            buffer_set(hb, p, j, value(true, s) as f16)
+    let mut hc: Buffer[f32, (16, 16)] = buffer_alloc([16, 16])
+    let da: Buffer[f16, (16, 16), device_global] = buffer_to_device(ha)
+    let db: Buffer[f16, (16, 16), device_global] = buffer_to_device(hb)
+    let mut dc: Buffer[f32, (16, 16), device_global] = buffer_to_device(hc)
+    gpu_launch(gemm_f16_shared, 1, 64, &da, &db, &mut dc)
+    let got: Buffer[f32, (16, 16)] = buffer_to_host(dc)
+    let mut bad: i64 = 0
+    for i: i64 in range(16):
+        for j: i64 in range(16):
+            let mut want: f64 = 0.0
+            for p: i64 in range(16):
+                want = want + buffer_get(va, i, p) * buffer_get(vb, p, j)
+            if (buffer_get(got, i, j) as f64) != want:
+                bad = bad + 1
+    if bad != 0:
+        println!("workgroup-staged gemm: {bad} mismatches")
+    return bad
+
+def next_seed(s: i64) -> i64:
+    return (s * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+
+# A pseudo-random input: exact cases use multiples of 1/16 in [-4, 4),
+# random ones multiples of 1/1024 in [-1, 1).
+def value(exact: bool, s: i64) -> f64:
+    if exact:
+        return (((s >> 33) & 127) - 64) as f64 / 16.0
+    return (((s >> 33) & 2047) - 1024) as f64 / 1024.0
+
+# The smallest `sh` with `1 << sh >= tiles`.
+def col_shift(tiles: i64) -> i64:
+    let mut sh: i64 = 0
+    while (1 << sh) < tiles:
+        sh = sh + 1
+    return sh
+
+def abs_f64(x: f64) -> f64:
+    if x < 0.0:
+        return -x
+    return x
+
+# Compare `got` with the f64 reference `want`: bit for bit when `exact`,
+# within `(k + 1) * 2^-20` otherwise. Returns the number of mismatches.
+def compare(kind: i64, m: i64, n: i64, k: i64, exact: bool, got: Buffer[f32, (M, N)], want: Buffer[f64, (M, N)]) -> i64:
+    let tol: f64 = (k + 1) as f64 / 1048576.0
+    let mut bad: i64 = 0
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            let g: f64 = buffer_get(got, i, j) as f64
+            let w: f64 = buffer_get(want, i, j)
+            let ok: bool = g == w if exact else abs_f64(g - w) <= tol
+            if not ok:
+                if bad < 5:
+                    println!("kernel {kind} {m}x{n}x{k}: c[{i}, {j}] = {g}, want {w}")
+                bad = bad + 1
+    return bad
+
+# `kind`: 0 = f16, 1 = bf16, 2 = f16 with `b` transposed, 3 = f16 32x32x8,
+# 4 = bf16 32x32x8.
+def check(kind: i64, m: i64, n: i64, k: i64, exact: bool, seed: i64) -> i64:
+    let bf: bool = kind == 1 or kind == 4
+    let mut s: i64 = seed
+    let mut va: Buffer[f64, (M, K)] = buffer_alloc([m, k])
+    let mut vb: Buffer[f64, (K, N)] = buffer_alloc([k, n])
+    for i: i64 in range(m):
+        for p: i64 in range(k):
+            s = next_seed(s)
+            buffer_set(va, i, p, value(exact, s))
+    for p: i64 in range(k):
+        for j: i64 in range(n):
+            s = next_seed(s)
+            buffer_set(vb, p, j, value(exact, s))
+    # The reference, from the half-precision values the device sees.
+    let mut want: Buffer[f64, (M, N)] = buffer_alloc([m, n])
+    let mut hc: Buffer[f32, (M, N)] = buffer_alloc([m, n])
+    for i: i64 in range(m):
+        for j: i64 in range(n):
+            let mut acc: f64 = 0.0
+            for p: i64 in range(k):
+                if bf:
+                    acc = acc + ((buffer_get(va, i, p) as bf16) as f64) * ((buffer_get(vb, p, j) as bf16) as f64)
+                else:
+                    acc = acc + ((buffer_get(va, i, p) as f16) as f64) * ((buffer_get(vb, p, j) as f16) as f64)
+            buffer_set(want, i, j, acc)
+            buffer_set(hc, i, j, 12345.0)
+    let t: i64 = 32 if kind >= 3 else 16
+    let sh: i64 = col_shift((n + t - 1) / t)
+    let tiles: i64 = ((m + t - 1) / t) << sh
+    let grid: i64 = (tiles + WAVES - 1) / WAVES
+    let mut dc: Buffer[f32, (M, N), device_global] = buffer_to_device(hc)
+    if bf:
+        let mut ha: Buffer[bf16, (M, K)] = buffer_alloc([m, k])
+        let mut hb: Buffer[bf16, (K, N)] = buffer_alloc([k, n])
+        for i: i64 in range(m):
+            for p: i64 in range(k):
+                buffer_set(ha, i, p, buffer_get(va, i, p) as bf16)
+        for p: i64 in range(k):
+            for j: i64 in range(n):
+                buffer_set(hb, p, j, buffer_get(vb, p, j) as bf16)
+        let da: Buffer[bf16, (M, K), device_global] = buffer_to_device(ha)
+        let db: Buffer[bf16, (K, N), device_global] = buffer_to_device(hb)
+        if kind == 4:
+            gpu_launch(gemm32_bf16, grid, THREADS, sh, &da, &db, &mut dc)
+        else:
+            gpu_launch(gemm_bf16, grid, THREADS, sh, &da, &db, &mut dc)
+    else:
+        let mut ha: Buffer[f16, (M, K)] = buffer_alloc([m, k])
+        for i: i64 in range(m):
+            for p: i64 in range(k):
+                buffer_set(ha, i, p, buffer_get(va, i, p) as f16)
+        let da: Buffer[f16, (M, K), device_global] = buffer_to_device(ha)
+        if kind == 2:
+            let mut hbt: Buffer[f16, (N, K)] = buffer_alloc([n, k])
+            for p: i64 in range(k):
+                for j: i64 in range(n):
+                    buffer_set(hbt, j, p, buffer_get(vb, p, j) as f16)
+            let dbt: Buffer[f16, (N, K), device_global] = buffer_to_device(hbt)
+            gpu_launch(gemm_f16_bt, grid, THREADS, sh, &da, &dbt, &mut dc)
+        else:
+            let mut hb: Buffer[f16, (K, N)] = buffer_alloc([k, n])
+            for p: i64 in range(k):
+                for j: i64 in range(n):
+                    buffer_set(hb, p, j, buffer_get(vb, p, j) as f16)
+            let db: Buffer[f16, (K, N), device_global] = buffer_to_device(hb)
+            if kind == 3:
+                gpu_launch(gemm32_f16, grid, THREADS, sh, &da, &db, &mut dc)
+            else:
+                gpu_launch(gemm_f16, grid, THREADS, sh, &da, &db, &mut dc)
+    let got: Buffer[f32, (M, N)] = buffer_to_host(dc)
+    return compare(kind, m, n, k, exact, got, want)
+
+def main() -> i32:
+    let mut bad: i64 = 0
+    let mut cases: i64 = 0
+    # (m, n, k): one tile, many tiles, and M/N/K tails.
+    let shapes: Array[i64; 21] = [16, 16, 16, 32, 32, 8, 64, 64, 64, 128, 96, 256, 17, 9, 15, 50, 30, 70, 33, 100, 1]
+    for d: i64 in range(5):
+        for c: i64 in range(7):
+            let m: i64 = shapes[3 * c]
+            let n: i64 = shapes[3 * c + 1]
+            let k: i64 = shapes[3 * c + 2]
+            bad = bad + check(d, m, n, k, true, 2519 + c)
+            bad = bad + check(d, m, n, k, false, 7919 + c)
+            cases = cases + 2
+    bad = bad + check_shared()
+    cases = cases + 1
+    if bad != 0:
+        println!("FAIL: {bad} mismatches")
+        return 1
+    println!("rocm_mma_gemm: {cases} cases match the host reference")
+    return 0

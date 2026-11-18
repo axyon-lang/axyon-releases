@@ -1,0 +1,41 @@
+# Blanket Impls Demo - `impl Trait for T where T: Bound` (issue #89)
+#
+# An impl whose target is a bare type parameter applies to every type that
+# satisfies its `where` bounds. The call `p.describe()` below is answered by the
+# blanket impl, instantiated for `Point`.
+
+trait Marker:
+    def mark(self) -> i32
+
+trait Describe:
+    def describe(self) -> i32
+
+struct Point:
+    x: i32
+
+impl Marker for Point:
+    def mark(self) -> i32:
+        return self.x
+
+# Every `Marker` type is `Describe`.
+impl Describe for T where T: Marker:
+    def describe(self) -> i32:
+        return 1
+
+trait Wrap[T]:
+    def wrap(self) -> T
+
+# Identity: every type wraps to itself (works for primitives too).
+impl Wrap[T] for T:
+    def wrap(self) -> T:
+        return self
+
+def main() -> i32:
+    let p: Point = Point { x: 4 }
+    let n: i32 = 5
+    let m: i32 = n.wrap()
+    let d: i32 = p.describe()
+    println!("describe = {d}")
+    assert!(m == 5, "n.wrap() should be 5")
+    assert!(d == 1, "p.describe() should be 1")
+    return 0

@@ -1,0 +1,75 @@
+# Element writes and augmented assignment on places (issue #638).
+#
+# `a[i] = v`, `a[i] op= v`, `a[i][j] = v`, `p.x += v`, `v[i].f -= v`,
+# `self.count += 1` and `*r += v` all store into the place itself. Every
+# subscript is bounds-checked: an out-of-range write traps with
+# "index out of bounds" instead of corrupting memory. The right-hand side
+# must have the element type; convert with `as`.
+
+struct Body:
+    x: f64
+    vx: f64
+
+struct Account:
+    id: i64
+    balance: i64
+
+struct Ledger:
+    accounts: Vec[Account]
+    ops: i64
+
+impl Ledger:
+    def deposit(mut self, i: i64, amount: i64) -> None:
+        self.accounts[i as usize].balance += amount
+        self.ops += 1
+
+def scale_row(grid: ref_mut[Array[i64; 4]], k: i64) -> None:
+    for j: i64 in range(4):
+        grid[j] *= k
+
+def bump(n: ref_mut[i64]) -> None:
+    *n += 1
+
+def make_grid() -> Array[Array[i64; 3]; 2]:
+    let r0: Array[i64; 3] = [0, 0, 0]
+    let r1: Array[i64; 3] = [0, 0, 0]
+    return [r0, r1]
+
+def main() -> i32:
+    # Fixed-size arrays: plain, augmented and nested writes.
+    let mut a: Array[i32; 4] = [10, 20, 30, 40]
+    a[1] = 42
+    a[1] += 1
+    let wide: i64 = 7
+    a[3] = wide as i32
+    let mut hist: Array[i64; 5] = [0, 0, 0, 0, 0]
+    for k: i64 in range(1000):
+        hist[k % 5] += 1
+    let mut grid: Array[Array[i64; 3]; 2] = make_grid()
+    for i: i64 in range(2):
+        for j: i64 in range(3):
+            grid[i][j] = i * 3 + j
+    grid[1][2] <<= 2
+
+    # Struct fields, `Vec` element fields and a `mut self` method.
+    let mut b: Body = Body { x: 1.0, vx: 0.5 }
+    b.x += b.vx * 2.0
+    let mut accounts: Vec[Account] = Vec.new()
+    accounts.push(Account { id: 1, balance: 100 })
+    accounts.push(Account { id: 2, balance: 0 })
+    accounts[1].balance -= 25
+    let mut ledger: Ledger = Ledger { accounts: accounts, ops: 0 }
+    ledger.deposit(0, 50)
+
+    # Through references.
+    let mut row: Array[i64; 4] = [1, 2, 3, 4]
+    scale_row(ref_mut(row), 10)
+    let mut n: i64 = 41
+    bump(ref_mut(n))
+
+    let ok: bool = a[1] == 43 and a[3] == 7 and hist[3] == 200 and grid[1][2] == 20 and b.x == 2.0 and ledger.accounts[0].balance == 150 and ledger.accounts[1].balance == -25 and ledger.ops == 1 and row[3] == 40 and n == 42
+    if not ok:
+        return 1
+    let second: i32 = a[1]
+    println!("element writes ok: {second} {n}")
+    return 0

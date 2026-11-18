@@ -1,0 +1,112 @@
+# Waking a task through a hand-written vtable with std.core.task (#208).
+#
+# An executor describes how to wake one of its tasks with a `RawWakerVTable`
+# of four callbacks and an opaque data pointer (here: a small `Task` record
+# on the heap). `Waker.from_raw` adopts that pair; afterwards every waker
+# operation delegates to the vtable:
+#
+#   waker.clone()        -> vtable.clone(data)        new reference
+#   waker.wake_by_ref()  -> vtable.wake_by_ref(data)  keep the waker
+#   waker.wake()         -> vtable.wake(data)         consume the waker
+#   (waker dropped)      -> vtable.drop(data)         release the reference
+#
+# The callbacks below keep a reference count and a "scheduled" counter, the
+# way a real executor would. The contract they must honour is documented in
+# stdlib/core/task.axpy and docs/src/guide/stdlib.md ("Task Module").
+
+from std.core.task import RawWakerVTable, RawWaker, Waker, Context
+
+# Executor-side state behind the waker's data pointer.
+struct Task:
+    refs: i64
+    scheduled: i64
+
+const TASK_SIZE: i64 = 16
+const TASK_ALIGN: i64 = 8
+
+# SAFETY (all four callbacks): `data` points at the live `Task` that `main`
+# allocates and frees only after every waker is gone.
+@unsafe
+def task_clone(data: ptr[unit]) -> ptr[unit]:
+    let t: ptr_mut[Task] = data as ptr_mut[Task]
+    (*t).refs = (*t).refs + 1
+    return data
+
+@unsafe
+def task_wake(data: ptr[unit]) -> unit:
+    let t: ptr_mut[Task] = data as ptr_mut[Task]
+    (*t).scheduled = (*t).scheduled + 1
+    (*t).refs = (*t).refs - 1
+
+@unsafe
+def task_wake_by_ref(data: ptr[unit]) -> unit:
+    let t: ptr_mut[Task] = data as ptr_mut[Task]
+    (*t).scheduled = (*t).scheduled + 1
+
+@unsafe
+def task_drop(data: ptr[unit]) -> unit:
+    let t: ptr_mut[Task] = data as ptr_mut[Task]
+    (*t).refs = (*t).refs - 1
+
+def read_task(data: ptr[unit]) -> Task:
+    let t: ptr[Task] = data as ptr[Task]
+    let mut out: Task = Task { refs: 0, scheduled: 0 }
+    # SAFETY: `data` points at the live `Task` allocated in `main`.
+    unsafe:
+        out = Task { refs: (*t).refs, scheduled: (*t).scheduled }
+    return out
+
+# A future's `poll` only sees the Context: it wakes the task now and keeps a
+# clone of the waker to wake it again later.
+def poll_once(cx: ref[Context]) -> Waker:
+    cx.waker().wake_by_ref()
+    return cx.waker().clone()
+
+# Adopt the executor's reference to the task as a Waker.
+def adopt(data: ptr[unit], vt: ref[RawWakerVTable]) -> Waker:
+    # SAFETY: the vtable callbacks honour the waker contract, `vt` outlives
+    # every waker made from it, and `main` adopts its one reference once.
+    unsafe:
+        return Waker.from_raw(RawWaker.new(data, vt))
+
+def run(data: ptr[unit], vt: ref[RawWakerVTable]) -> unit:
+    # The executor holds one reference to the task (refs starts at 1).
+    let w: Waker = adopt(data, vt)
+    let cx: Context = Context.from_waker(ref(w))
+    let later: Waker = poll_once(ref(cx))
+    let mid: Task = read_task(data)
+    println!("after poll: refs={mid.refs} scheduled={mid.scheduled}")
+    assert!(later.will_wake(ref(w)), "the stored clone wakes the same task")
+    later.wake()
+    let end: Task = read_task(data)
+    println!("after wake: refs={end.refs} scheduled={end.scheduled}")
+
+def main() -> i32:
+    let mem: ptr_mut[u8] = global_alloc_zeroed(TASK_SIZE, TASK_ALIGN)
+    if (mem as usize) == 0:
+        println!("allocation failed")
+        return 1
+    let data: ptr[unit] = mem as ptr[unit]
+    let t: ptr_mut[Task] = mem as ptr_mut[Task]
+    # SAFETY: `t` is the fresh 16-byte allocation above.
+    unsafe:
+        (*t).refs = 1
+
+    # Bind the callbacks to typed locals: passing a function name straight to
+    # `RawWakerVTable.new(...)` currently trips a spurious AX0381.
+    let c: unsafe fn(ptr[unit]) -> ptr[unit] = task_clone
+    let wk: unsafe fn(ptr[unit]) -> unit = task_wake
+    let br: unsafe fn(ptr[unit]) -> unit = task_wake_by_ref
+    let d: unsafe fn(ptr[unit]) -> unit = task_drop
+    let vt: RawWakerVTable = RawWakerVTable.new(c, wk, br, d)
+
+    run(data, ref(vt))
+
+    let done: Task = read_task(data)
+    println!("after drop: refs={done.refs} scheduled={done.scheduled}")
+    assert!(done.refs == 0, "every reference was released exactly once")
+    assert!(done.scheduled == 2, "woken once by reference and once by value")
+    # SAFETY: no waker over `mem` is alive any more; freed once.
+    unsafe:
+        global_dealloc(mem, TASK_SIZE, TASK_ALIGN)
+    return 0

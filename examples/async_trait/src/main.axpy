@@ -1,0 +1,56 @@
+# Async trait methods (#3078): `async def` in a trait and in its impls.
+# Each impl gets its own future type (static dispatch, no boxing), so generic
+# code awaits `s.call(req)` through a `S: Service` bound.
+from core.future import Future, Poll
+from core.task import Context
+from std.async_runtime import block_on
+
+# Not ready for the first `left` polls, so a method awaiting it suspends.
+struct Delay:
+    left: i64
+    value: i64
+
+impl Future for Delay:
+    type Output = i64
+
+    def poll(mut self, cx: ref_mut[Context]) -> Poll[i64]:
+        if self.left == 0:
+            return Poll.Ready(self.value)
+        self.left = self.left - 1
+        cx.waker().wake_by_ref()
+        return Poll.Pending
+
+trait Service:
+    async def call(self, req: i64) -> i64
+
+@derive(Copy)
+struct Doubler:
+    k: i64
+
+@derive(Copy)
+struct Slow:
+    extra: i64
+
+impl Service for Doubler:
+    async def call(self, req: i64) -> i64:
+        return req * self.k
+
+impl Service for Slow:
+    async def call(self, req: i64) -> i64:
+        let d: i64 = await Delay { left: 2, value: self.extra }
+        return req + d
+
+# `S: Copy` because `call` takes `self` by value: a borrowed receiver would make
+# the future hold a reference, which a future cannot store yet (#2243).
+async def run[S: Service + Copy](s: S, r: i64) -> i64:
+    let a: i64 = await s.call(r)
+    return await s.call(a)
+
+def main() -> i32:
+    let mut f: __Future_run[Doubler] = run[Doubler](Doubler { k: 3 }, 2)
+    let a: i64 = block_on(&mut f)
+    println!("doubler: {a}")
+    let mut g: __Future_run[Slow] = run[Slow](Slow { extra: 10 }, 1)
+    let b: i64 = block_on(&mut g)
+    println!("slow: {b}")
+    return 0

@@ -1,0 +1,36 @@
+# Half-precision constants (issue #472).
+#
+# `f16`/`bf16` constants are evaluated at compile time by a software
+# implementation that rounds once (round-to-nearest-even) in the half format,
+# so each constant is bit-identical to the same expression at runtime.
+
+const SUM_F16: f16 = 0.1_f16 + 0.2_f16
+const SUM_BF16: bf16 = (0.1 as bf16) + (0.2 as bf16)
+const ADOPT_F16: f16 = 1.0_f16 + 1
+const ADOPT_BF16: bf16 = 2 * (1.5 as bf16)
+const ROUNDED: f16 = 2048.0_f16 + 1.0_f16
+const FROM_INT: f16 = 3 as f16
+const TO_INT: i32 = 2.75_f16 as i32
+const IS_LESS: bool = 1.0_f16 < 2.0_f16
+
+
+def add_f16(a: f16, b: f16) -> f16:
+    return a + b
+
+
+def add_bf16(a: bf16, b: bf16) -> bf16:
+    return a + b
+
+
+@host
+def main() -> i32:
+    let two: f16 = 2.0_f16
+    assert!(SUM_F16 == add_f16(0.1_f16, 0.2_f16), "f16 const matches runtime")
+    assert!(SUM_BF16 == add_bf16((0.1 as bf16), (0.2 as bf16)), "bf16 const matches runtime")
+    assert!(ADOPT_F16 == two, "integer literal adopts f16")
+    assert!(ROUNDED == 2048.0_f16, "2049 is not representable in f16")
+    assert!(FROM_INT == add_f16(1.0_f16, 2.0_f16), "int -> f16")
+    assert!(TO_INT == 2, "f16 -> int truncates")
+    assert!(IS_LESS, "f16 comparison")
+    println!("TO_INT={TO_INT} IS_LESS={IS_LESS}")
+    return 0

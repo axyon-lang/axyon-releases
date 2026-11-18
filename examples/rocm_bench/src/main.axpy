@@ -1,0 +1,707 @@
+# Reproducible AMD (ROCm) benchmark workloads (issue #2658)
+#
+# The AMD counterpart of `examples/cuda_bench` (#2112): the same workloads,
+# kernels, inputs and strict references, generated for `rocdl-gfx942`
+# (wave64), plus a bandwidth workload:
+#
+# - `saxpy`:  elementwise `out = a * x + y` in f32 (a rounded multiply, then
+#             a rounded add: strict math, never fused).
+# - `reduce`: an i32 sum through three launches of one workgroup-sum kernel
+#             (`gpu_workgroup_sum`, 256-thread workgroups of four wave64
+#             subgroups), all on the GPU.
+# - `matmul`: f32 dense matmul with the 16 x 16 LDS-tiled kernel of
+#             `examples/cuda_matmul` (#2110).
+# - `chain`:  `CHAIN` in-place `x = a * x + b` launches on one persistent
+#             device buffer (one upload, one download), against
+#             `chain_rt`: the same steps with a host round trip each.
+# - `copy`:   a device-to-device f32 copy `out[i] = x[i]` of a buffer the
+#             device filled (`iota_f32`), four elements per thread one
+#             grid stride apart (#2900): the bandwidth workload that
+#             `benches/rocm_gpu` compares with `hipMemcpy` device-to-device.
+#
+# Without arguments the program checks every workload and size against a
+# strict host reference and exits non-zero on any mismatch. With an
+# argument (`rocm_bench bench`) it runs the timed sweep that
+# `benches/rocm_gpu/run_rocm_bench.py` drives. Correctness comes first in
+# both modes: a timed workload is checked before its device samples are
+# kept, and a mismatch stops the sweep with exit code 1.
+#
+# Timing boundaries (see docs/src/reference/rocm-benchmarks.md):
+#
+# - A `gpu_launch` returns after the kernel completed (the HIP runtime
+#   waits on its stream), so a `warm` sample is the host-observed
+#   launch-to-completion time of an already-loaded kernel on resident
+#   buffers, never an enqueue time.
+# - Device kernel time comes from the device timer (#2901):
+#   `gpu_timer_start()`/`gpu_timer_stop(t)` around the same warm launches,
+#   in a second loop after the host-timed one (so `warm` keeps its exact
+#   region). While a timer is open every launch carries two HIP events
+#   bound to its dispatch (`hipExtModuleLaunchKernel`), and the timer sums
+#   the kernels' execution intervals: a `device` sample is the kernel time
+#   of one region (three launches for `reduce`, `CHAIN` for `chain`). The
+#   `rocprofv3` kernel trace (the driver's `--rocprof`) is the cross-check.
+# - An upload returns without waiting (`buffer_to_device` is stream-
+#   ordered), so uploads are never timed alone: `e2e` (upload + launches +
+#   download) and `xfer` (upload + download of the inputs) end with a
+#   download, which waits for everything before it. A region that starts on
+#   resident data first completes the pending upload with `wait_transfers`
+#   (a one-element download, ordered after every queued copy), untimed and
+#   without launching anything.
+#
+# Every sample is one raw line `sample,<workload>,<size>,<phase>,<rep>,<ns>`
+# with workload 0 saxpy, 1 reduce, 2 matmul, 3 chain, 4 chain_rt, 5 copy
+# and phase 0 jit, 1 e2e, 2 xfer, 3 warmup, 4 warm, 5 check (`ns` =
+# mismatches), 6 host (the strict host reference loop, one sample: the CPU
+# side of the crossover; inputs generated before the clock starts), 7
+# launches (`ns` = the kernel launches one timed `chain` region ran, one
+# line per timed region; the driver requires `CHAIN` in every one), 8
+# device (the device timer's kernel time of one warm region) and 9
+# device_warmup (the untimed-in-the-summary warm-up regions of the device
+# loop).
+
+from std.env import argc
+from std.time import Instant
+
+const BLOCK: i64 = 256
+const TILE: i64 = 16
+const MAX_GRID: i64 = 2147483647
+const CHAIN: i64 = 8
+
+# Repetitions, frozen with the baseline (benches/rocm_gpu/budgets.json).
+const E2E_REPS: i64 = 5
+const WARMUP: i64 = 3
+const REPS: i64 = 30
+
+# Input seeds; printed as `config` lines so every run records them (the
+# values of `examples/cuda_bench`, so both suites time the same inputs).
+const SEED_X: i64 = 2112
+const SEED_Y: i64 = 2113
+const SEED_A: i64 = 2114
+const SEED_B: i64 = 2115
+
+@gpu(entry)
+def saxpy(a: f32, x: &Buffer[f32, (N,), device_global], y: &Buffer[f32, (N,), device_global], out: &mut Buffer[f32, (N,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < buffer_dim(out, 0):
+        buffer_set(out, i, a * buffer_get(x, i) + buffer_get(y, i))
+
+@gpu(entry)
+def affine(a: f32, b: f32, x: &mut Buffer[f32, (N,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < buffer_dim(x, 0):
+        buffer_set(x, i, a * buffer_get(x, i) + b)
+
+@gpu(entry)
+@schedule(subgroup=64, max_threads=256)
+def sum_i32(n: i64, x: &Buffer[i32, (N,), device_global], out: &mut Buffer[i32, (N,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    let mut v: i32 = 0
+    if i < n:
+        v = buffer_get(x, i)
+    let s: i32 = gpu_workgroup_sum(v)
+    if gpu_thread_id(0) == 0:
+        buffer_set(out, gpu_block_id(0), s)
+
+# The bandwidth workload: one f32 read and one f32 write per element.
+#
+# Each thread copies `COPY_PER_THREAD` (4) elements one grid stride `t`
+# apart (#2900): `i`, `i + t`, `i + 2t`, `i + 3t`, with the grid sized by
+# `copy_blocks` so `4 * t >= n`. Every access of a wavefront stays one
+# contiguous, coalesced 256-byte segment, and a thread issues its four
+# loads before its first store, so four times as many reads are in flight
+# per wave. On gfx942 this raised the 64M-element copy from about 3650 to
+# about 4650 GB/s (device time) over one element per thread; four
+# adjacent elements per thread merge the loads into one
+# `global_load_dwordx4` but not the stores (each `buffer_set` keeps its
+# own bounds check) and measured slower than this strided form. Every
+# access is still a bounds-checked `buffer_get`/`buffer_set`; the tail (a
+# thread whose fourth element is past `n`) copies element by element.
+@gpu(entry)
+def copy_f32(x: &Buffer[f32, (N,), device_global], out: &mut Buffer[f32, (N,), device_global]) -> None:
+    let t: i64 = gpu_grid_dim(0) * gpu_block_dim(0)
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    let n: i64 = buffer_dim(out, 0)
+    if i + 3 * t < n:
+        let a: f32 = buffer_get(x, i)
+        let b: f32 = buffer_get(x, i + t)
+        let c: f32 = buffer_get(x, i + 2 * t)
+        let d: f32 = buffer_get(x, i + 3 * t)
+        buffer_set(out, i, a)
+        buffer_set(out, i + t, b)
+        buffer_set(out, i + 2 * t, c)
+        buffer_set(out, i + 3 * t, d)
+    else:
+        let mut k: i64 = i
+        while k < n:
+            buffer_set(out, k, buffer_get(x, k))
+            k = k + t
+
+# The copy input, filled on the device: multiples of 1/256 in [-4, 4), a
+# function of the index only (`iota_value`), so a large buffer needs no
+# host fill and upload.
+@gpu(entry)
+def iota_f32(x: &mut Buffer[f32, (N,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < buffer_dim(x, 0):
+        buffer_set(x, i, (((i * 7) & 2047) - 1024) as f32 * 0.00390625)
+
+# The untiled matmul: the device reference of the large shapes.
+@gpu(entry)
+def matmul_naive(sh: i64, a: &Buffer[f32, (M, K), device_global], b: &Buffer[f32, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    let row: i64 = (gpu_block_id(0) >> sh) * TILE + gpu_thread_id(0) / TILE
+    let col: i64 = (gpu_block_id(0) & ((1 << sh) - 1)) * TILE + gpu_thread_id(0) % TILE
+    if row < buffer_dim(c, 0) and col < buffer_dim(c, 1):
+        let mut acc: f32 = 0.0
+        for p: i64 in range(buffer_dim(a, 1)):
+            acc = acc + buffer_get(a, row, p) * buffer_get(b, p, col)
+        buffer_set(c, row, col, acc)
+
+# The tiled matmul of `examples/cuda_matmul`: same terms, same order.
+@gpu(entry)
+def matmul_tiled(sh: i64, a: &Buffer[f32, (M, K), device_global], b: &Buffer[f32, (K, N), device_global], c: &mut Buffer[f32, (M, N), device_global]) -> None:
+    let ta: &mut Buffer[f32, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let tb: &mut Buffer[f32, (16, 16), workgroup] = gpu_workgroup_buffer()
+    let ty: i64 = gpu_thread_id(0) / TILE
+    let tx: i64 = gpu_thread_id(0) % TILE
+    let row: i64 = (gpu_block_id(0) >> sh) * TILE + ty
+    let col: i64 = (gpu_block_id(0) & ((1 << sh) - 1)) * TILE + tx
+    let m: i64 = buffer_dim(c, 0)
+    let n: i64 = buffer_dim(c, 1)
+    let k: i64 = buffer_dim(a, 1)
+    let mut acc: f32 = 0.0
+    if (gpu_block_id(0) & ((1 << sh) - 1)) * TILE < buffer_dim(c, 1):
+        for t: i64 in range((buffer_dim(a, 1) + TILE - 1) / TILE):
+            let pa: i64 = t * TILE + tx
+            let mut va: f32 = 0.0
+            if row < m and pa < k:
+                va = buffer_get(a, row, pa)
+            buffer_set(ta, ty, tx, va)
+            let pb: i64 = t * TILE + ty
+            let mut vb: f32 = 0.0
+            if pb < k and col < n:
+                vb = buffer_get(b, pb, col)
+            buffer_set(tb, ty, tx, vb)
+            gpu_barrier()
+            let mut lim: i64 = k - t * TILE
+            if lim > TILE:
+                lim = TILE
+            for q: i64 in range(lim):
+                acc = acc + buffer_get(ta, ty, q) * buffer_get(tb, q, tx)
+            gpu_barrier()
+    if row < m and col < n:
+        buffer_set(c, row, col, acc)
+
+def emit(w: i64, size: i64, phase: i64, rep: i64, ns: i64) -> None:
+    println!("sample,{w},{size},{phase},{rep},{ns}")
+
+# A fixed-seed linear congruential generator: the same inputs every run.
+# One device-timed warm region (#2901): `WARMUP` warm-up regions first,
+# then `REPS` measured ones, like the host-timed `warmup`/`warm` loop.
+def emit_device(w: i64, size: i64, rep: i64, ns: i64) -> None:
+    if rep < WARMUP:
+        emit(w, size, 9, rep, ns)
+    else:
+        emit(w, size, 8, rep - WARMUP, ns)
+
+def next_seed(s: i64) -> i64:
+    return (s * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+
+# Completes every transfer queued on the device so far: a download is
+# ordered after every copy already on the device's transfer stream and
+# returns complete (#2385). Launches nothing.
+def wait_transfers() -> None:
+    let _probe: Buffer[f32, (N,)] = buffer_to_host(buffer_to_device(fill_f32(1, SEED_X)))
+
+def blocks_for(n: i64) -> i64:
+    return (n + BLOCK - 1) / BLOCK
+
+# The elements one `copy_f32` thread copies, and its grid: enough
+# workgroups that `COPY_PER_THREAD` grid strides cover `n`.
+const COPY_PER_THREAD: i64 = 4
+
+def copy_blocks(n: i64) -> i64:
+    return blocks_for((n + COPY_PER_THREAD - 1) / COPY_PER_THREAD)
+
+# `n` f32 values, multiples of 1/256 in [-4, 4).
+def fill_f32(n: i64, seed: i64) -> Buffer[f32, (N,)]:
+    let mut h: Buffer[f32, (N,)] = buffer_alloc([n])
+    let mut s: i64 = seed
+    for i: i64 in range(n):
+        s = next_seed(s)
+        buffer_set(h, i, ((((s >> 20) & 2047) - 1024) as f32) / 256.0)
+    return h
+
+# `n` i32 values in [-64, 64): every partial and total sum fits an i32
+# for `n <= 2^24`, so the device and host sums are exact.
+def fill_i32(n: i64, seed: i64) -> Buffer[i32, (N,)]:
+    let mut h: Buffer[i32, (N,)] = buffer_alloc([n])
+    let mut s: i64 = seed
+    for i: i64 in range(n):
+        s = next_seed(s)
+        buffer_set(h, i, (((s >> 20) & 127) - 64) as i32)
+    return h
+
+# Multiples of 1/3072 in [-341, 341): products and sums round.
+def mat_value(s: i64) -> f32:
+    return ((((s >> 20) & 2097151) - 1048576) as f32) / 3072.0
+
+# The `s x s` left operand `a`.
+def fill_a(n: i64) -> Buffer[f32, (M, K)]:
+    let mut h: Buffer[f32, (M, K)] = buffer_alloc([n, n])
+    let mut s: i64 = SEED_A
+    for i: i64 in range(n):
+        for j: i64 in range(n):
+            s = next_seed(s)
+            buffer_set(h, i, j, mat_value(s))
+    return h
+
+# The `s x s` right operand `b`.
+def fill_b(n: i64) -> Buffer[f32, (K, N)]:
+    let mut h: Buffer[f32, (K, N)] = buffer_alloc([n, n])
+    let mut s: i64 = SEED_B
+    for i: i64 in range(n):
+        for j: i64 in range(n):
+            s = next_seed(s)
+            buffer_set(h, i, j, mat_value(s))
+    return h
+
+# Exact equality: the same value with the same sign of zero, or both NaN.
+def same_f32(x: f32, y: f32) -> bool:
+    if x != x:
+        return y != y
+    if x != y:
+        return false
+    if x != 0.0:
+        return true
+    return 1.0 / x == 1.0 / y
+
+def coeff() -> f32:
+    return 1.0 / 3.0
+
+# ---------------------------------------------------------------- saxpy
+
+def saxpy_ref(n: i64, timed: bool) -> Buffer[f32, (N,)]:
+    let x: Buffer[f32, (N,)] = fill_f32(n, SEED_X)
+    let y: Buffer[f32, (N,)] = fill_f32(n, SEED_Y)
+    let mut r: Buffer[f32, (N,)] = buffer_alloc([n])
+    let a: f32 = coeff()
+    let t0: Instant = Instant.now()
+    for i: i64 in range(n):
+        buffer_set(r, i, a * buffer_get(x, i) + buffer_get(y, i))
+    if timed:
+        emit(0, n, 6, 0, t0.elapsed().as_nanos())
+    return r
+
+def saxpy_bad(n: i64, out: Buffer[f32, (N,)], want: Buffer[f32, (N,)]) -> i64:
+    let mut bad: i64 = 0
+    for i: i64 in range(n):
+        if not same_f32(buffer_get(out, i), buffer_get(want, i)):
+            bad = bad + 1
+    return bad
+
+def bench_saxpy(n: i64, timed: bool) -> i64:
+    let want: Buffer[f32, (N,)] = saxpy_ref(n, timed)
+    let a: f32 = coeff()
+    let mut bad: i64 = 0
+    for rep: i64 in range(E2E_REPS):
+        let hx: Buffer[f32, (N,)] = fill_f32(n, SEED_X)
+        let hy: Buffer[f32, (N,)] = fill_f32(n, SEED_Y)
+        let ho: Buffer[f32, (N,)] = buffer_alloc([n])
+        let t0: Instant = Instant.now()
+        let dx: Buffer[f32, (N,), device_global] = buffer_to_device(hx)
+        let dy: Buffer[f32, (N,), device_global] = buffer_to_device(hy)
+        let mut dout: Buffer[f32, (N,), device_global] = buffer_to_device(ho)
+        gpu_launch(saxpy, blocks_for(n), BLOCK, a, &dx, &dy, &mut dout)
+        let out: Buffer[f32, (N,)] = buffer_to_host(dout)
+        let ns: i64 = t0.elapsed().as_nanos()
+        for i: i64 in range(n):
+            if not same_f32(buffer_get(out, i), buffer_get(want, i)):
+                bad = bad + 1
+        if timed:
+            emit(0, n, 1, rep, ns)
+        if not timed:
+            return bad
+    if bad != 0:
+        emit(0, n, 5, 0, bad)
+        return bad
+    # Transfers: the inputs up and the output back, nothing launched.
+    for rep: i64 in range(E2E_REPS):
+        let hx: Buffer[f32, (N,)] = fill_f32(n, SEED_X)
+        let hy: Buffer[f32, (N,)] = fill_f32(n, SEED_Y)
+        let t0: Instant = Instant.now()
+        let _dx: Buffer[f32, (N,), device_global] = buffer_to_device(hx)
+        let dy: Buffer[f32, (N,), device_global] = buffer_to_device(hy)
+        let _back: Buffer[f32, (N,)] = buffer_to_host(dy)
+        emit(0, n, 2, rep, t0.elapsed().as_nanos())
+    # Warm: resident buffers, already-loaded kernel.
+    let dx: Buffer[f32, (N,), device_global] = buffer_to_device(fill_f32(n, SEED_X))
+    let dy: Buffer[f32, (N,), device_global] = buffer_to_device(fill_f32(n, SEED_Y))
+    let mut dout: Buffer[f32, (N,), device_global] = buffer_alloc([n])
+    for rep: i64 in range(WARMUP + REPS):
+        let t0: Instant = Instant.now()
+        gpu_launch(saxpy, blocks_for(n), BLOCK, a, &dx, &dy, &mut dout)
+        let ns: i64 = t0.elapsed().as_nanos()
+        if rep < WARMUP:
+            emit(0, n, 3, rep, ns)
+        else:
+            emit(0, n, 4, rep - WARMUP, ns)
+    # Device: the same warm launches, timed on the device (#2901).
+    for rep: i64 in range(WARMUP + REPS):
+        let timer: i64 = gpu_timer_start()
+        gpu_launch(saxpy, blocks_for(n), BLOCK, a, &dx, &dy, &mut dout)
+        emit_device(0, n, rep, gpu_timer_stop(timer))
+    let out: Buffer[f32, (N,)] = buffer_to_host(dout)
+    bad = saxpy_bad(n, out, want)
+    emit(0, n, 5, 0, bad)
+    return bad
+
+# --------------------------------------------------------------- reduce
+
+def reduce_ref(n: i64, timed: bool) -> i32:
+    let x: Buffer[i32, (N,)] = fill_i32(n, SEED_X)
+    let mut acc: i32 = 0
+    let t0: Instant = Instant.now()
+    for i: i64 in range(n):
+        acc = acc + buffer_get(x, i)
+    if timed:
+        emit(1, n, 6, 0, t0.elapsed().as_nanos())
+    return acc
+
+def bench_reduce(n: i64, timed: bool) -> i64:
+    let want: i32 = reduce_ref(n, timed)
+    let nb1: i64 = blocks_for(n)
+    let nb2: i64 = blocks_for(nb1)
+    assert!(nb2 <= BLOCK, "reduce: at most 2^24 elements")
+    let mut bad: i64 = 0
+    for rep: i64 in range(E2E_REPS):
+        let hx: Buffer[i32, (N,)] = fill_i32(n, SEED_X)
+        let t0: Instant = Instant.now()
+        let dx: Buffer[i32, (N,), device_global] = buffer_to_device(hx)
+        let mut pa: Buffer[i32, (N,), device_global] = buffer_alloc([nb1])
+        let mut pb: Buffer[i32, (N,), device_global] = buffer_alloc([nb2])
+        gpu_launch(sum_i32, nb1, BLOCK, n, &dx, &mut pa)
+        gpu_launch(sum_i32, nb2, BLOCK, nb1, &pa, &mut pb)
+        gpu_launch(sum_i32, 1, BLOCK, nb2, &pb, &mut pa)
+        let out: Buffer[i32, (N,)] = buffer_to_host(pa)
+        let ns: i64 = t0.elapsed().as_nanos()
+        if buffer_get(out, 0) != want:
+            bad = bad + 1
+        if timed:
+            emit(1, n, 1, rep, ns)
+        if not timed:
+            return bad
+    if bad != 0:
+        emit(1, n, 5, 0, bad)
+        return bad
+    for rep: i64 in range(E2E_REPS):
+        let hx: Buffer[i32, (N,)] = fill_i32(n, SEED_X)
+        let t0: Instant = Instant.now()
+        let dx: Buffer[i32, (N,), device_global] = buffer_to_device(hx)
+        let _back: Buffer[i32, (N,)] = buffer_to_host(dx)
+        emit(1, n, 2, rep, t0.elapsed().as_nanos())
+    let dx: Buffer[i32, (N,), device_global] = buffer_to_device(fill_i32(n, SEED_X))
+    let mut pa: Buffer[i32, (N,), device_global] = buffer_alloc([nb1])
+    let mut pb: Buffer[i32, (N,), device_global] = buffer_alloc([nb2])
+    for rep: i64 in range(WARMUP + REPS):
+        let t0: Instant = Instant.now()
+        gpu_launch(sum_i32, nb1, BLOCK, n, &dx, &mut pa)
+        gpu_launch(sum_i32, nb2, BLOCK, nb1, &pa, &mut pb)
+        gpu_launch(sum_i32, 1, BLOCK, nb2, &pb, &mut pa)
+        let ns: i64 = t0.elapsed().as_nanos()
+        if rep < WARMUP:
+            emit(1, n, 3, rep, ns)
+        else:
+            emit(1, n, 4, rep - WARMUP, ns)
+    for rep: i64 in range(WARMUP + REPS):
+        let timer: i64 = gpu_timer_start()
+        gpu_launch(sum_i32, nb1, BLOCK, n, &dx, &mut pa)
+        gpu_launch(sum_i32, nb2, BLOCK, nb1, &pa, &mut pb)
+        gpu_launch(sum_i32, 1, BLOCK, nb2, &pb, &mut pa)
+        emit_device(1, n, rep, gpu_timer_stop(timer))
+    let out: Buffer[i32, (N,)] = buffer_to_host(pa)
+    if buffer_get(out, 0) != want:
+        bad = 1
+    emit(1, n, 5, 0, bad)
+    return bad
+
+# --------------------------------------------------------------- matmul
+
+def col_shift(tiles: i64) -> i64:
+    let mut sh: i64 = 0
+    while (1 << sh) < tiles:
+        sh = sh + 1
+    return sh
+
+def grid_for(m: i64, sh: i64) -> i64:
+    let tiles_m: i64 = (m + TILE - 1) / TILE
+    assert!(sh < 31 and tiles_m <= (MAX_GRID >> sh), "matmul: grid too large")
+    return tiles_m << sh
+
+# The reference of an `s x s` product: a sequential host loop up to 256,
+# the untiled device kernel (same terms, same order; checked against the
+# host by `examples/cuda_matmul`) above.
+def matmul_ref(s: i64, timed: bool) -> Buffer[f32, (M, N)]:
+    let ha: Buffer[f32, (M, K)] = fill_a(s)
+    let hb: Buffer[f32, (K, N)] = fill_b(s)
+    if s <= 256:
+        let mut r: Buffer[f32, (M, N)] = buffer_alloc([s, s])
+        let t0: Instant = Instant.now()
+        for i: i64 in range(s):
+            for j: i64 in range(s):
+                let mut acc: f32 = 0.0
+                for p: i64 in range(s):
+                    acc = acc + buffer_get(ha, i, p) * buffer_get(hb, p, j)
+                buffer_set(r, i, j, acc)
+        if timed:
+            emit(2, s, 6, 0, t0.elapsed().as_nanos())
+        return r
+    let sh: i64 = col_shift((s + TILE - 1) / TILE)
+    let da: Buffer[f32, (M, K), device_global] = buffer_to_device(ha)
+    let db: Buffer[f32, (K, N), device_global] = buffer_to_device(hb)
+    let mut dc: Buffer[f32, (M, N), device_global] = buffer_alloc([s, s])
+    gpu_launch(matmul_naive, grid_for(s, sh), BLOCK, sh, &da, &db, &mut dc)
+    return buffer_to_host(dc)
+
+def matmul_bad(s: i64, out: Buffer[f32, (M, N)], want: Buffer[f32, (M, N)]) -> i64:
+    let mut bad: i64 = 0
+    for i: i64 in range(s):
+        for j: i64 in range(s):
+            if not same_f32(buffer_get(out, i, j), buffer_get(want, i, j)):
+                bad = bad + 1
+    return bad
+
+def bench_matmul(s: i64, timed: bool) -> i64:
+    let want: Buffer[f32, (M, N)] = matmul_ref(s, timed)
+    let sh: i64 = col_shift((s + TILE - 1) / TILE)
+    let grid: i64 = grid_for(s, sh)
+    let mut bad: i64 = 0
+    for rep: i64 in range(E2E_REPS):
+        let ha: Buffer[f32, (M, K)] = fill_a(s)
+        let hb: Buffer[f32, (K, N)] = fill_b(s)
+        let t0: Instant = Instant.now()
+        let da: Buffer[f32, (M, K), device_global] = buffer_to_device(ha)
+        let db: Buffer[f32, (K, N), device_global] = buffer_to_device(hb)
+        let mut dc: Buffer[f32, (M, N), device_global] = buffer_alloc([s, s])
+        gpu_launch(matmul_tiled, grid, BLOCK, sh, &da, &db, &mut dc)
+        let out: Buffer[f32, (M, N)] = buffer_to_host(dc)
+        let ns: i64 = t0.elapsed().as_nanos()
+        for i: i64 in range(s):
+            for j: i64 in range(s):
+                if not same_f32(buffer_get(out, i, j), buffer_get(want, i, j)):
+                    bad = bad + 1
+        if timed:
+            emit(2, s, 1, rep, ns)
+        if not timed:
+            return bad
+    if bad != 0:
+        emit(2, s, 5, 0, bad)
+        return bad
+    for rep: i64 in range(E2E_REPS):
+        let ha: Buffer[f32, (M, K)] = fill_a(s)
+        let hb: Buffer[f32, (K, N)] = fill_b(s)
+        let t0: Instant = Instant.now()
+        let _da: Buffer[f32, (M, K), device_global] = buffer_to_device(ha)
+        let db: Buffer[f32, (K, N), device_global] = buffer_to_device(hb)
+        let _back: Buffer[f32, (K, N)] = buffer_to_host(db)
+        emit(2, s, 2, rep, t0.elapsed().as_nanos())
+    let da: Buffer[f32, (M, K), device_global] = buffer_to_device(fill_a(s))
+    let db: Buffer[f32, (K, N), device_global] = buffer_to_device(fill_b(s))
+    let mut dc: Buffer[f32, (M, N), device_global] = buffer_alloc([s, s])
+    for rep: i64 in range(WARMUP + REPS):
+        let t0: Instant = Instant.now()
+        gpu_launch(matmul_tiled, grid, BLOCK, sh, &da, &db, &mut dc)
+        let ns: i64 = t0.elapsed().as_nanos()
+        if rep < WARMUP:
+            emit(2, s, 3, rep, ns)
+        else:
+            emit(2, s, 4, rep - WARMUP, ns)
+    for rep: i64 in range(WARMUP + REPS):
+        let timer: i64 = gpu_timer_start()
+        gpu_launch(matmul_tiled, grid, BLOCK, sh, &da, &db, &mut dc)
+        emit_device(2, s, rep, gpu_timer_stop(timer))
+    let out: Buffer[f32, (M, N)] = buffer_to_host(dc)
+    bad = matmul_bad(s, out, want)
+    emit(2, s, 5, 0, bad)
+    return bad
+
+# ---------------------------------------------------------------- chain
+
+def chain_coeffs() -> f32:
+    return 0.5
+
+def chain_ref(n: i64, timed: bool) -> Buffer[f32, (N,)]:
+    let mut x: Buffer[f32, (N,)] = fill_f32(n, SEED_X)
+    let a: f32 = chain_coeffs()
+    let b: f32 = coeff()
+    let t0: Instant = Instant.now()
+    for step: i64 in range(CHAIN):
+        for i: i64 in range(n):
+            buffer_set(x, i, a * buffer_get(x, i) + b)
+    if timed:
+        emit(3, n, 6, 0, t0.elapsed().as_nanos())
+    return x
+
+# One host round trip per step: upload, launch, download.
+def chain_step_rt(h: Buffer[f32, (N,)], n: i64) -> Buffer[f32, (N,)]:
+    let mut d: Buffer[f32, (N,), device_global] = buffer_to_device(h)
+    gpu_launch(affine, blocks_for(n), BLOCK, chain_coeffs(), coeff(), &mut d)
+    return buffer_to_host(d)
+
+def bench_chain(n: i64, timed: bool) -> i64:
+    let want: Buffer[f32, (N,)] = chain_ref(n, timed)
+    let a: f32 = chain_coeffs()
+    let b: f32 = coeff()
+    let g: i64 = blocks_for(n)
+    let mut bad: i64 = 0
+    # `chain`: one upload, `CHAIN` launches on the resident buffer, one
+    # download. The warm phase is the `CHAIN` launches alone.
+    for rep: i64 in range(E2E_REPS):
+        let hx: Buffer[f32, (N,)] = fill_f32(n, SEED_X)
+        let mut launches: i64 = 0
+        let t0: Instant = Instant.now()
+        let mut d: Buffer[f32, (N,), device_global] = buffer_to_device(hx)
+        for step: i64 in range(CHAIN):
+            gpu_launch(affine, g, BLOCK, a, b, &mut d)
+            launches = launches + 1
+        let out: Buffer[f32, (N,)] = buffer_to_host(d)
+        let ns: i64 = t0.elapsed().as_nanos()
+        if timed:
+            emit(3, n, 7, rep, launches)
+        for i: i64 in range(n):
+            if not same_f32(buffer_get(out, i), buffer_get(want, i)):
+                bad = bad + 1
+        if timed:
+            emit(3, n, 1, rep, ns)
+        if not timed:
+            return bad
+    # `chain_rt`: the same steps, each with a host round trip.
+    for rep: i64 in range(E2E_REPS):
+        let mut h: Buffer[f32, (N,)] = fill_f32(n, SEED_X)
+        let t0: Instant = Instant.now()
+        for step: i64 in range(CHAIN):
+            h = chain_step_rt(h, n)
+        let ns: i64 = t0.elapsed().as_nanos()
+        for i: i64 in range(n):
+            if not same_f32(buffer_get(h, i), buffer_get(want, i)):
+                bad = bad + 1
+        emit(4, n, 1, rep, ns)
+    if bad != 0:
+        emit(3, n, 5, 0, bad)
+        return bad
+    for rep: i64 in range(WARMUP + REPS):
+        let mut d: Buffer[f32, (N,), device_global] = buffer_to_device(fill_f32(n, SEED_X))
+        # Complete the upload without a kernel step, so the timed region is
+        # exactly the `CHAIN` steps of the workload and of `chain_ref`.
+        wait_transfers()
+        let mut launches: i64 = 0
+        let t0: Instant = Instant.now()
+        for step: i64 in range(CHAIN):
+            gpu_launch(affine, g, BLOCK, a, b, &mut d)
+            launches = launches + 1
+        let ns: i64 = t0.elapsed().as_nanos()
+        emit(3, n, 7, E2E_REPS + rep, launches)
+        if rep < WARMUP:
+            emit(3, n, 3, rep, ns)
+        else:
+            emit(3, n, 4, rep - WARMUP, ns)
+        if rep == WARMUP + REPS - 1:
+            let out: Buffer[f32, (N,)] = buffer_to_host(d)
+            for i: i64 in range(n):
+                if not same_f32(buffer_get(out, i), buffer_get(want, i)):
+                    bad = bad + 1
+    # Device: the same `CHAIN` steps per region, timed on the device.
+    for rep: i64 in range(WARMUP + REPS):
+        let mut d: Buffer[f32, (N,), device_global] = buffer_to_device(fill_f32(n, SEED_X))
+        wait_transfers()
+        let timer: i64 = gpu_timer_start()
+        for step: i64 in range(CHAIN):
+            gpu_launch(affine, g, BLOCK, a, b, &mut d)
+        emit_device(3, n, rep, gpu_timer_stop(timer))
+    emit(3, n, 5, 0, bad)
+    return bad
+
+# ----------------------------------------------------------------- copy
+
+# The host value of element `i` of the `iota_f32` input: the same integer
+# and the same exact scaling by 2^-8.
+def iota_value(i: i64) -> f32:
+    return (((i * 7) & 2047) - 1024) as f32 * 0.00390625
+
+def copy_bad(n: i64, out: Buffer[f32, (N,)]) -> i64:
+    let mut bad: i64 = 0
+    for i: i64 in range(n):
+        if not same_f32(buffer_get(out, i), iota_value(i)):
+            bad = bad + 1
+    return bad
+
+def bench_copy(n: i64, timed: bool) -> i64:
+    let mut dx: Buffer[f32, (N,), device_global] = buffer_alloc([n])
+    let mut dout: Buffer[f32, (N,), device_global] = buffer_alloc([n])
+    gpu_launch(iota_f32, blocks_for(n), BLOCK, &mut dx)
+    if not timed:
+        gpu_launch(copy_f32, copy_blocks(n), BLOCK, &dx, &mut dout)
+        return copy_bad(n, buffer_to_host(dout))
+    # Warm: resident buffers, already-loaded kernel; nothing else runs.
+    for rep: i64 in range(WARMUP + REPS):
+        let t0: Instant = Instant.now()
+        gpu_launch(copy_f32, copy_blocks(n), BLOCK, &dx, &mut dout)
+        let ns: i64 = t0.elapsed().as_nanos()
+        if rep < WARMUP:
+            emit(5, n, 3, rep, ns)
+        else:
+            emit(5, n, 4, rep - WARMUP, ns)
+    for rep: i64 in range(WARMUP + REPS):
+        let timer: i64 = gpu_timer_start()
+        gpu_launch(copy_f32, blocks_for(n), BLOCK, &dx, &mut dout)
+        emit_device(5, n, rep, gpu_timer_stop(timer))
+    let bad: i64 = copy_bad(n, buffer_to_host(dout))
+    emit(5, n, 5, 0, bad)
+    return bad
+
+# ---------------------------------------------------------------- sweep
+
+def sweep(timed: bool) -> i64:
+    let vec: Array[i64; 4] = [1024, 65536, 1048576, 16777216]
+    let mat: Array[i64; 4] = [64, 256, 1024, 2048]
+    let chain: Array[i64; 3] = [65536, 1048576, 16777216]
+    let copy: Array[i64; 3] = [1048576, 16777216, 67108864]
+    let mut bad: i64 = 0
+    for t: i64 in range(4):
+        bad = bad + bench_saxpy(vec[t], timed)
+    for t: i64 in range(4):
+        bad = bad + bench_reduce(vec[t], timed)
+    for t: i64 in range(4):
+        bad = bad + bench_matmul(mat[t], timed)
+    for t: i64 in range(3):
+        bad = bad + bench_chain(chain[t], timed)
+    for t: i64 in range(3):
+        bad = bad + bench_copy(copy[t], timed)
+    if not timed:
+        # Untimed only: a size that is no multiple of `COPY_PER_THREAD`
+        # nor of a workgroup, so `copy_f32`'s element-by-element tail runs.
+        bad = bad + bench_copy(1000003, false)
+    return bad
+
+def main() -> i32:
+    if argc() > 1:
+        println!("config,reps,{REPS}")
+        println!("config,warmup,{WARMUP}")
+        println!("config,e2e_reps,{E2E_REPS}")
+        println!("config,chain,{CHAIN}")
+        println!("config,block,{BLOCK}")
+        println!("config,seeds,{SEED_X}:{SEED_Y}:{SEED_A}:{SEED_B}")
+        # The process's first launch loads the HSACO code object (no JIT:
+        # the image is native gfx942 code).
+        let mut d: Buffer[f32, (N,), device_global] = buffer_to_device(fill_f32(1, SEED_X))
+        let t0: Instant = Instant.now()
+        gpu_launch(affine, 1, BLOCK, 1.0, 0.0, &mut d)
+        emit(3, 1, 0, 0, t0.elapsed().as_nanos())
+        if sweep(true) != 0:
+            return 1
+        return 0
+    let bad: i64 = sweep(false)
+    if bad != 0:
+        println!("rocm_bench: {bad} mismatches")
+        return 1
+    println!("rocm_bench: saxpy, reduce, matmul, chain and copy match the strict reference at every size")
+    return 0

@@ -1,0 +1,125 @@
+# A router that matches a request's method and path against registered
+# routes and calls the route's handler.
+#
+# Patterns are `/`-separated segments; a segment `:name` matches any one
+# non-empty path segment and binds it as a parameter (`/todos/:id`). A path
+# that matches some route but none with the request's method is a 405 with
+# an `Allow` header; a path that matches no route is a 404. A handler that
+# returns `Err(message)` becomes a 500.
+#
+# Handlers are plain `fn` pointers. They cannot capture state, so the router
+# is generic over a state type `S` that the server passes to every handler
+# as `&mut S` (#3550: capturing closures as handlers).
+
+from std.core import Result, Ok, Err, Option, Some, None_
+from .request import Request
+from .response import Response, error_response, with_header
+
+# One `:name` path parameter and the segment it matched.
+@public
+struct Param:
+    @public
+    name: String
+    @public
+    value: String
+
+# The value bound to the parameter `name`, cloned.
+@public
+def param(params: &Vec[Param], name: String) -> Option[String]:
+    for i: usize in range(0, params.len()):
+        if params[i].name == name:
+            return Some(params[i].value.clone())
+    # Workaround (#3533): bare imported `None_` is AX0381.
+    return Option.None_
+
+# A route: method, pattern segments and handler.
+@public
+struct Route[S]:
+    @public
+    method: String
+    @public
+    segments: Vec[String]
+    @public
+    handler: fn(&mut S, &Request, &Vec[Param]) -> Result[Response, String]
+
+@public
+struct Router[S]:
+    @public
+    routes: Vec[Route[S]]
+
+# Split `path` at `/`, dropping the leading one: `/a/b` is `["a", "b"]`,
+# `/` is `[""]`.
+@public
+def split_path(path: Slice[u8]) -> Vec[String]:
+    let mut out: Vec[String] = Vec.new()
+    let mut current: String = String.new()
+    let mut start: usize = 0
+    if path.len() > 0 and path[0] == 47:
+        start = 1
+    for i: usize in range(start, path.len()):
+        if path[i] == 47:
+            out.push(current)
+            current = String.new()
+        else:
+            current.push(path[i])
+    out.push(current)
+    return out
+
+# The `:name` bindings when `path` matches the pattern `segments`.
+def match_segments(segments: &Vec[String], path: &Vec[String]) -> Option[Vec[Param]]:
+    if segments.len() != path.len():
+        return Option.None_
+    let mut bound: Vec[Param] = Vec.new()
+    for i: usize in range(0, segments.len()):
+        let pattern: Slice[u8] = segments[i].as_bytes()
+        if pattern.len() > 1 and pattern[0] == 58:
+            if path[i].len() == 0:
+                return Option.None_
+            let mut name: String = String.new()
+            for k: usize in range(1, pattern.len()):
+                name.push(pattern[k])
+            bound.push(Param { name: name, value: path[i].clone() })
+        elif segments[i] != path[i]:
+            return Option.None_
+    return Some(bound)
+
+impl Router[S]:
+    @public
+    def new() -> Router[S]:
+        return Router { routes: Vec.new() }
+
+    # Register `handler` for `method` requests to `pattern`.
+    @public
+    def add(mut self, method: String, pattern: String, handler: fn(&mut S, &Request, &Vec[Param]) -> Result[Response, String]) -> unit:
+        let segments: Vec[String] = split_path(pattern.as_bytes())
+        self.routes.push(Route { method: method, segments: segments, handler: handler })
+
+    # Route `request` and run the matching handler on `state`.
+    @public
+    def dispatch(self: &Self, state: &mut S, request: &Request) -> Response:
+        let path: Vec[String] = split_path(request.path.as_bytes())
+        let mut allow: String = String.new()
+        for i: usize in range(0, self.routes.len()):
+            # Workaround (#3544): the bindings are
+            # returned rather than written to a `&mut Vec[Param]` out
+            # parameter: instantiated in a dependent package, this body kept
+            # that `&mut` borrow alive across the handler call (AX0502).
+            match match_segments(&self.routes[i].segments, &path):
+                Some(params) =>
+                    if self.routes[i].method == request.method:
+                        # Workaround (#3539): binding the handler to an annotated
+                        # `fn` local is a false "expected X, found X" type error,
+                        # so the field is called directly.
+                        match (self.routes[i].handler)(state, request, &params):
+                            Ok(response) => return response
+                            Err(message) => return error_response(500, message)
+                    # Workaround (#3538): a `String` field
+                    # of a generic struct is not known to be a `string` here.
+                    let method: &String = &self.routes[i].method
+                    if allow.len() > 0:
+                        allow.push_str(", ")
+                    allow.push_str(method)
+                None_ => pass
+        if allow.len() == 0:
+            return error_response(404, "no route for this path")
+        return with_header(error_response(405, "method not allowed"), "Allow", allow)

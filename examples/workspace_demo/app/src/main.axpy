@@ -1,0 +1,30 @@
+# app — An application crate that depends on mathlib
+#
+# Demonstrates a binary crate within a workspace that uses
+# functions from its sibling library crate.
+
+from mathlib import circle_area
+from mathlib import rect_area
+from mathlib import clamp
+from mathlib import abs_diff
+
+def main() -> i32:
+    println!("Workspace Demo")
+    println!("==============")
+
+    # Use geometry functions from mathlib
+    let area: f64 = circle_area(5.0)
+    println!("Circle area (r=5): {area}")
+
+    let rect: f64 = rect_area(3.0, 7.0)
+    println!("Rectangle area (3x7): {rect}")
+
+    # Use arithmetic functions from mathlib
+    let clamped: i64 = clamp(150, 0, 100)
+    println!("clamp(150, 0, 100) = {clamped}")
+
+    let diff: i64 = abs_diff(42, 100)
+    println!("abs_diff(42, 100) = {diff}")
+
+    println!("Done!")
+    return 0

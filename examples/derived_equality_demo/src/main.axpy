@@ -1,0 +1,25 @@
+@derive(Eq)
+struct Point:
+    x: i32
+    y: i32
+
+@derive(Eq)
+enum Reading:
+    Value(value: i32)
+    Missing
+
+def main() -> i32:
+    let first: Point = Point { x: 3, y: 4 }
+    let same: Point = Point { x: 3, y: 4 }
+    let different: Point = Point { x: 3, y: 5 }
+    assert!(first == same, "equal struct fields compare equal")
+    assert!(first != different, "different struct fields compare unequal")
+
+    let reading: Reading = Reading.Value(42)
+    let same_reading: Reading = Reading.Value(42)
+    let different_value: Reading = Reading.Value(7)
+    let missing: Reading = Reading.Missing
+    assert!(reading == same_reading, "equal enum tags and payloads compare equal")
+    assert!(reading != different_value, "different enum payloads compare unequal")
+    assert!(reading != missing, "different enum tags compare unequal")
+    return 0

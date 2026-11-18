@@ -1,0 +1,34 @@
+# Fails if anything outside the allow-list reaches this public repository
+# (#2532): no compiler source, design docs, perf studies or internal material.
+# The guard and its allow-list are maintained in the private repository and
+# copied here by prepare-public-tree.sh. Make `guard` a required status check.
+name: public-tree-guard
+on:
+  push:
+  pull_request:
+  release:
+    types: [published, edited]
+permissions:
+  contents: read
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Allow-list check of the tree
+        run: sh scripts/check-public-tree.sh .
+      - name: Installer syntax and lint
+        run: |
+          sh -n install.sh
+          shellcheck -s sh install.sh scripts/check-public-tree.sh
+  release-assets:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "${{ github.event.release.tag_name }}" --dir assets --repo "${{ github.repository }}"
+      - name: Allow-list check of the release assets and archives
+        run: sh scripts/check-public-tree.sh --release-assets assets

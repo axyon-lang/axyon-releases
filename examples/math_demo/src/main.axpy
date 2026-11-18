@@ -1,0 +1,70 @@
+# Floating-point math: every spelling of sqrt/tan/abs works.
+import std.math as math
+from std.math import sqrt, tan, abs, hypot, powi, fma, asinh, acosh, atanh, log1p, tgamma
+from std.math import sin, cos, exp, ln, sqrt_f32, tan_f32, sin_f32, cos_f32, exp_f32, ln_f32
+
+def close(a: f64, b: f64) -> bool:
+    return abs(a - b) < 0.000001
+
+def close32(a: f32, b: f64) -> bool:
+    """Compare an f32 result against the f64 reference at f32 precision."""
+    return abs((a as f64) - b) < 0.00001
+
+def check_f64(x: f64) -> None:
+    """sqrt/sin/cos/tan/exp/ln on f64: function, module and method spellings."""
+    assert!(close(sqrt(x), 0.7071067811865476), "sqrt f64")
+    assert!(close(math.sin(x), 0.479425538604203), "math.sin f64")
+    assert!(close(cos(x), 0.8775825618903728), "cos f64")
+    assert!(close(x.tan(), 0.5463024898437905), "x.tan() f64")
+    assert!(close(exp(x), 1.6487212707001282), "exp f64")
+    assert!(close(x.ln(), -0.6931471805599453), "x.ln() f64")
+    assert!(close(math.ln(x), -0.6931471805599453), "math.ln f64")
+    assert!(close(x.sin() * x.sin() + x.cos() * x.cos(), 1.0), "sin^2 + cos^2 f64")
+
+def check_f32(x: f32) -> None:
+    """The same functions on f32 (`*_f32` functions and f32 methods)."""
+    assert!(close32(sqrt_f32(x), 0.7071067811865476), "sqrt_f32")
+    assert!(close32(x.sqrt(), 0.7071067811865476), "x.sqrt() f32")
+    assert!(close32(sin_f32(x), 0.479425538604203), "sin_f32")
+    assert!(close32(x.cos(), 0.8775825618903728), "x.cos() f32")
+    assert!(close32(cos_f32(x), 0.8775825618903728), "cos_f32")
+    assert!(close32(tan_f32(x), 0.5463024898437905), "tan_f32")
+    assert!(close32(math.exp_f32(x), 1.6487212707001282), "math.exp_f32")
+    assert!(close32(x.exp(), 1.6487212707001282), "x.exp() f32")
+    assert!(close32(ln_f32(x), -0.6931471805599453), "ln_f32")
+
+def main() -> i32:
+    let two: f64 = 2.0
+    assert!(close(sqrt(two), 1.4142135623730951), "from std.math import sqrt")
+    assert!(close(math.sqrt(two), 1.4142135623730951), "math.sqrt(variable)")
+    assert!(close(math.sqrt(2.0), 1.4142135623730951), "math.sqrt(literal)")
+    assert!(close(math_sqrt(2.0), 1.4142135623730951), "math_sqrt(literal)")
+    assert!(close(two.sqrt(), 1.4142135623730951), "x.sqrt()")
+    assert!(close(tan(0.0), 0.0), "tan")
+    assert!(close(abs(-3.5), 3.5), "abs")
+    assert!(close((0.0 - 3.5).abs(), 3.5), "x.abs()")
+    assert!(close(hypot(3.0, 4.0), 5.0), "hypot")
+    assert!(close(powi(2.0, 10), 1024.0), "powi")
+    check_f64(0.5)
+    check_f32(0.5_f32)
+
+    # Fused multiply-add: a single rounding keeps the cancellation residue.
+    let eps: f64 = 1.0 / 134217728.0
+    let tiny: f64 = 1.0 / 18014398509481984.0
+    assert!(fma(1.0 + eps, 1.0 - eps, -1.0) == 0.0 - tiny, "fma is fused")
+    # hypot must not overflow / underflow in the intermediate squares.
+    assert!(hypot(1.0e200, 1.0e200) > 1.41e200, "hypot large")
+    assert!(hypot(1.0e-200, 1.0e-200) > 1.41e-200, "hypot small")
+    # Inverse hyperbolics and log1p near zero and at large finite inputs.
+    assert!(asinh(1.0e-20) == 1.0e-20, "asinh near zero")
+    assert!(atanh(1.0e-20) == 1.0e-20, "atanh near zero")
+    assert!(asinh(1.0e200) > 461.0, "asinh large")
+    assert!(acosh(1.0e200) > 461.0, "acosh large")
+    assert!(log1p(1.0e308) > 709.0, "log1p large")
+    # Gamma stays finite where the result is representable.
+    assert!(tgamma(150.0) > 3.8e260, "tgamma(150)")
+    # The minimum exponent must not wrap.
+    let nmin: i32 = -2147483647 - 1
+    assert!(powi(2.0, nmin) == 0.0, "powi(2, i32::MIN)")
+    println!("math ok")
+    return 0

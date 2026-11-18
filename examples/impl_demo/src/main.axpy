@@ -1,0 +1,31 @@
+struct Point:
+    @public
+    x: f32
+    @public
+    y: f32
+
+impl Point:
+    def new(x: f32, y: f32) -> Self:
+        return Point { x: x, y: y }
+
+    def magnitude_squared(self) -> f32:
+        return self.x * self.x + self.y * self.y
+
+    def add(self, other: Point) -> Self:
+        return Point { x: self.x + other.x, y: self.y + other.y }
+
+def main() -> i32:
+    # Create a point using static method
+    let p1 = Point.new(3.0, 4.0)
+
+    # Call instance method (consumes p1)
+    let mag = p1.magnitude_squared()
+    println!("Point (3, 4) magnitude squared: {mag}")
+
+    # Create points for add operation
+    let p1_new = Point.new(3.0, 4.0)
+    let p2 = Point.new(1.0, 2.0)
+    let p3 = p1_new.add(p2)
+    println!("After adding (1, 2): ({p3.x}, {p3.y})")
+
+    return 0

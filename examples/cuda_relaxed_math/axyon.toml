@@ -1,0 +1,20 @@
+[package]
+name = "cuda_relaxed_math"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# Generated kernels run on CUDA with the opt-in relaxed device math (#2830):
+# device float `+ - * /` may be reassociated and contracted into `fma.rn`,
+# never flushed (`.ftz`), approximated (`.approx`) or run as TF32. Host math
+# stays strict (`[build] fast_math` is independent and stays off). Remove
+# `gpu-math` (or set it to "strict") for the strict device build of the
+# same kernels.
+[target]
+gpu = ["nvptx-sm80"]
+gpu-math = "relaxed"

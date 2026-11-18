@@ -1,0 +1,5 @@
+# A workspace whose executable launches a dependency's CUDA kernels
+# directly (issue #2663). `kernels` builds first; `app` imports and
+# launches its `@gpu(entry)` kernels.
+[workspace]
+members = ["kernels", "app"]

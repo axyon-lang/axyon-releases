@@ -1,0 +1,109 @@
+# Portable fixed-width SIMD (#1699): saxpy, a clamped dot product and a
+# lane-wise conversion, each with a `load_n`/`store_n` tail so any length
+# works. See docs/src/guide/simd.md.
+
+# ys[i] = a * xs[i] + ys[i]
+def saxpy(a: f32, xs: &Vec[f32], ys: &mut Vec[f32]) -> None:
+    let n: i64 = xs.len() as i64
+    let va: Simd[f32, 8] = Simd.splat[f32, 8](a)
+    let mut i: i64 = 0
+    while i < n:
+        let mut rem: i64 = n - i
+        if rem > 8:
+            rem = 8
+        let x: Simd[f32, 8] = Simd.load_n[f32, 8](xs, i, rem)
+        let y: Simd[f32, 8] = Simd.load_n[f32, 8](ys, i, rem)
+        va.mul_add(x, y).store_n(ys, i, rem)
+        i = i + 8
+
+# sum of clamp(xs[i], lo, hi) * ys[i], lanes accumulated in lane order
+def clamped_dot(xs: &Vec[f32], ys: &Vec[f32], lo: f32, hi: f32) -> f32:
+    let n: i64 = xs.len() as i64
+    let vlo: Simd[f32, 8] = Simd.splat[f32, 8](lo)
+    let vhi: Simd[f32, 8] = Simd.splat[f32, 8](hi)
+    let mut acc: Simd[f32, 8] = Simd.splat[f32, 8](0.0)
+    let mut i: i64 = 0
+    while i < n:
+        let mut rem: i64 = n - i
+        if rem > 8:
+            rem = 8
+        let x: Simd[f32, 8] = Simd.load_n[f32, 8](xs, i, rem).max(vlo).min(vhi)
+        acc = acc + x * Simd.load_n[f32, 8](ys, i, rem)
+        i = i + 8
+    return acc.reduce_sum()
+
+# Round to the nearest integer and count the elements above `limit`. The
+# padded lanes of a partial last chunk are zero, which may itself compare
+# above a negative `limit`, so they are masked out with `active` (1 for the
+# first `rem` lanes, 0 after) before the lanes are summed.
+def count_above(xs: &Vec[f32], limit: i32) -> i64:
+    let n: i64 = xs.len() as i64
+    let vlimit: Simd[i32, 8] = Simd.splat[i32, 8](limit)
+    let one: Simd[i32, 8] = Simd.splat[i32, 8](1)
+    let zero: Simd[i32, 8] = Simd.splat[i32, 8](0)
+    let half: Simd[f32, 8] = Simd.splat[f32, 8](0.5)
+    let mut ones: Vec[i32] = Vec.new()
+    for k: i64 in range(8):
+        ones.push(1)
+    let mut count: i64 = 0
+    let mut i: i64 = 0
+    while i < n:
+        let mut rem: i64 = n - i
+        if rem > 8:
+            rem = 8
+        let r: Simd[i32, 8] = (Simd.load_n[f32, 8](xs, i, rem) + half).cast[i32]()
+        let active: Simd[i32, 8] = Simd.load_n[i32, 8](&ones, 0, rem)
+        let hit: Simd[i32, 8] = r.gt(vlimit).select(one, zero) * active
+        count = count + (hit.reduce_sum() as i64)
+        i = i + 8
+    return count
+
+# Lane shuffles (#2527): compile-time masks, then a run-time byte table
+# lookup where an index >= 16 yields 0 (defined on every target).
+def shuffles() -> None:
+    let mut src: Vec[u8] = Vec.new()
+    let mut idx: Vec[u8] = Vec.new()
+    let mut out: Vec[u8] = Vec.new()
+    for i: i64 in range(16):
+        src.push((i as u8) + 10)
+        idx.push(((15 - i) as u8))
+        out.push(0)
+    # an out-of-range dynamic index (200) selects 0
+    idx[3] = 200
+    let v: Simd[u8, 16] = Simd.load[u8, 16](&src, 0)
+    let r: Simd[u8, 16] = v.reverse()
+    r.store(&mut out, 0)
+    assert!(out[0] == 25 and out[15] == 10, "reverse")
+    let rot: Simd[u8, 16] = v.rotate_left[1]()
+    rot.store(&mut out, 0)
+    assert!(out[0] == 11 and out[15] == 10, "rotate_left")
+    let sw: Simd[u8, 16] = v.shuffle[(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14)]()
+    sw.store(&mut out, 0)
+    assert!(out[0] == 11 and out[1] == 10, "shuffle")
+    let mix: Simd[u8, 16] = v.shuffle2[(0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23)](r)
+    mix.store(&mut out, 0)
+    assert!(out[0] == 10 and out[1] == 25 and out[3] == 24, "shuffle2")
+    let vi: Simd[u8, 16] = Simd.load[u8, 16](&idx, 0)
+    let d: Simd[u8, 16] = v.shuffle_dynamic(vi)
+    d.store(&mut out, 0)
+    assert!(out[0] == 25 and out[3] == 0 and out[15] == 10, "shuffle_dynamic")
+    println!("shuffles ok")
+
+def main() -> i32:
+    let mut xs: Vec[f32] = Vec.new()
+    let mut ys: Vec[f32] = Vec.new()
+    for i: i64 in range(21):
+        xs.push((i as f32) * 0.5)
+        ys.push(1.0)
+    saxpy(2.0, &xs, &mut ys)
+    println!("ys[0] = {ys[0]}, ys[20] = {ys[20]}")
+    let d: f32 = clamped_dot(&xs, &ys, 1.0, 4.0)
+    println!("clamped dot = {d}")
+    let c: i64 = count_above(&xs, 6)
+    println!("lanes above 6 = {c}")
+    let mut one_x: Vec[f32] = Vec.new()
+    one_x.push(1.0)
+    assert!(count_above(&one_x, -1) == 1, "partial chunk, negative limit")
+    assert!(count_above(&xs, -1) == 21, "tail lanes must not be counted")
+    shuffles()
+    return 0

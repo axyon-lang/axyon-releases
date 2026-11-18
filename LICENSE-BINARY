@@ -1,0 +1,241 @@
+AXYON BINARY LICENSE AGREEMENT
+Version 1.0 — November 14, 2026
+
+Copyright (c) 2026 Anyon Systems Inc. All rights reserved.
+
+1. PARTIES AND ACCEPTANCE
+
+This agreement is between Anyon Systems Inc. ("Anyon") and the individual or
+legal entity accepting it ("You"). By affirmatively accepting this agreement,
+You agree to its terms. If accepting for an entity, You represent that You have
+authority to bind that entity. If You do not agree, do not install or use the
+Software. A separate written agreement signed by Anyon controls to the extent
+it expressly replaces or conflicts with this agreement.
+
+2. SCOPE AND DEFINITIONS
+
+"Software" means the Anyon-owned portions of the official AXYON distribution
+provided by Anyon under this agreement: compiler and command-line binaries,
+language server, editor tools, runtime libraries, precompiled standard library,
+and accompanying documentation and materials. Third-Party Components, defined
+in Section 8, are excluded from this definition.
+
+"Your Programs" means software, source code, data, models, and other work that
+You develop using the Software. The Software and Third-Party Components are
+not Your Programs merely because they are included in or used to build them.
+
+"Commercial Use" means use of the Software primarily intended for commercial
+advantage or monetary compensation, including developing, testing, building,
+maintaining, or operating a commercial product or service; internal business
+operations or commercial research and development; paid client or consulting
+work; and providing a commercial hosted compilation or development service.
+Pre-revenue development and internal use can be Commercial Use. Publishing
+source code, charging no end-user fee, or working at a nonprofit or academic
+institution does not by itself make an activity noncommercial.
+
+"Permitted Free Use" means any of the following, provided the activity is not
+Commercial Use:
+
+  (a) Open-source project work: developing, testing, building, or maintaining a
+      project whose source code is publicly available under an Open Source
+      Initiative-approved license. Private commercial development does not
+      qualify merely because a future open-source release is planned.
+  (b) Noncommercial research: scientific or technical research undertaken to
+      advance knowledge, rather than to develop or supply a commercial product
+      or service or perform a commercial engagement.
+  (c) Academic work: teaching, coursework, student projects, theses, or
+      noncommercial academic research at a recognized educational or research
+      institution, including work by its students, teachers, and researchers.
+
+Ordinary tuition, academic salaries, scholarships, and research grants do not
+by themselves make academic or research work commercial. Sponsored work that
+develops a sponsor's commercial product, delivers paid client work, or confers
+exclusive commercial exploitation rights is Commercial Use. General donations
+to an open-source project do not by themselves make its work commercial;
+payment for commercial deliverables or services does. For mixed activities,
+this agreement covers only the qualifying noncommercial work.
+
+3. FREE LICENSE AND COMMERCIAL LICENSING
+
+Subject to compliance with this agreement, Anyon grants You a non-exclusive,
+non-transferable, royalty-free license to install, copy as reasonably needed
+for authorized use and backup, and execute the Software solely for Permitted
+Free Use. You may use it on local machines, institutional clusters, and private
+or hosted CI workers acting for You for that purpose. Your authorized personnel
+must comply with these terms, and You are responsible for their use on Your
+behalf. No license is granted to offer the compiler as a service to unrelated
+third parties or to distribute compiler copies to them.
+
+Commercial Use requires a separate written commercial license from Anyon and
+payment of the applicable fees before that use begins. No commercial trial,
+revenue threshold, production exception, or implied commercial license is
+granted here. Contact Anyon Systems Inc. through its official business contact
+channel to arrange commercial terms. A commercial license does not grant
+source-code access unless it expressly says so.
+
+4. YOUR PROGRAMS AND RUNTIME REDISTRIBUTION
+
+Anyon does not claim ownership of Your Programs merely because You use the
+Software. You may choose their license, including an open-source license,
+subject to the rights in any components included in them. Compiler use to
+create or maintain them must still comply with Section 3. This agreement does
+not impose a royalty on Your Programs or require disclosure of their source.
+
+"Redistributables" means only the Anyon-owned runtime and standard-library
+object code that the Software incorporates into Your Programs during ordinary
+compilation or linking, and Anyon runtime shared libraries expressly identified
+as redistributable in the official distribution. This includes compiler-emitted
+support code needed to execute Your Programs. It excludes compiler and language
+server executables, development tools, source files, standalone static runtime
+archives, and precompiled standard-library bundles used for compilation.
+
+For Your Programs built under a valid free or commercial license, Anyon grants
+You a worldwide, royalty-free right to reproduce and distribute the
+Redistributables in object-code form solely as part of, or as necessary to run,
+Your Programs that provide substantial functionality beyond those components.
+Include this agreement and retain applicable copyright and third-party notices
+in accompanying documentation or a notices file. Do not offer Redistributables
+as a standalone development kit or grant rights in Anyon code beyond this
+agreement. Normal compiler optimization and linking are permitted.
+
+Anyon directly grants each lawful recipient the royalty-free right to execute,
+copy, and further redistribute those Redistributables solely with such Programs
+and subject to this Section's conditions. Merely running or redistributing
+those Programs, including commercially, does not require an AXYON compiler
+license. Using the compiler to rebuild, modify, or maintain them is separately
+governed by Section 3. This runtime permission survives expiry or termination
+of the developer's compiler license for Programs lawfully built beforehand;
+it ends for a recipient who breaches its conditions. Third-party runtime code
+is governed by Section 8, not this grant.
+
+5. PROPRIETARY RIGHTS AND ACCOMPANYING MATERIALS
+
+Anyon and its licensors retain their respective ownership of the Software and
+all related intellectual property. No compiler source-code license is granted.
+Do not disclose nonpublic Anyon source or other confidential materials received
+under a separate agreement except as that agreement permits. No confidentiality
+claim is made over Your Programs or information lawfully public independently
+of a breach of an obligation to Anyon.
+
+If an official distribution includes standard-library source, interface files,
+or documentation, You may read and use them with the Software for authorized
+development, including compiling the supplied standard library without source
+modification. This is not permission to publish or modify those materials or
+the compiler. Code snippets explicitly presented as application examples in
+the supplied documentation may be copied, adapted, and distributed in Your
+Programs; this exception does not extend to compiler or library implementation
+source. No trademark or endorsement rights are granted.
+
+6. RESTRICTIONS
+
+Except as expressly permitted in this agreement or a separate written
+agreement with Anyon, You must not, and must not assist others to:
+
+  (a) reverse engineer, decompile, disassemble, or otherwise attempt to derive
+      source code, algorithms, or implementation details of the Software;
+  (b) modify, translate, patch, or create derivative works of the Software;
+  (c) bypass license controls, access restrictions, or technical protections;
+  (d) sell, rent, lease, sublicense, publish, mirror, or redistribute the
+      Software, including in public containers or package registries, except
+      for the runtime permissions in Section 4;
+  (e) remove or obscure copyright, trademark, license, or proprietary notices;
+  (f) use or disclose nonpublic Anyon implementation materials to reproduce
+      the Software or build a substitute implementation; or
+  (g) use the Software unlawfully or outside Your licensed scope.
+
+These restrictions apply to Anyon's Software, not to Your own code or an
+independently developed implementation. They do not prohibit ordinary use of
+documented interfaces, compiler flags, emitted diagnostics, or generated IR
+to develop, inspect, optimize, or debug Your Programs. Section 8 controls for
+Third-Party Components, including rights to modify or reverse engineer them
+under their own licenses. Each restriction applies only to the extent permitted
+by applicable law and does not override a statutory right that cannot lawfully
+be excluded or limited, including applicable interoperability rights.
+
+7. EXPORT CONTROLS AND SANCTIONS
+
+You must comply with applicable export, re-export, transfer, import, sanctions,
+and trade-control laws, including those of Canada and, where applicable, the
+United States and other relevant jurisdictions. Do not supply or make the
+Software or controlled technology available to prohibited persons, destinations,
+or end uses, or facilitate evasion of those restrictions. Obtain any required
+authorizations before a controlled transaction, including remote access or
+electronic transfer where regulated. Neither a free license nor a commercial
+license is an export authorization. This agreement does not assign an export
+classification to the Software or make a representation that a permit is or
+is not required.
+
+8. THIRD-PARTY COMPONENTS; LLVM/MLIR AND GPU TOOLCHAINS
+
+The distribution may include or interoperate with software owned by others
+("Third-Party Components"). Each component remains governed by its own license.
+Its license controls over this agreement for that component. Nothing here
+restricts rights independently granted by an open-source or other third-party
+license, requires payment to Anyon for those rights, or asserts Anyon ownership
+of that component. Preserve all notices and comply with applicable terms.
+
+LLVM and MLIR, including applicable upstream LLVM, GPU, NVVM/NVGPU, and
+ROCDL/AMDGPU dialect implementations, are generally licensed under Apache-2.0
+with LLVM Exceptions; component-specific notices and exceptions also apply.
+Anyon's commercial-use and reverse-engineering restrictions do not replace
+those licenses. Merely emitting those dialects does not make the generated
+program or Anyon's original compiler code an upstream LLVM/MLIR implementation.
+
+NVIDIA CUDA toolkits, libraries and drivers; AMD ROCm/HIP components; and Apple
+Metal, Xcode, SDKs and frameworks are distinct from upstream MLIR dialects.
+Their respective terms govern their use and any redistribution. This agreement
+does not grant a right to redistribute a vendor SDK or driver, waive a vendor
+restriction, or grant rights to third-party code included in generated output.
+Use a lawfully obtained vendor installation when it is required. Anyon must
+supply required licenses and notices for components it actually distributes;
+Your obligations do not replace Anyon's own distribution obligations.
+
+9. TERM AND TERMINATION
+
+This agreement applies to the version of the Software supplied with it while
+You comply with its terms. You may terminate it by ceasing use and deleting
+Your copies of the Software, subject to Section 4. Your free-use permission
+does not extend to activities that become Commercial Use.
+
+Anyon may terminate this agreement by written notice for a material breach
+that remains uncured 30 days after notice, or immediately for unauthorized
+disclosure or distribution of compiler source, intentional license-control
+circumvention, or use prohibited by applicable export or sanctions law. On
+termination, stop using and delete the Software, except a copy required by law
+to be retained without further use. Sections concerning ownership, restrictions,
+third-party rights, liability, and accrued obligations survive as applicable;
+the surviving runtime permission is described in Section 4. A future license
+version does not retroactively change this version's terms without agreement.
+
+10. WARRANTY, SUPPORT, AND LIABILITY
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED
+"AS IS" AND "AS AVAILABLE," WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+EXPRESS, IMPLIED, OR STATUTORY, INCLUDING MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. ANYON DOES NOT WARRANT THAT
+THE SOFTWARE OR GENERATED OUTPUT WILL BE ERROR-FREE, SECURE, OR UNINTERRUPTED.
+YOU ARE RESPONSIBLE FOR VALIDATING YOUR PROGRAMS AND THEIR FITNESS FOR USE.
+NO SUPPORT, MAINTENANCE, UPDATE, OR SERVICE-LEVEL COMMITMENT IS INCLUDED UNLESS
+SEPARATELY AGREED IN WRITING. THE SOFTWARE IS NOT CERTIFIED FOR SAFETY-CRITICAL
+USE WHERE FAILURE COULD CAUSE DEATH, INJURY, OR SEVERE ENVIRONMENTAL DAMAGE.
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, ANYON AND ITS LICENSORS WILL
+NOT BE LIABLE FOR INDIRECT, SPECIAL, INCIDENTAL, CONSEQUENTIAL, EXEMPLARY,
+OR PUNITIVE DAMAGES, OR LOST PROFITS, REVENUE, DATA, OR BUSINESS OPPORTUNITIES
+ARISING FROM THIS AGREEMENT OR THE SOFTWARE. THEIR AGGREGATE LIABILITY UNDER
+THIS FREE LICENSE WILL NOT EXCEED CAD 100. A SEPARATE COMMERCIAL AGREEMENT MAY
+SET DIFFERENT LIABILITY TERMS. THESE LIMITATIONS APPLY REGARDLESS OF THE LEGAL
+THEORY AND EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE, BUT DO NOT
+EXCLUDE OR LIMIT LIABILITY OR RIGHTS THAT APPLICABLE LAW DOES NOT ALLOW TO BE
+EXCLUDED OR LIMITED.
+
+11. GENERAL
+
+This agreement and any applicable separate written agreement with Anyon are
+the entire agreement for the covered Software. Changes or additional rights
+require Anyon's written agreement. You may not assign this agreement without
+Anyon's written consent except where applicable law requires otherwise. If a
+provision is unenforceable, the remaining provisions remain effective to the
+extent permitted by law. Failure to enforce a provision is not a waiver. No
+rights are granted by implication. Third-Party Components remain governed by
+their own terms in all cases.

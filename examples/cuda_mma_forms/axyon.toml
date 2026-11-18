@@ -1,0 +1,16 @@
+[package]
+name = "cuda_mma_forms"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# Tensor-core fragments lower to `mma.sync` on CUDA (#2513, #2928): exactly
+# one GPU target with a device runtime.
+[target]
+gpu = ["nvptx-sm80"]

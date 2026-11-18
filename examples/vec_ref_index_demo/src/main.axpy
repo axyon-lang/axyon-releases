@@ -1,0 +1,38 @@
+# Indexing through `&Vec[T]` / `&mut Vec[T]` parameters (#1282).
+#
+# `g[i]` reads through a shared or mutable reference, `g[i] = x` and
+# `g[i] += x` write through `&mut`, and `ref_mut(g[i])` hands out the element's
+# real address so a callee writes into the caller's Vec.
+
+def total(g: &Vec[i64]) -> i64:
+    let mut sum: i64 = 0
+    for i: usize in range(0, g.len()):
+        sum += g[i]
+    return sum
+
+def bump(g: &mut Vec[i64], i: usize) -> None:
+    g[i] = g[i] + 1
+    g[i] += 10
+
+def first_mut(g: &mut Vec[i64]) -> &mut i64:
+    return ref_mut(g[0])
+
+def first(g: &Vec[i64]) -> &i64:
+    return ref(g[0])
+
+def set_to(p: &mut i64, x: i64) -> None:
+    *p = x
+
+def main() -> i32:
+    let mut v: Vec[i64] = Vec.new()
+    v.push(1)
+    v.push(2)
+    assert!(total(&v) == 3, "shared read through &Vec")
+    bump(&mut v, 1)
+    assert!(v[1] == 13, "write and += through &mut Vec")
+    set_to(first_mut(&mut v), 7)
+    assert!(v[0] == 7, "element borrow aliases the caller's Vec")
+    let f: &i64 = first(&v)
+    assert!(*f == 7, "returned shared element borrow")
+    println!("ok")
+    return 0

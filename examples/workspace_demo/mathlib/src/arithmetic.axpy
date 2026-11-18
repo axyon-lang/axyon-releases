@@ -1,0 +1,17 @@
+# Arithmetic helpers
+
+@public
+def clamp(x: i64, lo: i64, hi: i64) -> i64:
+    """Clamp x to the range [lo, hi]."""
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+@public
+def abs_diff(a: i64, b: i64) -> i64:
+    """Compute the absolute difference between a and b."""
+    if a > b:
+        return a - b
+    return b - a

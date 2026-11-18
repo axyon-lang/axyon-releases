@@ -1,0 +1,389 @@
+# Vector add, saxpy and elementwise kernels on an AMD GPU (issue #2655)
+#
+# Every step runs for real on the `rocdl-gfx942` target (AMD Instinct
+# MI300-series): the host fills buffers from a fixed-seed generator, copies
+# them to the device, launches compiler-generated HSACO kernels through HIP,
+# copies the results back and checks each element against a host reference
+# computed by the same expressions. Integer results are bit-exact
+# (two's-complement wrapping, the same as the host). f32 results are compared
+# bit for bit (`to_bits`): addition and multiplication round to nearest-even,
+# subnormals are kept and a multiply followed by an add is never fused, so
+# the device matches the host exactly.
+#
+# Every v1 storage scalar of the target is covered: `i32`, `u32`, `i64`,
+# `u64` and `f32` by a binary and a unary kernel, `bool` by an elementwise
+# logical kernel. The buffers have a static capacity (`CAP` elements); each
+# launch processes its first `n`. The 1-D grid is rounded up to whole
+# blocks, so the last block has tail lanes past `n`: they skip the access
+# (`if i < n`) and the sentinel values there must survive. A launch of zero
+# blocks is zero work.
+#
+# Set `AXYON_GPU_LAUNCH_EVIDENCE=1` to see, for each launch, the backend,
+# the device it actually ran on and a fingerprint of the HSACO image.
+# Without a usable AMD device the first device allocation stops the program
+# with an AXYON panic: there is no CPU fallback.
+
+@gpu(entry)
+def add_i32(n: i64, x: &Buffer[i32, (4099,), device_global], y: &Buffer[i32, (4099,), device_global], out: &mut Buffer[i32, (4099,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, buffer_get(x, i) + buffer_get(y, i))
+
+@gpu(entry)
+def add_u32(n: i64, x: &Buffer[u32, (4099,), device_global], y: &Buffer[u32, (4099,), device_global], out: &mut Buffer[u32, (4099,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, buffer_get(x, i) + buffer_get(y, i))
+
+@gpu(entry)
+def add_i64(n: i64, x: &Buffer[i64, (4099,), device_global], y: &Buffer[i64, (4099,), device_global], out: &mut Buffer[i64, (4099,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, buffer_get(x, i) + buffer_get(y, i))
+
+@gpu(entry)
+def add_u64(n: i64, x: &Buffer[u64, (4099,), device_global], y: &Buffer[u64, (4099,), device_global], out: &mut Buffer[u64, (4099,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, buffer_get(x, i) + buffer_get(y, i))
+
+@gpu(entry)
+def add_f32(n: i64, x: &Buffer[f32, (4099,), device_global], y: &Buffer[f32, (4099,), device_global], out: &mut Buffer[f32, (4099,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, buffer_get(x, i) + buffer_get(y, i))
+
+# saxpy: out[i] = a * x[i] + y[i], a rounded multiply then a rounded add.
+@gpu(entry)
+def saxpy(n: i64, a: f32, x: &Buffer[f32, (4099,), device_global], y: &Buffer[f32, (4099,), device_global], out: &mut Buffer[f32, (4099,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, a * buffer_get(x, i) + buffer_get(y, i))
+
+# Elementwise unary kernels: integer and float negation, bitwise complement.
+@gpu(entry)
+def neg_i32(n: i64, x: &Buffer[i32, (4099,), device_global], out: &mut Buffer[i32, (4099,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, 0 - buffer_get(x, i))
+
+@gpu(entry)
+def not_u32(n: i64, x: &Buffer[u32, (4099,), device_global], out: &mut Buffer[u32, (4099,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, ~buffer_get(x, i))
+
+@gpu(entry)
+def neg_i64(n: i64, x: &Buffer[i64, (4099,), device_global], out: &mut Buffer[i64, (4099,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, 0 - buffer_get(x, i))
+
+@gpu(entry)
+def not_u64(n: i64, x: &Buffer[u64, (4099,), device_global], out: &mut Buffer[u64, (4099,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, ~buffer_get(x, i))
+
+@gpu(entry)
+def neg_f32(n: i64, x: &Buffer[f32, (4099,), device_global], out: &mut Buffer[f32, (4099,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, -buffer_get(x, i))
+
+# Elementwise over bool: out[i] = x[i] xor y[i], and a logical not.
+@gpu(entry)
+def xor_bool(n: i64, x: &Buffer[bool, (4099,), device_global], y: &Buffer[bool, (4099,), device_global], out: &mut Buffer[bool, (4099,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, buffer_get(x, i) != buffer_get(y, i))
+
+@gpu(entry)
+def not_bool(n: i64, x: &Buffer[bool, (4099,), device_global], out: &mut Buffer[bool, (4099,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(out, i, not buffer_get(x, i))
+
+# Elementwise conversion: out[i] = (x[i] as f32) * scale + bias.
+@gpu(entry)
+def scale_bias(n: i64, scale: f32, bias: f32, x: &Buffer[i32, (4099,), device_global], out: &mut Buffer[f32, (4099,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        let v: f32 = buffer_get(x, i) as f32
+        buffer_set(out, i, v * scale + bias)
+
+const CAP: i64 = 4099
+const BLOCK: i64 = 128
+
+# A fixed-seed linear congruential generator: the same inputs every run.
+def next_seed(s: i64) -> i64:
+    return (s * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+
+def blocks_for(n: i64) -> i64:
+    return (n + BLOCK - 1) / BLOCK
+
+# A float in [-2^20, 2^20) with fractional bits, so sums and products round.
+def float_of(s: i64, div: f32) -> f32:
+    return (((s >> 20) & 536870911) - 268435456) as f32 / div
+
+# A device buffer with every lane set to `v`: the sentinel the lanes at
+# and past `n` must keep.
+def filled_i32(v: i32) -> Buffer[i32, (4099,), device_global]:
+    let mut h: Buffer[i32, (4099,)] = buffer_alloc([4099])
+    for i: i64 in range(CAP):
+        buffer_set(h, i, v)
+    return buffer_to_device(h)
+
+def filled_u32(v: u32) -> Buffer[u32, (4099,), device_global]:
+    let mut h: Buffer[u32, (4099,)] = buffer_alloc([4099])
+    for i: i64 in range(CAP):
+        buffer_set(h, i, v)
+    return buffer_to_device(h)
+
+def filled_i64(v: i64) -> Buffer[i64, (4099,), device_global]:
+    let mut h: Buffer[i64, (4099,)] = buffer_alloc([4099])
+    for i: i64 in range(CAP):
+        buffer_set(h, i, v)
+    return buffer_to_device(h)
+
+def filled_u64(v: u64) -> Buffer[u64, (4099,), device_global]:
+    let mut h: Buffer[u64, (4099,)] = buffer_alloc([4099])
+    for i: i64 in range(CAP):
+        buffer_set(h, i, v)
+    return buffer_to_device(h)
+
+def filled_f32(v: f32) -> Buffer[f32, (4099,), device_global]:
+    let mut h: Buffer[f32, (4099,)] = buffer_alloc([4099])
+    for i: i64 in range(CAP):
+        buffer_set(h, i, v)
+    return buffer_to_device(h)
+
+def filled_bool(v: bool) -> Buffer[bool, (4099,), device_global]:
+    let mut h: Buffer[bool, (4099,)] = buffer_alloc([4099])
+    for i: i64 in range(CAP):
+        buffer_set(h, i, v)
+    return buffer_to_device(h)
+
+# Binary and unary kernels over i32, u32, i64 and u64 for length `n`;
+# returns the mismatches.
+def check_ints(n: i64, seed: i64) -> i64:
+    let mut s: i64 = seed
+    let mut x32: Buffer[i32, (4099,)] = buffer_alloc([4099])
+    let mut y32: Buffer[i32, (4099,)] = buffer_alloc([4099])
+    let mut xu: Buffer[u32, (4099,)] = buffer_alloc([4099])
+    let mut yu: Buffer[u32, (4099,)] = buffer_alloc([4099])
+    let mut x64: Buffer[i64, (4099,)] = buffer_alloc([4099])
+    let mut y64: Buffer[i64, (4099,)] = buffer_alloc([4099])
+    let mut xw: Buffer[u64, (4099,)] = buffer_alloc([4099])
+    let mut yw: Buffer[u64, (4099,)] = buffer_alloc([4099])
+    for i: i64 in range(CAP):
+        s = next_seed(s)
+        let a: i64 = s * 3
+        s = next_seed(s)
+        let b: i64 = s * 5
+        buffer_set(x32, i, a as i32)
+        buffer_set(y32, i, b as i32)
+        buffer_set(xu, i, a as u32)
+        buffer_set(yu, i, b as u32)
+        buffer_set(x64, i, a)
+        buffer_set(y64, i, b)
+        buffer_set(xw, i, a as u64)
+        buffer_set(yw, i, b as u64)
+    # The host reference, computed before the inputs move to the device.
+    let mut r32: Buffer[i32, (4099,)] = buffer_alloc([4099])
+    let mut ru: Buffer[u32, (4099,)] = buffer_alloc([4099])
+    let mut r64: Buffer[i64, (4099,)] = buffer_alloc([4099])
+    let mut rw: Buffer[u64, (4099,)] = buffer_alloc([4099])
+    let mut n32: Buffer[i32, (4099,)] = buffer_alloc([4099])
+    let mut nu: Buffer[u32, (4099,)] = buffer_alloc([4099])
+    let mut n64: Buffer[i64, (4099,)] = buffer_alloc([4099])
+    let mut nw: Buffer[u64, (4099,)] = buffer_alloc([4099])
+    for i: i64 in range(CAP):
+        buffer_set(r32, i, buffer_get(x32, i) + buffer_get(y32, i))
+        buffer_set(ru, i, buffer_get(xu, i) + buffer_get(yu, i))
+        buffer_set(r64, i, buffer_get(x64, i) + buffer_get(y64, i))
+        buffer_set(rw, i, buffer_get(xw, i) + buffer_get(yw, i))
+        buffer_set(n32, i, 0 - buffer_get(x32, i))
+        buffer_set(nu, i, ~buffer_get(xu, i))
+        buffer_set(n64, i, 0 - buffer_get(x64, i))
+        buffer_set(nw, i, ~buffer_get(xw, i))
+    let dx32: Buffer[i32, (4099,), device_global] = buffer_to_device(x32)
+    let dy32: Buffer[i32, (4099,), device_global] = buffer_to_device(y32)
+    let dxu: Buffer[u32, (4099,), device_global] = buffer_to_device(xu)
+    let dyu: Buffer[u32, (4099,), device_global] = buffer_to_device(yu)
+    let dx64: Buffer[i64, (4099,), device_global] = buffer_to_device(x64)
+    let dy64: Buffer[i64, (4099,), device_global] = buffer_to_device(y64)
+    let dxw: Buffer[u64, (4099,), device_global] = buffer_to_device(xw)
+    let dyw: Buffer[u64, (4099,), device_global] = buffer_to_device(yw)
+    let mut do32: Buffer[i32, (4099,), device_global] = filled_i32(-7)
+    let mut dou: Buffer[u32, (4099,), device_global] = filled_u32(7)
+    let mut do64: Buffer[i64, (4099,), device_global] = filled_i64(-7)
+    let mut dow: Buffer[u64, (4099,), device_global] = filled_u64(7)
+    let mut dn32: Buffer[i32, (4099,), device_global] = filled_i32(-7)
+    let mut dnu: Buffer[u32, (4099,), device_global] = filled_u32(7)
+    let mut dn64: Buffer[i64, (4099,), device_global] = filled_i64(-7)
+    let mut dnw: Buffer[u64, (4099,), device_global] = filled_u64(7)
+    gpu_launch(add_i32, blocks_for(n), BLOCK, n, &dx32, &dy32, &mut do32)
+    gpu_launch(add_u32, blocks_for(n), BLOCK, n, &dxu, &dyu, &mut dou)
+    gpu_launch(add_i64, blocks_for(n), BLOCK, n, &dx64, &dy64, &mut do64)
+    gpu_launch(add_u64, blocks_for(n), BLOCK, n, &dxw, &dyw, &mut dow)
+    gpu_launch(neg_i32, blocks_for(n), BLOCK, n, &dx32, &mut dn32)
+    gpu_launch(not_u32, blocks_for(n), BLOCK, n, &dxu, &mut dnu)
+    gpu_launch(neg_i64, blocks_for(n), BLOCK, n, &dx64, &mut dn64)
+    gpu_launch(not_u64, blocks_for(n), BLOCK, n, &dxw, &mut dnw)
+    let b32: Buffer[i32, (4099,)] = buffer_to_host(do32)
+    let bu: Buffer[u32, (4099,)] = buffer_to_host(dou)
+    let b64: Buffer[i64, (4099,)] = buffer_to_host(do64)
+    let bw: Buffer[u64, (4099,)] = buffer_to_host(dow)
+    let c32: Buffer[i32, (4099,)] = buffer_to_host(dn32)
+    let cu: Buffer[u32, (4099,)] = buffer_to_host(dnu)
+    let c64: Buffer[i64, (4099,)] = buffer_to_host(dn64)
+    let cw: Buffer[u64, (4099,)] = buffer_to_host(dnw)
+    let mut bad: i64 = 0
+    for i: i64 in range(CAP):
+        let mut w32: i32 = -7
+        let mut wu: u32 = 7
+        let mut w64: i64 = -7
+        let mut ww: u64 = 7
+        let mut v32: i32 = -7
+        let mut vu: u32 = 7
+        let mut v64: i64 = -7
+        let mut vw: u64 = 7
+        if i < n:
+            w32 = buffer_get(r32, i)
+            wu = buffer_get(ru, i)
+            w64 = buffer_get(r64, i)
+            ww = buffer_get(rw, i)
+            v32 = buffer_get(n32, i)
+            vu = buffer_get(nu, i)
+            v64 = buffer_get(n64, i)
+            vw = buffer_get(nw, i)
+        if buffer_get(b32, i) != w32:
+            bad = bad + 1
+        if buffer_get(bu, i) != wu:
+            bad = bad + 1
+        if buffer_get(b64, i) != w64:
+            bad = bad + 1
+        if buffer_get(bw, i) != ww:
+            bad = bad + 1
+        if buffer_get(c32, i) != v32:
+            bad = bad + 1
+        if buffer_get(cu, i) != vu:
+            bad = bad + 1
+        if buffer_get(c64, i) != v64:
+            bad = bad + 1
+        if buffer_get(cw, i) != vw:
+            bad = bad + 1
+    return bad
+
+# f32 add, saxpy, negation and the conversion kernel for length `n`, every
+# lane compared bit for bit.
+def check_floats(n: i64, seed: i64) -> i64:
+    let mut s: i64 = seed
+    let mut x: Buffer[f32, (4099,)] = buffer_alloc([4099])
+    let mut y: Buffer[f32, (4099,)] = buffer_alloc([4099])
+    let mut xi: Buffer[i32, (4099,)] = buffer_alloc([4099])
+    for i: i64 in range(CAP):
+        s = next_seed(s)
+        buffer_set(x, i, float_of(s, 256.0))
+        s = next_seed(s)
+        buffer_set(y, i, float_of(s, 3.0))
+        buffer_set(xi, i, (s >> 33) as i32)
+    let a: f32 = 1.7
+    let mut r_add: Buffer[f32, (4099,)] = buffer_alloc([4099])
+    let mut r_axpy: Buffer[f32, (4099,)] = buffer_alloc([4099])
+    let mut r_neg: Buffer[f32, (4099,)] = buffer_alloc([4099])
+    let mut r_sb: Buffer[f32, (4099,)] = buffer_alloc([4099])
+    for i: i64 in range(CAP):
+        buffer_set(r_add, i, buffer_get(x, i) + buffer_get(y, i))
+        buffer_set(r_axpy, i, a * buffer_get(x, i) + buffer_get(y, i))
+        buffer_set(r_neg, i, -buffer_get(x, i))
+        let v: f32 = buffer_get(xi, i) as f32
+        buffer_set(r_sb, i, v * 0.1 + 3.0)
+    let dx: Buffer[f32, (4099,), device_global] = buffer_to_device(x)
+    let dy: Buffer[f32, (4099,), device_global] = buffer_to_device(y)
+    let dxi: Buffer[i32, (4099,), device_global] = buffer_to_device(xi)
+    let mut d_add: Buffer[f32, (4099,), device_global] = filled_f32(-1.0)
+    let mut d_axpy: Buffer[f32, (4099,), device_global] = filled_f32(-1.0)
+    let mut d_neg: Buffer[f32, (4099,), device_global] = filled_f32(-1.0)
+    let mut d_sb: Buffer[f32, (4099,), device_global] = filled_f32(-1.0)
+    gpu_launch(add_f32, blocks_for(n), BLOCK, n, &dx, &dy, &mut d_add)
+    gpu_launch(saxpy, blocks_for(n), BLOCK, n, a, &dx, &dy, &mut d_axpy)
+    gpu_launch(neg_f32, blocks_for(n), BLOCK, n, &dx, &mut d_neg)
+    gpu_launch(scale_bias, blocks_for(n), BLOCK, n, 0.1, 3.0, &dxi, &mut d_sb)
+    let g_add: Buffer[f32, (4099,)] = buffer_to_host(d_add)
+    let g_axpy: Buffer[f32, (4099,)] = buffer_to_host(d_axpy)
+    let g_neg: Buffer[f32, (4099,)] = buffer_to_host(d_neg)
+    let g_sb: Buffer[f32, (4099,)] = buffer_to_host(d_sb)
+    let sentinel: u32 = (-1.0 as f32).to_bits()
+    let mut bad: i64 = 0
+    for i: i64 in range(CAP):
+        let mut w_add: u32 = sentinel
+        let mut w_axpy: u32 = sentinel
+        let mut w_neg: u32 = sentinel
+        let mut w_sb: u32 = sentinel
+        if i < n:
+            w_add = buffer_get(r_add, i).to_bits()
+            w_axpy = buffer_get(r_axpy, i).to_bits()
+            w_neg = buffer_get(r_neg, i).to_bits()
+            w_sb = buffer_get(r_sb, i).to_bits()
+        if buffer_get(g_add, i).to_bits() != w_add:
+            bad = bad + 1
+        if buffer_get(g_axpy, i).to_bits() != w_axpy:
+            bad = bad + 1
+        if buffer_get(g_neg, i).to_bits() != w_neg:
+            bad = bad + 1
+        if buffer_get(g_sb, i).to_bits() != w_sb:
+            bad = bad + 1
+    return bad
+
+# The bool kernels for length `n`.
+def check_bools(n: i64, seed: i64) -> i64:
+    let mut s: i64 = seed
+    let mut x: Buffer[bool, (4099,)] = buffer_alloc([4099])
+    let mut y: Buffer[bool, (4099,)] = buffer_alloc([4099])
+    for i: i64 in range(CAP):
+        s = next_seed(s)
+        buffer_set(x, i, ((s >> 40) & 1) == 1)
+        buffer_set(y, i, ((s >> 41) & 1) == 1)
+    let mut r_xor: Buffer[bool, (4099,)] = buffer_alloc([4099])
+    let mut r_not: Buffer[bool, (4099,)] = buffer_alloc([4099])
+    for i: i64 in range(CAP):
+        buffer_set(r_xor, i, buffer_get(x, i) != buffer_get(y, i))
+        buffer_set(r_not, i, not buffer_get(x, i))
+    let dx: Buffer[bool, (4099,), device_global] = buffer_to_device(x)
+    let dy: Buffer[bool, (4099,), device_global] = buffer_to_device(y)
+    let mut d_xor: Buffer[bool, (4099,), device_global] = filled_bool(true)
+    let mut d_not: Buffer[bool, (4099,), device_global] = filled_bool(true)
+    gpu_launch(xor_bool, blocks_for(n), BLOCK, n, &dx, &dy, &mut d_xor)
+    gpu_launch(not_bool, blocks_for(n), BLOCK, n, &dx, &mut d_not)
+    let g_xor: Buffer[bool, (4099,)] = buffer_to_host(d_xor)
+    let g_not: Buffer[bool, (4099,)] = buffer_to_host(d_not)
+    let mut bad: i64 = 0
+    for i: i64 in range(CAP):
+        let mut w_xor: bool = true
+        let mut w_not: bool = true
+        if i < n:
+            w_xor = buffer_get(r_xor, i)
+            w_not = buffer_get(r_not, i)
+        if buffer_get(g_xor, i) != w_xor:
+            bad = bad + 1
+        if buffer_get(g_not, i) != w_not:
+            bad = bad + 1
+    return bad
+
+def main() -> i32:
+    # Zero, one, small, a non-divisible tail, one full block, and the whole
+    # (irregular) capacity: 4099 = 32 * 128 + 3.
+    let lengths: Array[i64; 6] = [0, 1, 7, 1000, 128, 4099]
+    let mut total: i64 = 0
+    for k: i64 in range(6):
+        let n: i64 = lengths[k]
+        let bad: i64 = check_ints(n, 2655 + k) + check_floats(n, 5310 + k) + check_bools(n, 7965 + k)
+        if bad != 0:
+            println!("n = {n}: {bad} mismatches")
+        total = total + bad
+    if total != 0:
+        return 1
+    println!("rocm vector add, saxpy and elementwise kernels: all lengths match the host reference")
+    return 0

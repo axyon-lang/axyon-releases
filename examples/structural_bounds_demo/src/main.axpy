@@ -1,0 +1,93 @@
+# Structural where-clause bounds (issue #771).
+#
+# * `T: Into[U]` keeps its trait argument: the call checks `Into[Dest]`.
+# * `S: Source[Item = i32]` is `S: Source` plus `S.Item == i32`, checked at
+#   every instantiation, including through a nested impl (`Wrap[I].Item` is
+#   `I.Item`).
+# * A projection under `S: Feed[i32]` resolves through the `Feed[i32]` impl
+#   even when the type also implements `Feed[f64]`.
+
+trait Into[U]:
+    def tag(self) -> i32
+
+struct Src:
+    v: i32
+
+struct Dest:
+    v: i32
+
+impl Into[Dest] for Src:
+    def tag(self) -> i32:
+        return self.v + 10
+
+def convert[T: Into[U], U](x: T, u: U) -> i32:
+    return 11
+
+trait Source:
+    type Item
+    def pull(self) -> i32
+
+struct IntSource:
+    v: i32
+
+impl Source for IntSource:
+    type Item = i32
+    def pull(self) -> i32:
+        return self.v
+
+struct Wrap[I]:
+    inner: I
+
+impl Source for Wrap[I] where I: Source:
+    type Item = I.Item
+    def pull(self) -> i32:
+        return 100
+
+def need[S: Source[Item = i32]](s: S) -> i32:
+    return 5
+
+# A struct bound with an associated-type equality, checked for every field
+# instance regardless of declaration order.
+struct Holder[S: Source[Item = i32]]:
+    s: S
+
+trait Feed[T]:
+    type Item
+
+struct Both:
+    v: i32
+
+impl Feed[i32] for Both:
+    type Item = i64
+
+impl Feed[f64] for Both:
+    type Item = u8
+
+def wide_of[S: Feed[i32]](s: S) -> S.Item:
+    return 300
+
+def narrow_of[S: Feed[f64]](s: S) -> S.Item:
+    return 7
+
+def main() -> i32:
+    let s: Src = Src { v: 1 }
+    let d: Dest = Dest { v: 2 }
+    let c: i32 = convert(s, d)
+    assert!(c == 11, "Src: Into[Dest]")
+
+    let i: IntSource = IntSource { v: 5 }
+    assert!(need(i) == 5, "IntSource.Item == i32")
+    let w: Wrap[IntSource] = Wrap { inner: IntSource { v: 6 } }
+    assert!(need(w) == 5, "Wrap[IntSource].Item == i32")
+
+    let h: Holder[IntSource] = Holder { s: IntSource { v: 7 } }
+    assert!(h.s.pull() == 7, "Holder field")
+
+    let b: Both = Both { v: 1 }
+    let wide: i64 = wide_of(b)
+    let b2: Both = Both { v: 2 }
+    let narrow: u8 = narrow_of(b2)
+    assert!(wide == 300_i64, "<Both as Feed[i32]>.Item is i64")
+    assert!(narrow == 7_u8, "<Both as Feed[f64]>.Item is u8")
+    println!("structural bounds: {c} {wide} {narrow}")
+    return 0

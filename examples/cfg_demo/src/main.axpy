@@ -1,0 +1,27 @@
+# Conditional compilation with @cfg.
+#   axyon build --emit mlir                    # CPU path
+#   axyon build --emit mlir --cfg feature=gpu  # GPU path
+import axyon.debug as D
+
+@cfg(feature = "gpu")
+def backend() -> i32:
+    return 2
+
+@cfg(not(feature = "gpu"))
+def backend() -> i32:
+    return 1
+
+@cfg(any(target_os = "linux", target_os = "macos"))
+def unix_like() -> bool:
+    return true
+
+@cfg(all(not(target_os = "linux"), not(target_os = "macos")))
+def unix_like() -> bool:
+    return false
+
+def main() -> i32:
+    """Entry point."""
+    D.println("backend selected")
+    if unix_like():
+        return backend() - backend()
+    return 0

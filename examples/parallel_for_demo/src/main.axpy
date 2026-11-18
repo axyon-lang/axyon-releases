@@ -1,0 +1,78 @@
+# Data-parallel loops with `prange` (#666).
+#
+# `prange` is `range` whose iterations run on several threads. The compiler
+# proves they are independent: each iteration writes only its own element
+# `v[i]` of a shared vector, and accumulators are declared with `reduce=`.
+# `threads=` and `grain=` tune how one loop is scheduled (#2614).
+# An iteration may also write anywhere in its own row `rows[i]` of a shared
+# `Vec[Vec[T]]`, so a sequential sweep along each line runs in parallel over
+# lines (#2814).
+
+def saxpy(a: f64, x: ref[Vec[f64]], y: ref_mut[Vec[f64]]) -> None:
+    let n: usize = len(x)
+    for i: usize in prange(0, n):
+        y[i] = a * x[i] + y[i]
+
+
+def collatz_steps(start: u64) -> i64:
+    let mut v: u64 = start
+    let mut steps: i64 = 0
+    while v != 1:
+        if v % 2 == 0:
+            v = v / 2
+        else:
+            v = 3 * v + 1
+        steps += 1
+    return steps
+
+
+@host
+def main() -> i32:
+    let n: usize = 1000000
+    let mut x: Vec[f64] = Vec.zeroed(n)
+    let mut y: Vec[f64] = Vec.zeroed(n)
+    for i: usize in prange(0, n):
+        x[i] = (i % 10) as f64
+        y[i] = 1.0
+    saxpy(2.0, ref(x), ref_mut(y))
+
+    # Two reductions in one loop: a sum and a count.
+    let mut total: f64 = 0.0
+    let mut big: i64 = 0
+    for i: usize in prange(0, n, reduce=(total, big)):
+        total += y[i]
+        if y[i] > 10.0:
+            big += 1
+    println!("total = {total}, elements above 10 = {big}")
+
+    # `min` / `max` reductions (#2614); a memory-bound loop needs few threads.
+    let mut lo: f64 = 1.0e300
+    let mut hi: f64 = -1.0e300
+    for i: usize in prange(0, n, reduce=(lo, hi), threads=4):
+        lo = min(lo, y[i])
+        hi = max(hi, y[i])
+    println!("min = {lo}, max = {hi}")
+
+    # A compute-heavy body: total Collatz chain length below 100000.
+    let mut steps_sum: i64 = 0
+    # Uneven iterations: small chunks keep every core busy to the end.
+    for k: u64 in prange(1, 100000, reduce=steps_sum, grain=256):
+        steps_sum += collatz_steps(k)
+    println!("collatz steps below 100000 = {steps_sum}")
+
+    # One sequential recurrence per line (#2814): iteration `i` owns `rows[i]`.
+    let lines: usize = 256
+    let width: usize = 512
+    let mut rows: Vec[Vec[f64]] = Vec.new()
+    for r: usize in range(0, lines):
+        let z: Vec[f64] = Vec.zeroed(width)
+        rows.push(z)
+    for i: usize in prange(0, lines):
+        rows[i][0] = i as f64
+        for k: usize in range(1, width):
+            rows[i][k] = 0.5 * rows[i][k - 1] + 1.0
+    let mut ends: f64 = 0.0
+    for i: usize in prange(0, lines, reduce=ends):
+        ends += rows[i][width - 1]
+    println!("sum of line ends = {ends}")
+    return 0

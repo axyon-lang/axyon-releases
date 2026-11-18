@@ -1,0 +1,42 @@
+# Pinning (#202): `Pin[T]`, the `Unpin` auto trait and `pin!`.
+#
+# `Countdown` stands in for an async state machine: it holds a
+# `PhantomPinned`, so it is `!Unpin` and may only be pinned with `pin!`
+# (`Pin.new(ref_mut(c))` is rejected, AX070). Once pinned it can be polled
+# repeatedly through `as_mut`, but never moved again: the original binding
+# is moved into a hidden owner that no code can name.
+from core.pin import Pin
+from core.marker import PhantomPinned
+
+struct Countdown:
+    remaining: i64
+    _pinned: PhantomPinned
+
+# One step of the state machine. Mutating a `!Unpin` value through its pin
+# needs `get_unchecked_mut` (`@unsafe`): this code promises not to move it.
+def poll(p: Pin[Countdown]) -> bool:
+    unsafe:
+        let c: ref_mut[Countdown] = p.get_unchecked_mut()
+        c.remaining = c.remaining - 1
+        return c.remaining <= 0
+
+@host
+def main() -> i32:
+    # An `Unpin` value (every primitive is) pins and unpins freely.
+    let mut n: i64 = 41
+    let pn: Pin[i64] = Pin.new(ref_mut(n))
+    let r: ref_mut[i64] = pn.into_inner()
+    *r = *r + 1
+    println!("unpinned again: {n}")
+
+    # A `!Unpin` value is pinned on the stack.
+    let mut fut: Pin[Countdown] = pin!(Countdown { remaining: 3, _pinned: PhantomPinned {} })
+    let mut polls: i64 = 0
+    let mut done: bool = false
+    while not done:
+        done = poll(fut.as_mut())
+        polls = polls + 1
+    let left: i64 = fut.get_ref().remaining
+    println!("ready after {polls} polls, remaining = {left}")
+    assert!(polls == 3, "three polls")
+    return 0

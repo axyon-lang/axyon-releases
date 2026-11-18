@@ -1,0 +1,11 @@
+[package]
+name = "layout_aggregates_demo"
+version = "0.1.0"
+edition = "2024"
+description = "Demonstrates size_of/align_of on aggregate types (arrays, tuples, structs, Vec, fn pointers)"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true

@@ -1,0 +1,466 @@
+# Collections Demo for AXYON
+#
+# Demonstrates the collection types and what's currently working.
+#
+# WORKING NOW:
+# - Array[T; N]: Fixed-size arrays with literal initialization
+# - Tensor operations via tensor module
+#
+# TYPE SYSTEM READY (runtime integration pending):
+# - Vec[T]/List[T]: Dynamic heap arrays
+# - Slice[T]/SliceMut[T]: Fat pointer views
+# - View[T, rank]: N-dimensional strided views
+# - Buffer[dtype, shape]: Owned memory buffers
+
+import std.tensor as T
+
+# =============================================================================
+# Array Examples - Working Now
+# =============================================================================
+
+def my_array_demo() -> i32: 
+    let arr: Array[i32; 3] = [1, 2, 3]
+    for i in range(0,3):
+        # Subscripts are not valid inside a placeholder body; bind the element
+        # first, then print the simple name.
+        let v: i32 = arr[i]
+        println!("arr[{i}] = {v}")
+    
+    return 0
+
+def array_creation_demo() -> i32:
+    """Demonstrate array creation with literals."""
+    println!("=== Array[T; N] - Fixed-Size Arrays ===")
+    println!("")
+
+    # Create arrays with different element types
+    let int_arr: Array[i32; 4] = [1, 2, 3, 4]
+    let float_arr: Array[f64; 3] = [1.0, 2.0, 3.0]
+    let bool_arr = [True, False]
+
+    println!("Created arrays:")
+    println!("  int_arr: Array[i32; 4] = [1, 2, 3, 4]")
+    println!("  float_arr: Array[f64; 3] = [1.0, 2.0, 3.0]")
+    println!("  bool_arr: Array[bool; 2] = [True, False]")
+    println!("")
+
+    # Arrays are Copy if element type is Copy
+    let arr_copy: Array[i32; 4] = int_arr
+    println!("Arrays with Copy elements are Copy:")
+    println!("  let arr_copy = int_arr  # Both usable!")
+    println!("")
+
+    return 0
+
+def array_assignment_demo() -> i32:
+    """Demonstrate array assignment and copying."""
+    println!("=== Array Assignment ===")
+    println!("")
+
+    # Create and copy arrays
+    let arr1: Array[i64; 3] = [10, 20, 30]
+    let arr2: Array[i64; 3] = arr1  # Copy since i64 is Copy
+
+    println!("Array copying (Copy types):")
+    println!("  let arr1: Array[i64; 3] = [10, 20, 30]")
+    println!("  let arr2 = arr1  # arr1 still valid!")
+    println!("")
+
+    # Both arrays are independent copies
+    println!("Both arr1 and arr2 are independent copies")
+    println!("")
+
+    return 0
+
+# =============================================================================
+# Tensor Examples - Working Now
+# =============================================================================
+
+def tensor_operations_demo() -> i32:
+    """Demonstrate tensor operations using tensor module."""
+    println!("=== Tensor Operations ===")
+    println!("")
+
+    # Create tensors
+    let zeros: Tensor[f32, (4,)] = T.zeros([4])
+    let ones: Tensor[f32, (4,)] = T.ones([4])
+    println!("Created tensors:")
+    println!("  zeros: Tensor[f32, (4,)] = T.zeros([4])")
+    println!("  ones: Tensor[f32, (4,)] = T.ones([4])")
+    println!("")
+
+    # Tensor arithmetic
+    let sum_tensor: Tensor[f32, (4,)] = T.add(zeros, ones)
+    println!("Tensor arithmetic:")
+    println!("  sum = T.add(zeros, ones)")
+    println!("")
+
+    # 2D tensors
+    let matrix: Tensor[f32, (2, 3)] = T.zeros([2, 3])
+    println!("2D tensor:")
+    println!("  matrix: Tensor[f32, (2, 3)] = T.zeros([2, 3])")
+    println!("")
+
+    return 0
+
+def tensor_math_demo() -> i32:
+    """Demonstrate tensor math operations."""
+    println!("=== Tensor Math ===")
+    println!("")
+
+    # Create tensors for addition
+    let a1: Tensor[f32, (100,)] = T.zeros([100])
+    let b1: Tensor[f32, (100,)] = T.ones([100])
+    let added: Tensor[f32, (100,)] = T.add(a1, b1)
+
+    # Create new tensors for multiplication (tensors are moved, not copied)
+    let a2: Tensor[f32, (100,)] = T.zeros([100])
+    let b2: Tensor[f32, (100,)] = T.ones([100])
+    let multiplied: Tensor[f32, (100,)] = T.mul(a2, b2)
+
+    println!("Element-wise operations on 100-element tensors:")
+    println!("  T.add(a, b) - element-wise addition")
+    println!("  T.mul(a, b) - element-wise multiplication")
+    println!("")
+    println!("Note: Tensors are move-only (not Copy)")
+    println!("  Each tensor can only be used once!")
+    println!("")
+
+    return 0
+
+# =============================================================================
+# Type System Preview - Infrastructure Ready
+# =============================================================================
+
+def type_system_preview() -> i32:
+    """Preview of collection types in the type system."""
+    println!("=== Collection Type System (Preview) ===")
+    println!("")
+    println!("The following types are defined in the type system:")
+    println!("")
+
+    println!("Vec[T] / List[T] - Dynamic arrays")
+    println!("  Heap-allocated, growable")
+    println!("  NOT Copy (owns memory)")
+    println!("  Runtime: vec_new(), vec_push(), vec_pop(), etc.")
+    println!("")
+
+    println!("Slice[T] / SliceMut[T] - Borrowed views")
+    println!("  Fat pointer: (ptr, length)")
+    println!("  Always Copy (just a view)")
+    println!("  Syntax: arr[1:4], arr[:5], arr[::2]")
+    println!("")
+
+    println!("View[T, rank] - N-D strided views")
+    println!("  For multi-dimensional data")
+    println!("  Always Copy (borrowed)")
+    println!("  Supports disjoint borrowing")
+    println!("")
+
+    println!("Buffer[dtype, shape] - Owned memory")
+    println!("  Explicit memory management")
+    println!("  NOT Copy (owns memory)")
+    println!("  Placement: Buffer[T, (shape), host] or device_global (with a GPU target)")
+    println!("")
+
+    return 0
+
+# =============================================================================
+# Move Semantics Examples
+# =============================================================================
+
+def move_semantics_demo() -> i32:
+    """Demonstrate move semantics with collections."""
+    println!("=== Move Semantics ===")
+    println!("")
+
+    println!("Move semantics transfer ownership. After a move, the")
+    println!("original variable can no longer be used.")
+    println!("")
+
+    # Tensors are move-only
+    println!("--- Tensors are Move-Only ---")
+    println!("")
+
+    let t1: Tensor[f32, (4,)] = T.zeros([4])
+    let t2: Tensor[f32, (4,)] = T.ones([4])
+
+    # When we pass tensors to T.add, they are moved
+    let result: Tensor[f32, (4,)] = T.add(t1, t2)
+
+    println!("let t1 = T.zeros([4])")
+    println!("let t2 = T.ones([4])")
+    println!("let result = T.add(t1, t2)  # t1 and t2 are MOVED")
+    println!("")
+    println!("After the add, t1 and t2 are no longer valid!")
+    println!("Attempting to use them would cause a compile error:")
+    println!("  # let x = T.add(t1, t2)  # ERROR: use of moved value")
+    println!("")
+
+    # Must create new tensors for each operation
+    println!("To use values multiple times, create new instances:")
+    println!("")
+
+    let a1: Tensor[f32, (4,)] = T.ones([4])
+    let b1: Tensor[f32, (4,)] = T.ones([4])
+    let sum1: Tensor[f32, (4,)] = T.add(a1, b1)
+
+    let a2: Tensor[f32, (4,)] = T.ones([4])
+    let b2: Tensor[f32, (4,)] = T.ones([4])
+    let sum2: Tensor[f32, (4,)] = T.add(a2, b2)
+
+    println!("let a1 = T.ones([4]); let b1 = T.ones([4])")
+    println!("let sum1 = T.add(a1, b1)")
+    println!("")
+    println!("let a2 = T.ones([4]); let b2 = T.ones([4])  # New instances")
+    println!("let sum2 = T.add(a2, b2)")
+    println!("")
+
+    return 0
+
+def move_vs_copy_demo() -> i32:
+    """Demonstrate the difference between move and copy."""
+    println!("=== Move vs Copy ===")
+    println!("")
+
+    println!("Copy types can be duplicated freely.")
+    println!("Move types transfer ownership on assignment.")
+    println!("")
+
+    # Arrays of Copy types are Copy
+    println!("--- Arrays of Copy Types ---")
+    println!("")
+
+    let arr1: Array[i32; 3] = [1, 2, 3]
+    let arr2: Array[i32; 3] = arr1  # COPY - arr1 still valid
+    let arr3: Array[i32; 3] = arr1  # COPY again - still works!
+
+    println!("let arr1: Array[i32; 3] = [1, 2, 3]")
+    println!("let arr2 = arr1  # COPY - arr1 still valid")
+    println!("let arr3 = arr1  # COPY again - arr1 still valid!")
+    println!("")
+    println!("Arrays of i32 are Copy because i32 is Copy.")
+    println!("Each variable gets its own independent copy.")
+    println!("")
+
+    # Demonstrate with different element types
+    println!("--- Copy Semantics by Element Type ---")
+    println!("")
+
+    let int_arr: Array[i64; 2] = [10, 20]
+    let int_copy: Array[i64; 2] = int_arr
+    println!("Array[i64; 2]: Copy (i64 is Copy)")
+
+    let float_arr: Array[f32; 2] = [1.0, 2.0]
+    let float_copy: Array[f32; 2] = float_arr
+    println!("Array[f32; 2]: Copy (f32 is Copy)")
+
+    let bool_arr: Array[bool; 2] = [True, False]
+    let bool_copy: Array[bool; 2] = bool_arr
+    println!("Array[bool; 2]: Copy (bool is Copy)")
+    println!("")
+
+    # Contrast with move types
+    println!("--- Move Types (Vec, Buffer, Tensor) ---")
+    println!("")
+    println!("Move types own heap memory or resources:")
+    println!("  - Vec[T]: owns heap-allocated buffer")
+    println!("  - Buffer[T, shape]: owns memory region")
+    println!("  - Tensor[T, shape]: owns tensor data")
+    println!("")
+    println!("These types MOVE on assignment:")
+    println!("  let v1: Vec[i32] = Vec.new()")
+    println!("  let v2 = v1  # MOVE - v1 is now invalid!")
+    println!("")
+
+    return 0
+
+# =============================================================================
+# Borrowing Examples
+# =============================================================================
+
+def borrowing_concepts_demo() -> i32:
+    """Demonstrate borrowing concepts."""
+    println!("=== Borrowing Concepts ===")
+    println!("")
+
+    println!("Borrowing allows temporary access without ownership transfer.")
+    println!("AXYON supports borrowing through Slices and Views.")
+    println!("")
+
+    println!("--- Slices: Borrowed 1D Views ---")
+    println!("")
+    println!("A Slice[T] is a fat pointer: (ptr, length)")
+    println!("It borrows a contiguous range from an array or vec.")
+    println!("")
+    println!("Syntax:")
+    println!("  let arr: Array[i32; 5] = [1, 2, 3, 4, 5]")
+    println!("  let s1 = arr[1:4]   # Elements 1, 2, 3")
+    println!("  let s2 = arr[:3]    # First 3 elements")
+    println!("  let s3 = arr[2:]    # From index 2 to end")
+    println!("  let s4 = arr[:]     # Entire array")
+    println!("")
+
+    println!("--- Views: Borrowed N-D Views ---")
+    println!("")
+    println!("A View[T, rank] borrows N-dimensional data.")
+    println!("Supports multi-dimensional indexing and slicing.")
+    println!("")
+    println!("Syntax:")
+    println!("  let buf: Buffer[f32, (4, 4)] = Buffer.alloc((4, 4))")
+    println!("  let view = buf.as_view()      # Full view")
+    println!("  let row = view[0, :]          # First row")
+    println!("  let col = view[:, 0]          # First column")
+    println!("  let sub = view[1:3, 1:3]      # 2x2 submatrix")
+    println!("")
+
+    return 0
+
+def borrow_rules_demo() -> i32:
+    """Demonstrate borrowing rules."""
+    println!("=== Borrowing Rules ===")
+    println!("")
+
+    println!("AXYON enforces these borrowing rules at compile time:")
+    println!("")
+
+    println!("1. Multiple immutable borrows are allowed:")
+    println!("   let s1 = arr[0:2]  # OK")
+    println!("   let s2 = arr[2:4]  # OK - both immutable")
+    println!("")
+
+    println!("2. Only ONE mutable borrow at a time:")
+    println!("   let mut s1 = arr[0:4]  # Mutable borrow")
+    println!("   # let s2 = arr[:]      # ERROR - arr already borrowed")
+    println!("")
+
+    println!("3. Disjoint mutable borrows are allowed:")
+    println!("   let mut s1 = arr[0:2]  # Borrows [0, 2)")
+    println!("   let mut s2 = arr[2:4]  # Borrows [2, 4) - disjoint, OK!")
+    println!("")
+
+    println!("4. Borrows must not outlive the source:")
+    println!("   let s: Slice[i32]")
+    println!("   {{")
+    println!("       let arr = [1, 2, 3]")
+    println!("       s = arr[:]  # ERROR - arr dropped at block end")
+    println!("   }}")
+    println!("")
+
+    return 0
+
+def disjoint_borrow_demo() -> i32:
+    """Demonstrate disjoint borrowing detection."""
+    println!("=== Disjoint Borrowing ===")
+    println!("")
+
+    println!("The borrow checker detects when slices/views don't overlap.")
+    println!("Non-overlapping (disjoint) mutable borrows are safe.")
+    println!("")
+
+    println!("--- 1D Disjoint Slices ---")
+    println!("")
+    println!("Array: [0, 1, 2, 3, 4, 5]")
+    println!("       |--s1--|")
+    println!("               |--s2--|")
+    println!("")
+    println!("let mut arr: Array[i32; 6] = [0, 1, 2, 3, 4, 5]")
+    println!("let s1 = arr[0:3]  # [0, 1, 2]")
+    println!("let s2 = arr[3:6]  # [3, 4, 5]")
+    println!("# Both s1 and s2 can be mutable - they don't overlap!")
+    println!("")
+
+    println!("--- 2D Disjoint Views ---")
+    println!("")
+    println!("Matrix 4x4:")
+    println!("  +---+---+---+---+")
+    println!("  | A | A | B | B |")
+    println!("  +---+---+---+---+")
+    println!("  | A | A | B | B |")
+    println!("  +---+---+---+---+")
+    println!("  | C | C | D | D |")
+    println!("  +---+---+---+---+")
+    println!("  | C | C | D | D |")
+    println!("  +---+---+---+---+")
+    println!("")
+    println!("Four quadrants can be borrowed mutably at once:")
+    println!("  let A = view[0:2, 0:2]")
+    println!("  let B = view[0:2, 2:4]")
+    println!("  let C = view[2:4, 0:2]")
+    println!("  let D = view[2:4, 2:4]")
+    println!("")
+
+    return 0
+
+# =============================================================================
+# Ownership Semantics Summary
+# =============================================================================
+
+def ownership_demo() -> i32:
+    """Demonstrate ownership semantics for collections."""
+    println!("=== Ownership Summary ===")
+    println!("")
+
+    println!("Copy Types (can duplicate freely):")
+    println!("  - Array[T; N] when T is Copy")
+    println!("  - Slice[T], SliceMut[T] (fat pointers)")
+    println!("  - View[T, rank] (fat pointers)")
+    println!("  - All primitive types (i32, f64, bool, etc.)")
+    println!("")
+
+    println!("Move Types (ownership transfers):")
+    println!("  - Array[T; N] when T is NOT Copy")
+    println!("  - Vec[T], List[T] (heap-allocated)")
+    println!("  - Buffer[dtype, shape] (owns memory)")
+    println!("  - Tensor[dtype, shape] (owns data)")
+    println!("")
+
+    # Demonstrate with actual code
+    let arr1: Array[i32; 3] = [1, 2, 3]
+    let arr2: Array[i32; 3] = arr1  # Copy! arr1 still valid
+    let arr3: Array[i32; 3] = arr1  # Copy again!
+    println!("Example - Array[i32; 3] is Copy:")
+    println!("  let arr1 = [1, 2, 3]")
+    println!("  let arr2 = arr1  # Copy, arr1 still valid")
+    println!("  let arr3 = arr1  # Copy again, still valid!")
+    println!("")
+
+    return 0
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main() -> i32:
+    println!("AXYON Collections Demo")
+    println!("======================")
+    println!("")
+
+    # Array examples
+    let r1: i32 = array_creation_demo()
+    let r2: i32 = array_assignment_demo()
+
+    # Tensor examples
+    let r3: i32 = tensor_operations_demo()
+    let r4: i32 = tensor_math_demo()
+
+    # Type system preview
+    let r5: i32 = type_system_preview()
+
+    # Move and borrowing examples
+    let r6: i32 = move_semantics_demo()
+    let r7: i32 = move_vs_copy_demo()
+    let r8: i32 = borrowing_concepts_demo()
+    let r9: i32 = borrow_rules_demo()
+    let r10: i32 = disjoint_borrow_demo()
+
+    # Ownership summary
+    let r11: i32 = ownership_demo()
+
+    println!("=== Demo Complete ===")
+    println!("")
+    println!("Working now: Array literals, Tensor operations, Move semantics")
+    println!("Type system ready: Vec, Slice, View, Buffer")
+    println!("Borrow checking: Disjoint slice detection implemented")
+
+    return 0

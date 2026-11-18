@@ -1,0 +1,66 @@
+# `Vec.zeroed[T]` in a generic body (#2923): a type parameter bounded by
+# `Zeroable` (from `std.core.marker`, re-exported by `std.core`) may be the
+# element type of a zero-initialized vector. The template is checked once under
+# its bound; each instantiation is re-checked against the closed set of
+# zeroable primitives and allocates with its own element size.
+
+from std.core import Zeroable
+
+# Explicit method type argument.
+def make[T: Zeroable](n: usize) -> Vec[T]:
+    let v: Vec[T] = Vec.zeroed[T](n)
+    return v
+
+# Element type taken from the declared binding.
+def make_annotated[T: Zeroable](n: usize) -> Vec[T]:
+    let v: Vec[T] = Vec.zeroed(n)
+    return v
+
+# A generic caller forwarding its own bounded parameter.
+def make_twice[U: Zeroable](n: usize) -> Vec[U]:
+    return make[U](n * 2)
+
+struct Grid[T]:
+    cells: Vec[T]
+
+impl Grid[T] where T: Zeroable:
+    def blank(self, n: usize) -> Vec[T]:
+        let c: Vec[T] = Vec.zeroed(n)
+        return c
+
+@host
+def main() -> i32:
+    let bytes: Vec[u8] = make[u8](16)
+    let ints: Vec[i32] = make[i32](8)
+    let floats: Vec[f64] = make_annotated[f64](4)
+    let wide: Vec[i64] = make_twice[i64](3)
+    let flags: Vec[bool] = make[bool](2)
+    let grid: Grid[u16] = Grid { cells: make[u16](1) }
+    let row: Vec[u16] = grid.blank(5)
+
+    assert!(bytes.len() == 16, "u8 length")
+    assert!(ints.len() == 8, "i32 length")
+    assert!(floats.len() == 4, "f64 length")
+    assert!(wide.len() == 6, "forwarded i64 length")
+    assert!(flags.len() == 2, "bool length")
+    assert!(row.len() == 5, "impl-method u16 length")
+
+    let mut sum: i64 = 0
+    for i: usize in range(bytes.len()):
+        sum = sum + (bytes[i] as i64)
+    for i: usize in range(ints.len()):
+        sum = sum + (ints[i] as i64)
+    for i: usize in range(wide.len()):
+        sum = sum + wide[i]
+    for i: usize in range(row.len()):
+        sum = sum + (row[i] as i64)
+    let mut fsum: f64 = 0.0
+    for i: usize in range(floats.len()):
+        fsum = fsum + floats[i]
+    assert!(sum == 0, "integer elements start at zero")
+    assert!(fsum == 0.0, "float elements start at zero")
+    assert!(not flags[0] and not flags[1], "bool elements start false")
+
+    let total: usize = bytes.len() + ints.len() + floats.len() + wide.len() + flags.len() + row.len()
+    println!("zeroed {total} elements across six instances, sum = {sum}")
+    return 0

@@ -1,0 +1,15 @@
+[package]
+name = "cuda_warp_roles_gemm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# Subgroup roles hand tiles off through mbarriers on CUDA
+# (#2515): exactly one GPU target with a copy engine and a device runtime.
+[target]
+gpu = ["nvptx-sm80"]

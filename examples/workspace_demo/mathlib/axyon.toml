@@ -1,0 +1,8 @@
+[package]
+name = "mathlib"
+version = "0.1.0"
+
+[lib]
+path = "src/__init__.axpy"
+
+[dependencies]

@@ -1,0 +1,38 @@
+# Generic return-type inference demo (#1208).
+#
+# `T` appears only in the return type of `empty_box` / `none_of`, so no argument
+# can bind it. The expected type of the call (a `let` annotation or a `return`
+# in a function with a declared return type) supplies it.
+
+enum Slot[T]:
+    Empty
+    Full(T)
+
+def none_of[T]() -> Slot[T]:
+    return Slot.Empty
+
+def fill[T](v: T) -> Slot[T]:
+    return Slot.Full(v)
+
+def from_return() -> Slot[i64]:
+    return none_of()
+
+def describe(s: Slot[i64]) -> i64:
+    match s:
+        case Slot.Empty:
+            return -1
+        case Slot.Full(v):
+            return v
+
+def main() -> i32:
+    let a: Slot[i64] = none_of()
+    let b: Slot[i64] = from_return()
+    let c: Slot[i64] = fill(42)
+    let da: i64 = describe(a)
+    let db: i64 = describe(b)
+    let dc: i64 = describe(c)
+    println!("a = {da}, b = {db}, c = {dc}")
+    assert!(da == -1, "inferred Slot[i64] is empty")
+    assert!(db == -1, "return-position inference")
+    assert!(dc == 42, "argument inference still works")
+    return 0

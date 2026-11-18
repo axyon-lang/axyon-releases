@@ -1,0 +1,29 @@
+# Complex numbers (issue #473): c64 = two f32, c128 = two f64 (Complex[f32] /
+# Complex[f64] are aliases). No implicit real<->complex or c64<->c128 conversion.
+
+import std.tensor as T
+
+def main() -> i32:
+    let z: c128 = c128(1.0, 2.0)
+    let w: Complex[f64] = c128(3.0, -1.0)
+    let p: c128 = z * w          # (1+2i)(3-i) = 5+5i
+    let re: f64 = p.re
+    let im: f64 = p.im
+    assert!(re == 5.0, "re")
+    assert!(im == 5.0, "im")
+    assert!(c128(3.0, 4.0).abs() == 5.0, "|3+4i|")
+    assert!(z.conj() == c128(1.0, -2.0), "conj")
+
+    # Explicit casts only: float -> complex and c64 <-> c128.
+    let low: c64 = c64(1.5_f32, -0.5_f32)
+    let wide: c128 = low as c128
+    assert!(wide.re == 1.5, "widen")
+
+    # Complex tensors: construction and elementwise add/sub/mul/div/neg.
+    let a: Tensor[c64, (3,)] = T.full[c64]([3], c64(1.0_f32, 2.0_f32))
+    let two: Tensor[c64, (3,)] = T.full[c64]([3], c64(2.0_f32, 0.0_f32))
+    let m: Tensor[c64, (3,)] = T.mul(a, two)
+    let e: c64 = m[1]
+    assert!(e == c64(2.0_f32, 4.0_f32), "tensor mul")
+    println!("complex ok")
+    return 0

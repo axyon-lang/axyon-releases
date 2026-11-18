@@ -1,0 +1,73 @@
+# Try (`?`) Operator Demo for AXYON
+#
+# The postfix `?` operator propagates errors and absent values with an early
+# return, keeping the success path flat. It works on:
+#   * `Result`-like enums (variants `Ok` / `Err`)  -> unwraps `Ok`, else `return Err(..)`
+#   * `Option`-like enums (variants `Some` / `None_`) -> unwraps `Some`, else `return None_`
+#
+# See docs/src/guide/enums.md ("The `?` (Try) Operator") for details.
+
+# A Result-like enum (scalar payloads).
+enum Result:
+    Ok(value: i32)
+    Err(code: i32)
+
+# An Option-like enum (scalar payload).
+enum Option:
+    Some(value: i32)
+    None_
+
+# ============================================================================
+# Result propagation with `?`
+# ============================================================================
+
+# Succeeds for non-negative inputs, otherwise fails with an error code.
+def checked(x: i32) -> Result:
+    if x < 0:
+        return Result.Err(1)
+    else:
+        return Result.Ok(x)
+
+# `checked(a)?` yields the Ok value, or returns Err(..) early from `sum3`.
+# Any failing step short-circuits the whole function.
+def sum3(a: i32, b: i32, c: i32) -> Result:
+    let x: i32 = checked(a)?
+    let y: i32 = checked(b)?
+    let z: i32 = checked(c)?
+    return Result.Ok(x + y + z)
+
+# ============================================================================
+# Option propagation with `?`
+# ============================================================================
+
+# `opt?` yields the Some value, or returns None_ early from `add_one`.
+def add_one(opt: Option) -> Option:
+    let v: i32 = opt?
+    return Option.Some(v + 1)
+
+# ============================================================================
+# Entry point
+# ============================================================================
+
+def main() -> i32:
+    # Result: 1 + 2 + 3 = 6 on the happy path.
+    let total: Result = sum3(1, 2, 3)
+    let mut out: i32 = 0
+    match total:
+        case Result.Ok(value=v):
+            out = v
+        case Result.Err(code=_):
+            out = -1
+
+    # Option: Some(9) -> Some(10).
+    let stepped: Option = add_one(Option.Some(9))
+    match stepped:
+        case Option.Some(value=s):
+            out = out + s
+        case Option.None_:
+            out = out - 1
+
+    # Arm assignments reach `out` (6 + 10); exit 0 signals success.
+    println!("out = {out}")
+    assert!(out == 16, "match arm assignments must be visible after the match")
+    return 0

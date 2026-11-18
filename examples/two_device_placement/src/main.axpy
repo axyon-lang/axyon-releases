@@ -1,0 +1,45 @@
+# Explicit device placement across two GPUs (issue #2678)
+#
+# `Buffer[T, (shape), device_global[n]]` places a buffer on device ordinal
+# `n` of the selected device runtime (CUDA: `CUDA_VISIBLE_DEVICES`
+# numbering). An unqualified `device_global` buffer lives on the runtime's
+# default device (`AXYON_CUDA_DEVICE`, default 0). The device is part of the
+# type, so:
+#
+# - `buffer_alloc` of a placed buffer allocates on that device;
+# - `gpu_launch` runs on the device of its buffer arguments, and buffers of
+#   one launch on two devices are rejected at compile time (`AX0637`);
+# - `buffer_copy` between two devices is routed by the runtime's one
+#   transfer policy: a peer copy when the devices can access each other,
+#   else a copy staged through host memory (unless `AXYON_GPU_STAGING=deny`,
+#   which rejects it by name).
+#
+# Running it needs two visible CUDA devices: with one, the allocation on
+# device 1 stops the program with an AXYON panic (no fallback).
+
+@gpu(entry)
+def scale(n: i64, x: &mut Buffer[f32, (256,), device_global]) -> None:
+    let i: i64 = gpu_block_id(0) * gpu_block_dim(0) + gpu_thread_id(0)
+    if i < n:
+        buffer_set(x, i, buffer_get(x, i) * 2.0)
+
+def main() -> i32:
+    let mut h: Buffer[f32, (256,)] = buffer_alloc([256])
+    for i: i64 in range(256):
+        buffer_set(h, i, i as f32)
+
+    # Upload into device 1 and double every element there.
+    let mut d1: Buffer[f32, (256,), device_global[1]] = buffer_alloc([256])
+    buffer_copy(h, d1)
+    gpu_launch(scale, 1, 256, 256, &mut d1)
+
+    # Move the result to device 0 (peer or staged) and double it again there.
+    let mut d0: Buffer[f32, (256,), device_global[0]] = buffer_alloc([256])
+    buffer_copy(d1, d0)
+    gpu_launch(scale, 1, 256, 256, &mut d0)
+
+    let back: Buffer[f32, (256,)] = buffer_to_host(d0)
+    for i: i64 in range(256):
+        assert!(buffer_get(back, i) == (i * 4) as f32, "two doublings on two devices")
+    println!("two-device placement: ok")
+    return 0

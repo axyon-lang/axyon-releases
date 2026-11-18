@@ -1,0 +1,27 @@
+# Structured logging: error!/warn!/info!/debug!/trace! (#1685).
+#
+# The first argument is a format string with the same `{x}` interpolation as
+# `println!`; keyword arguments are structured fields (bool, integer, float or
+# string). Records go to stderr, filtered by `AXYON_LOG` (default `info`):
+#
+#   AXYON_LOG=debug axyon run
+#   AXYON_LOG_FORMAT=json axyon run
+#
+# A disabled event evaluates nothing, including its field expressions.
+
+def expensive(n: ref_mut[i32]) -> i32:
+    *n = *n + 1
+    return *n
+
+def main() -> i32:
+    let attempt: i32 = 2
+    let max: i32 = 5
+    let backend: String = String.from("primary db")
+    let mut evaluated: i32 = 0
+
+    info!("request done", path="/health", status=200, ms=12.5, cached=false)
+    warn!("retrying {attempt} of {max}", backend=backend)
+    # Evaluated only when `trace` is enabled (it is not under the default filter).
+    trace!("slow path", cost=expensive(&mut evaluated))
+    println!("expensive() ran {evaluated} time(s)")
+    return 0

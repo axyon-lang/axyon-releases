@@ -1,0 +1,51 @@
+# Address Space Demo
+# Demonstrates memory address space annotations for GPU/device memory
+#
+# Portable address space mapping (NVIDIA + AMD + MLIR compatible):
+#   @host           (as0) - CPU memory
+#   @device_global  (as1) - GPU global memory (VRAM/HBM)
+#   @workgroup      (as2) - GPU shared memory (LDS on AMD)
+#   @private        (as3) - Thread-private memory
+#   @constant       (as4) - Read-only cached memory
+
+# Function that takes a reference to device global memory
+def process_device_data(data: &Tensor[f32, (N,)]@device_global) -> f32:
+    """Process data in GPU global memory (VRAM/HBM)."""
+    return 0.0
+
+# Function that works with workgroup/shared memory (fast on-chip GPU memory)
+def process_shared_data(data: &Tensor[f32, (256,)]@workgroup) -> f32:
+    """Process data in GPU workgroup/shared memory."""
+    return 0.0
+
+# Function with mutable device reference
+def fill_device_tensor(data: &mut Tensor[f32, (N,)]@device_global) -> i32:
+    """Fill a tensor in GPU global memory."""
+    return 0
+
+# Host function (default address space)
+def process_host_data(data: &Tensor[f32, (N,)]@host) -> f32:
+    """Process data in CPU memory (explicit @host annotation)."""
+    return 0.0
+
+# Mixed address space function
+def copy_to_device(src: &Tensor[f32, (N,)]@host, dst: &mut Tensor[f32, (N,)]@device_global) -> i32:
+    """Copy data from host to device global memory."""
+    return 0
+
+# Thread-private memory
+def use_private_data(data: &Tensor[f32, (16,)]@private) -> f32:
+    """Access thread-private memory."""
+    return 0.0
+
+def main() -> i32:
+    """Entry point demonstrating portable address space syntax."""
+    println!("Address space annotations demo")
+    println!("")
+    println!("Portable address spaces (NVIDIA + AMD + MLIR):")
+    println!("  @host           (as0) - CPU memory")
+    println!("  @device_global  (as1) - GPU global memory")
+    println!("  @workgroup      (as2) - GPU shared/LDS memory")
+    println!("  @private        (as3) - Thread-private memory")
+    println!("  @constant       (as4) - Read-only cached memory")
+    return 0

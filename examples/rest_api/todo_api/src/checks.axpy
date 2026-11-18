@@ -1,0 +1,97 @@
+# `todo_api --self-test`: the CRUD API through real TCP round trips on
+# 127.0.0.1:0 (an OS-assigned port), checking statuses and bodies.
+#
+# This is the app's integration test. It runs from `main` rather than as an
+# `axyon test` because `axyon test` cannot compile this package: its source
+# holds values of the dependency's recursive `Json` enum (AX331,
+# #3555), and its use of std.strconv clashes with
+# the dependency's stdlib instances (AX331 `Option__Ordering`,
+# #3545).
+
+from std.core import Result, Ok, Err
+from std.io_core import IoError
+from std.net import SocketAddr, TcpListener
+from http.request import Limits
+from http.router import Router
+from http.testing import Reply, round_trip, parse_reply, request_text
+from todos import Store, new_store, build_router
+
+# The server side of the check.
+struct Server:
+    listener: TcpListener
+    router: Router[Store]
+    store: Store
+    limits: Limits
+
+# Send `raw` and parse the reply; status 0 when the round trip failed.
+def send(server: &mut Server, raw: String) -> Reply:
+    match round_trip(&server.listener, &server.router, &mut server.store, &server.limits, raw.as_bytes()):
+        Ok(bytes) => return parse_reply(bytes.as_slice())
+        Err(e) =>
+            let none: Vec[u8] = Vec.new()
+            return parse_reply(none.as_slice())
+
+# Count a failed check and say which.
+def check(ok: bool, what: String, failures: &mut i32) -> unit:
+    if not ok:
+        eprintln!("self-test FAILED: {what}")
+        *failures = *failures + 1
+
+# Run every check; returns the number that failed (0 = pass, -1 = no socket).
+@public
+def self_test() -> i32:
+    # Placeholder assigned from the arms (#3546: no diverging arms in a
+    # value-position match).
+    let mut listener: TcpListener = TcpListener { handle: -1 }
+    match TcpListener.bind(SocketAddr.new(127, 0, 0, 1, 0)):
+        Ok(l) => listener = l
+        Err(e) =>
+            eprintln!("self-test: cannot bind 127.0.0.1:0")
+            return -1
+    let mut server: Server = Server { listener: listener, router: build_router(), store: new_store(), limits: Limits { max_head_bytes: 512, max_body_bytes: 64 } }
+    let mut failures: i32 = 0
+    let f: &mut i32 = &mut failures
+
+    let empty: Reply = send(&mut server, request_text("GET", "/todos", ""))
+    check(empty.status == 200 and empty.body == "[]", "the list starts empty", f)
+    let created: Reply = send(&mut server, request_text("POST", "/todos", "{\"title\": \"buy milk\"}"))
+    check(created.status == 201 and created.body == "{\"id\":1,\"title\":\"buy milk\",\"done\":false}", "POST creates, done defaults to false", f)
+    check(created.head.contains("Location: /todos/1\r\n"), "Location of the new todo", f)
+    let second: Reply = send(&mut server, request_text("POST", "/todos", "{\"title\": \"walk \\\"Rex\\\"\", \"done\": true, \"x\": [1]}"))
+    check(second.status == 201 and second.body == "{\"id\":2,\"title\":\"walk \\\"Rex\\\"\",\"done\":true}", "escapes survive, unknown members are ignored", f)
+    let one: Reply = send(&mut server, request_text("GET", "/todos/1", ""))
+    check(one.status == 200 and one.body == "{\"id\":1,\"title\":\"buy milk\",\"done\":false}", "GET by id", f)
+    let updated: Reply = send(&mut server, request_text("PUT", "/todos/1", "{\"title\": \"oat milk\", \"done\": true}"))
+    check(updated.status == 200 and updated.body == "{\"id\":1,\"title\":\"oat milk\",\"done\":true}", "PUT replaces", f)
+    let deleted: Reply = send(&mut server, request_text("DELETE", "/todos/2", ""))
+    check(deleted.status == 204 and deleted.body == "", "DELETE answers 204 with no body", f)
+    let gone: Reply = send(&mut server, request_text("GET", "/todos/2", ""))
+    check(gone.status == 404, "a deleted todo is gone", f)
+    let all: Reply = send(&mut server, request_text("GET", "/todos", ""))
+    check(all.status == 200 and all.body == "[{\"id\":1,\"title\":\"oat milk\",\"done\":true}]", "the list reflects every change", f)
+
+    let bad_id: Reply = send(&mut server, request_text("GET", "/todos/abc", ""))
+    check(bad_id.status == 404, "a non-numeric id names no todo", f)
+    let patch: Reply = send(&mut server, request_text("PATCH", "/todos/1", ""))
+    check(patch.status == 405 and patch.head.contains("Allow: GET, PUT, DELETE\r\n"), "405 lists the allowed methods", f)
+    let not_json: Reply = send(&mut server, request_text("POST", "/todos", "{\"title\": "))
+    check(not_json.status == 400 and not_json.body.contains("invalid JSON"), "malformed JSON body", f)
+    let no_title: Reply = send(&mut server, request_text("POST", "/todos", "{\"done\": true}"))
+    check(no_title.status == 400 and no_title.body == "{\"error\":\"`title` is required\"}", "missing title", f)
+    let bad_done: Reply = send(&mut server, request_text("POST", "/todos", "{\"title\": \"a\", \"done\": 1}"))
+    check(bad_done.status == 400, "done must be a boolean", f)
+    let not_object: Reply = send(&mut server, request_text("POST", "/todos", "[1]"))
+    check(not_object.status == 400, "the body must be an object", f)
+    let empty_put: Reply = send(&mut server, request_text("PUT", "/todos/1", "{\"title\": \"\"}"))
+    check(empty_put.status == 400, "an empty title is rejected", f)
+    let missing_put: Reply = send(&mut server, request_text("PUT", "/todos/9", "{\"title\": \"x\"}"))
+    check(missing_put.status == 404, "PUT of an unknown id", f)
+    let too_big: Reply = send(&mut server, request_text("POST", "/todos", "{\"title\": \"0123456789012345678901234567890123456789012345678901234567890123456789\"}"))
+    check(too_big.status == 413, "a body over the limit", f)
+    let garbage: Reply = send(&mut server, "HELLO\r\n\r\n")
+    check(garbage.status == 400, "malformed request line", f)
+    let after: Reply = send(&mut server, request_text("GET", "/todos", ""))
+    check(after.body == "[{\"id\":1,\"title\":\"oat milk\",\"done\":true}]", "failed requests left the store unchanged", f)
+
+    let _closed: Result[unit, IoError] = server.listener.close()
+    return failures

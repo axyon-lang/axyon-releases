@@ -1,0 +1,65 @@
+# Snapshot and restart a solver field stored as a runtime-extent tensor in a
+# struct, with no staging copy (issue #3068).
+#
+# - `f.t.as_slice()` / `f.t.as_mut_slice()` lend the field's storage block as
+#   a `Slice[f64]` / `SliceMut[f64]`: `std.fs` writes the snapshot straight
+#   from it and reads the restart straight into it.
+# - `T.write_slice` / `T.from_slice` copy a runtime-extent tensor value to and
+#   from a slice (one pass, one range check that traps instead of truncating).
+#
+# Run: `axyon run` in this directory. Prints `snapshot round-trip ok`.
+
+import std.tensor as T
+from std.fs import File, write_scalars_to, read_scalars_exact_slice
+
+struct Field:
+    n: i64
+    t: Tensor[f64, (?,)]
+
+def field(n: i64) -> Field:
+    return Field { n: n, t: T.zeros[f64]([n]) }
+
+# Fill the field in place through its writable storage view.
+def init(f: &mut Field) -> None:
+    let s: SliceMut[f64] = f.t.as_mut_slice()
+    let mut i: u64 = 0
+    while i < s.len():
+        let r: &mut f64 = s.get_mut(i)
+        *r = (i as f64) * 0.25 - 1.0
+        i = i + 1
+
+def main() -> i32:
+    let n: i64 = 1000
+    let mut u: Field = field(n)
+    init(&mut u)
+
+    # Snapshot: the file bytes come straight from the field's storage.
+    match File.create(b"field.bin"):
+        Err(_) => return 1
+        Ok(file) =>
+            match write_scalars_to[f64](ref(file), u.t.as_slice()):
+                Err(_) => return 2
+                Ok(_) => pass
+
+    # Restart: read into a fresh field's storage in place.
+    let mut v: Field = field(n)
+    match File.open(b"field.bin"):
+        Err(_) => return 3
+        Ok(file) =>
+            match read_scalars_exact_slice[f64](ref(file), v.t.as_mut_slice()):
+                Err(_) => return 4
+                Ok(_) => pass
+    for i: i64 in range(0, n):
+        if v.t[i] != u.t[i]:
+            return 5
+
+    # A runtime-extent tensor value goes through a slice by copy.
+    let mut staging: Vec[f64] = Vec.zeroed(n as usize)
+    let doubled: Tensor[f64, (?,)] = T.mul(u.t, T.full([n], 2.0_f64))
+    T.write_slice(staging.as_mut_slice(), 0, doubled)
+    let back: Tensor[f64, (?,)] = T.from_slice(staging.as_slice(), 0, [n])
+    if back[n - 1] != 2.0 * u.t[n - 1]:
+        return 6
+
+    println!("snapshot round-trip ok")
+    return 0

@@ -1,0 +1,93 @@
+# Generic `async def` (#2263): each instantiation gets its own future type and
+# state machine. Driven by hand with a no-op waker (no executor in the stdlib).
+from core.future import Future, Poll
+from core.task import Context, Waker, RawWaker, RawWakerVTable
+
+# Not ready for the first `left` polls, so each await really suspends.
+struct Delay:
+    left: i64
+    value: i64
+
+impl Future for Delay:
+    type Output = i64
+
+    def poll(mut self, cx: ref_mut[Context]) -> Poll[i64]:
+        if self.left == 0:
+            return Poll.Ready(self.value)
+        self.left = self.left - 1
+        cx.waker().wake_by_ref()
+        return Poll.Pending
+
+trait Weight:
+    def weight(self) -> i64
+
+impl Weight for i32:
+    def weight(self) -> i64:
+        return 3
+
+impl Weight for i64:
+    def weight(self) -> i64:
+        return 100
+
+# Generic `async def` (#2263): one future and state machine per instantiation.
+async def ident[T](x: T) -> T:
+    let pause: i64 = await Delay { left: 1, value: 0 }
+    if pause != 0:
+        return x
+    return x
+
+async def heavy[T: Weight](x: T, extra: i64) -> i64:
+    let d: i64 = await Delay { left: 2, value: extra }
+    return x.weight() + d
+
+# A generic `async def` awaiting another one with its own parameter.
+async def twice[T](x: T) -> T:
+    let y: T = await ident[T](x)
+    return await ident[T](y)
+
+async def task() -> i64:
+    let a: i32 = await ident[i32](5)
+    let b: i64 = await ident[i64](7)
+    let c: i32 = await twice[i32](11)
+    let h1: i64 = await heavy[i32](1, 10)
+    let h2: i64 = await heavy[i64](1, 20)
+    return (a as i64) + b + (c as i64) + h1 + h2
+
+@unsafe
+def nop_clone(data: ptr[unit]) -> ptr[unit]:
+    return data
+
+@unsafe
+def nop_wake(data: ptr[unit]) -> unit:
+    pass
+
+def noop_waker(data: ptr[unit], vt: ref[RawWakerVTable]) -> Waker:
+    unsafe:
+        return Waker.from_raw(RawWaker.new(data, vt))
+
+def poll_once(future: ref_mut[__Future_task], waker: ref[Waker]) -> i64:
+    let mut cx: Context = Context.from_waker(waker)
+    match future.poll(&mut cx):
+        case Poll.Ready(value):
+            return value
+        case Poll.Pending:
+            return -1
+
+def main() -> i32:
+    let clone_fn: unsafe fn(ptr[unit]) -> ptr[unit] = nop_clone
+    let wake_fn: unsafe fn(ptr[unit]) -> unit = nop_wake
+    let vtable: RawWakerVTable = RawWakerVTable.new(clone_fn, wake_fn, wake_fn, wake_fn)
+    let data: ptr_mut[u8] = global_alloc_zeroed(8, 8)
+    let waker: Waker = noop_waker(data as ptr[unit], ref(vtable))
+    let mut future = task()
+    let mut polls: i64 = 0
+    while polls < 100:
+        let result: i64 = poll_once(&mut future, ref(waker))
+        polls = polls + 1
+        if result != -1:
+            # 5 + 7 + 11 + (3 + 10) + (100 + 20)
+            if result != 156:
+                return 1
+            println!("result: {result}")
+            return 0
+    return 2

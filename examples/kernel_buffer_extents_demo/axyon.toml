@@ -1,0 +1,15 @@
+[package]
+name = "kernel_buffer_extents_demo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# Launching a kernel needs exactly one GPU target with a device runtime
+# (#2382): CUDA.
+[target]
+gpu = ["nvptx-sm80"]

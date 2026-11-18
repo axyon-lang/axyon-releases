@@ -1,0 +1,37 @@
+# Issue #1212: keyword enum constructors, `str` consts, field/index paths and
+# reference arguments in print placeholders.
+const GREETING: str = "shapes"
+
+struct Item:
+    sku: i32
+
+struct Inventory:
+    items: Vec[Item]
+
+enum Shape:
+    Circle(r: f64)
+    Rect(w: f64, h: f64)
+
+def area(s: &Shape) -> f64:
+    match s:
+        case Shape.Circle(r=r):
+            return 3.0 * (*r) * (*r)
+        case Shape.Rect(w=w, h=h):
+            return (*w) * (*h)
+
+def show(name: &string, inv: &Inventory, i: i64) -> i32:
+    println!("{name}: first sku {inv.items[i].sku}")
+    return 0
+
+def main() -> i32:
+    let c: Shape = Shape.Circle(r=2.0)
+    let r: Shape = Shape.Rect(h=3.0, w=2.0)
+    let ca: f64 = area(&c)
+    let ra: f64 = area(&r)
+    println!("{GREETING}: {ca} {ra}")
+    let mut inv: Inventory = Inventory { items: Vec.new() }
+    inv.items.push(Item { sku: 42 })
+    let label: string = String.from("inventory")
+    let i: i64 = 0
+    let _unused: i32 = show(&label, &inv, i)
+    return 0

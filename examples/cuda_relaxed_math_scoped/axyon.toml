@@ -1,0 +1,19 @@
+[package]
+name = "cuda_relaxed_math_scoped"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# The build-wide device math stays strict (#2830): only the kernels marked
+# `@relaxed_math` (#2866) are relaxed. Set `gpu-math = "relaxed"` to relax
+# every unmarked kernel too; the `@fast_math("off")` kernels stay strict in
+# either build.
+[target]
+gpu = ["nvptx-sm80"]
+gpu-math = "strict"

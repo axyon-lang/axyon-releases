@@ -1,0 +1,55 @@
+# Width-exact constant evaluation (issue #775).
+#
+# Every `const` initializer is computed with the same scalar semantics as
+# the runtime: each step runs in its operand type, shifts mask their amount,
+# float arithmetic is IEEE-754 and float -> int casts saturate. `main`
+# recomputes each value at runtime and checks that the two agree.
+
+const U64_MAX: u64 = 18446744073709551615
+const HALF: u64 = U64_MAX / 2
+const LOW_NIBBLE: u8 = 0xFF_u8 & 0x0F_u8
+const WRAPPED_SHIFT: u32 = 1_u32 << 33_u32
+const FLOOR: i8 = -7_i8 // 2_i8
+const REM: i8 = -7_i8 % 2_i8
+const SATURATED: u8 = 300.0_f32 as u8
+const NAN_TO_INT: i32 = (0.0_f32 / 0.0_f32) as i32
+const SUM_F32: f32 = 0.1_f32 + 0.2_f32
+const NEG_INF: f64 = 1.0 / -0.0
+const IS_BIG: bool = HALF > 9223372036854775806
+
+# Rejected at compile time (uncomment to see the diagnostic):
+# const BAD: u8 = 200 + 100 - 100   # AX0603: overflows `u8` at the add
+# const DIV: i8 = -128_i8 / -1_i8   # AX0603: attempt to divide with overflow
+
+
+def div_u64(a: u64, b: u64) -> u64:
+    return a / b
+
+
+def floor_i8(a: i8, b: i8) -> i8:
+    return a // b
+
+
+def rem_i8(a: i8, b: i8) -> i8:
+    return a % b
+
+
+def to_u8(x: f32) -> u8:
+    return x as u8
+
+
+def add_f32(a: f32, b: f32) -> f32:
+    return a + b
+
+
+@host
+def main() -> i32:
+    println!("HALF={HALF} LOW_NIBBLE={LOW_NIBBLE} WRAPPED_SHIFT={WRAPPED_SHIFT}")
+    println!("FLOOR={FLOOR} REM={REM} SATURATED={SATURATED} NAN_TO_INT={NAN_TO_INT}")
+    println!("SUM_F32={SUM_F32} NEG_INF={NEG_INF} IS_BIG={IS_BIG}")
+    assert!(HALF == div_u64(U64_MAX, 2), "u64 division")
+    assert!(FLOOR == floor_i8(-7, 2), "floor division")
+    assert!(REM == rem_i8(-7, 2), "remainder")
+    assert!(SATURATED == to_u8(300.0), "saturating cast")
+    assert!(SUM_F32 == add_f32(0.1, 0.2), "f32 rounding")
+    return 0

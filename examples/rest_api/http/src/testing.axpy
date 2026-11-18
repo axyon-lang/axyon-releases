@@ -1,0 +1,90 @@
+# Loopback helpers for tests: run one request through a real TCP round trip
+# on a single thread, and split the raw response.
+#
+# `round_trip` connects to the listener, writes the whole request and
+# closes its sending side (the kernel queues the connection and buffers the
+# bytes), lets `serve_one` accept and answer that connection, then reads the
+# response until the server closes it. Requests and responses must fit in the socket buffers,
+# which holds for the small messages tests send. Bind the listener to
+# 127.0.0.1:0 so the OS picks a free port.
+
+from std.core import Result, Ok, Err
+from std.io_core import IoError
+from std.net import SocketAddr, TcpListener, TcpStream
+from .request import Limits
+from .router import Router
+from .server import serve_one, send_all
+
+# Send `raw` to `listener`, serve it with `router` and `state`, and return
+# the raw response bytes.
+@public
+def round_trip[S](listener: &TcpListener, router: &Router[S], state: &mut S, limits: &Limits, raw: Slice[u8]) -> Result[Vec[u8], IoError]:
+    let addr: SocketAddr = listener.local_addr()?
+    let client: TcpStream = TcpStream.connect(addr)?
+    send_all(&client, raw)?
+    # Half-close: a request shorter than its Content-Length then ends at EOF
+    # (a 400) instead of blocking the single-threaded server.
+    client.shutdown(1)?
+    let _status: u16 = serve_one(listener, router, state, limits)?
+    let bytes: Vec[u8] = read_to_end(&client)?
+    let _closed: Result[unit, IoError] = client.close()
+    return Ok(bytes)
+
+# Read from `stream` until the peer closes it.
+@public
+def read_to_end(stream: &TcpStream) -> Result[Vec[u8], IoError]:
+    let mut bytes: Vec[u8] = Vec.new()
+    let mut chunk: Vec[u8] = Vec.zeroed(1024)
+    while True:
+        let mut n: usize = 0
+        match stream.read(chunk.as_mut_slice()):
+            Ok(k) => n = k
+            Err(e) => return Err(e)
+        if n == 0:
+            return Ok(bytes)
+        for i: usize in range(0, n):
+            bytes.push(chunk[i])
+    return Ok(bytes)
+
+# A response as a client saw it.
+@public
+struct Reply:
+    @public
+    status: u16
+    # The status line and header fields, with the blank line.
+    @public
+    head: String
+    @public
+    body: String
+
+# Split a raw response into status, head and body. A response too short to
+# hold a status line has status 0.
+@public
+def parse_reply(bytes: Slice[u8]) -> Reply:
+    let mut status: u16 = 0
+    if bytes.len() >= 12:
+        status = ((bytes[9] - 48) as u16) * 100 + ((bytes[10] - 48) as u16) * 10 + ((bytes[11] - 48) as u16)
+    let mut split: usize = bytes.len()
+    let mut i: usize = 0
+    while i + 3 < bytes.len() and split == bytes.len():
+        if bytes[i] == 13 and bytes[i + 1] == 10 and bytes[i + 2] == 13 and bytes[i + 3] == 10:
+            split = i + 4
+        i = i + 1
+    let mut head: String = String.new()
+    for k: usize in range(0, split):
+        head.push(bytes[k])
+    let mut body: String = String.new()
+    for k: usize in range(split, bytes.len()):
+        body.push(bytes[k])
+    return Reply { status: status, head: head, body: body }
+
+# The text of a request with an optional body (and its Content-Length).
+@public
+def request_text(method: String, path: String, body: String) -> String:
+    let n: usize = body.len()
+    let mut raw: String = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+    if n > 0:
+        raw.push_str(format!("Content-Type: application/json\r\nContent-Length: {n}\r\n"))
+    raw.push_str("\r\n")
+    raw.push_str(body)
+    return raw

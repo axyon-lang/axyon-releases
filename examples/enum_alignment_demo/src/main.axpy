@@ -1,0 +1,200 @@
+# Enum Alignment Demo for AXYON
+# ==============================
+#
+# This example demonstrates how to control enum memory alignment using the
+# @align(N) attribute. Understanding alignment is crucial for:
+#
+# - FFI (Foreign Function Interface) with C/C++ code
+# - SIMD operations that require specific alignments
+# - Cache-line optimization for performance-critical code
+# - Hardware interfaces with alignment requirements
+#
+# MEMORY LAYOUT BACKGROUND
+# ------------------------
+# Enums in AXYON are laid out as tagged unions:
+#
+#   +--------+----------+-----------------+
+#   |  Tag   | Padding  |    Payload      |
+#   | (i32)  | (varies) | (largest variant)|
+#   +--------+----------+-----------------+
+#
+# - Tag: 4 bytes (i32) identifying which variant is active
+# - Padding: Added to align the payload to the required boundary
+# - Payload: Space for the largest variant's data
+#
+# The enum's alignment determines:
+# - Where the payload starts (aligned to max(tag_align, payload_align, forced_align))
+# - The total size (rounded up to alignment)
+
+# ============================================================================
+# ALIGNMENT EXAMPLES
+# ============================================================================
+#
+# @align(N) forces enum alignment to N bytes, even if the payload would
+# normally require less alignment. Common use cases:
+#
+# - @align(8)  - Basic alignment, cache-friendly
+# - @align(16) - SSE/NEON SIMD operations (128-bit vectors)
+# - @align(32) - AVX/AVX2 SIMD operations (256-bit vectors)
+# - @align(64) - AVX-512 SIMD, cache-line isolation
+#
+# ============================================================================
+# ALIGNMENT AND SIZE TABLE
+# ============================================================================
+#
+# | Enum Type      | Payload  | @align | Alignment | Total Size |
+# |----------------|----------|--------|-----------|------------|
+# | DefaultAlign   | i32      | none   | 4         | 8          |
+# | Aligned8       | i32      | 8      | 8         | 16         |
+# | Aligned16      | i32      | 16     | 16        | 32         |
+# | Aligned32      | i32      | 32     | 32        | 64         |
+# | Aligned64      | i32      | 64     | 64        | 128        |
+# | UnitAligned16  | none     | 16     | 16        | 16         |
+#
+# Note: Size is always rounded up to alignment, so @align(16) with an i32
+# payload results in size 32 (tag 4 + padding 12 + payload 4 + tail padding 12).
+
+# ============================================================================
+# Enum Definitions (for documentation purposes)
+# ============================================================================
+#
+# Default alignment (derived from payload):
+# enum DefaultAlign:
+#     Empty
+#     Value(data: i32)
+#
+# 8-byte alignment:
+# @align(8)
+# enum Aligned8:
+#     Empty
+#     Value(data: i32)
+#
+# 16-byte alignment (SIMD compatible):
+# @align(16)
+# enum Aligned16:
+#     Empty
+#     Value(data: i32)
+#
+# 32-byte alignment (AVX compatible):
+# @align(32)
+# enum Aligned32:
+#     Empty
+#     Value(data: i32)
+#
+# 64-byte alignment (cache-line aligned):
+# @align(64)
+# enum Aligned64:
+#     Empty
+#     Value(data: i32)
+#
+# Unit-only enum with alignment:
+# @align(16)
+# enum AlignedStatus:
+#     Pending
+#     Running
+#     Complete
+#     Failed
+
+# ============================================================================
+# Working Example: Status Enum with Standard Alignment
+# ============================================================================
+
+enum Status:
+    Pending
+    Running
+    Complete
+    Failed
+
+enum OptionI32:
+    Empty
+    Some(value: i32)
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def status_to_code(s: Status) -> i32:
+    """Convert status enum to numeric code."""
+    match s:
+        case Status.Pending:
+            return 0
+        case Status.Running:
+            return 1
+        case Status.Complete:
+            return 2
+        case Status.Failed:
+            return 3
+
+def unwrap_or(opt: OptionI32, default_val: i32) -> i32:
+    """Extract value from option, or return default if empty."""
+    match opt:
+        case OptionI32.Empty:
+            return default_val
+        case OptionI32.Some(value=v):
+            return v
+
+def is_some(opt: OptionI32) -> bool:
+    """Check if option contains a value."""
+    match opt:
+        case OptionI32.Empty:
+            return False
+        case OptionI32.Some(value=v):
+            return True
+
+# ============================================================================
+# Main Function
+# ============================================================================
+
+def main() -> i32:
+    println!("Enum Alignment Demo")
+    println!("===================")
+    println!("")
+
+    # --- Status enum example ---
+    println!("1. Status Enum (default alignment)")
+    let status1: Status = Status.Running
+    let status2: Status = Status.Complete
+    let code1: i32 = status_to_code(status1)
+    let code2: i32 = status_to_code(status2)
+    println!("   Status.Running -> code {code1}")
+    println!("   Status.Complete -> code {code2}")
+    println!("")
+
+    # --- Option enum example ---
+    println!("2. OptionI32 Enum (default alignment)")
+    let some_val: OptionI32 = OptionI32.Some(42)
+    let empty_val: OptionI32 = OptionI32.Empty
+
+    # Check is_some before consuming
+    let some_val_check: OptionI32 = OptionI32.Some(42)
+    let has_value: bool = is_some(some_val_check)
+    if has_value:
+        println!("   some_val contains a value")
+    else:
+        println!("   some_val is empty")
+
+    let extracted: i32 = unwrap_or(some_val, 0)
+    let default_used: i32 = unwrap_or(empty_val, -1)
+    println!("   OptionI32.Some(42) unwrapped: {extracted}")
+    println!("   OptionI32.Empty unwrapped with default: {default_used}")
+    println!("")
+
+    # --- Alignment information ---
+    println!("ALIGNMENT ATTRIBUTE SYNTAX")
+    println!("--------------------------")
+    println!("Use @align(N) before enum definition:")
+    println!("")
+    println!("  @align(8)")
+    println!("  enum MyEnum:")
+    println!("      Variant1")
+    println!("      Variant2(data: i32)")
+    println!("")
+    println!("Common alignment values:")
+    println!("  @align(8)  - Basic alignment, cache-friendly")
+    println!("  @align(16) - SSE/NEON SIMD (128-bit vectors)")
+    println!("  @align(32) - AVX/AVX2 SIMD (256-bit vectors)")
+    println!("  @align(64) - AVX-512, cache-line isolation")
+    println!("")
+
+    println!("Demo complete!")
+    return 0

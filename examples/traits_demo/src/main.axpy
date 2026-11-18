@@ -1,0 +1,67 @@
+# Traits Demo - Demonstrates the trait system in AXYON
+#
+# AXYON supports Rust-like traits with Python syntax:
+# - trait definitions with method signatures
+# - trait implementations for types
+# - @derive decorator for automatic trait implementation
+
+# Define a Display trait with a fmt method
+trait Display:
+    def fmt(self) -> string
+
+# Define a Describable trait with describe method
+trait Describable:
+    def describe(self) -> string
+
+# A simple Point struct with @derive(Copy) for value semantics
+@derive(Copy)
+struct Point:
+    @public
+    x: f32
+    @public
+    y: f32
+
+# Implement Display for Point
+impl Display for Point:
+    def fmt(self) -> string:
+        return "Point"
+
+# Implement Describable for Point
+impl Describable for Point:
+    def describe(self) -> string:
+        return "A 2D point"
+
+# A Rectangle struct with Copy semantics
+@derive(Copy)
+struct Rectangle:
+    @public
+    width: f32
+    @public
+    height: f32
+
+# Implement Display for Rectangle
+impl Display for Rectangle:
+    def fmt(self) -> string:
+        return "Rectangle"
+
+# Regular impl block (not a trait impl)
+impl Rectangle:
+    def area(self) -> f32:
+        return self.width * self.height
+
+def main() -> i32:
+    # Create a Point and call trait methods
+    let p = Point { x: 3.0, y: 4.0 }
+    let name = p.fmt()
+    println!("Type: {name}")
+
+    let desc = p.describe()
+    println!("Description: {desc}")
+
+    # Create a Rectangle and use both trait and regular methods
+    let r = Rectangle { width: 10.0, height: 5.0 }
+    let rect_name = r.fmt()
+    let area = r.area()
+    println!("Type: {rect_name}, Area: {area}")
+
+    return 0

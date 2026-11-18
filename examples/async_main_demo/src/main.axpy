@@ -1,0 +1,10 @@
+from core.future import Future, Poll
+from core.task import Context
+from std.async_runtime import sleep
+from std.time import Duration
+
+@async_main
+async def main() -> i32:
+    await sleep(Duration.from_millis(1))
+    println!("async main completed")
+    return 0

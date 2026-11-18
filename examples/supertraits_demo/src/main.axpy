@@ -1,0 +1,38 @@
+# Supertraits Demo - trait inheritance with `trait Child(Parent)`
+#
+# Implementing a child trait for a type requires that the type also implements
+# every parent trait (directly or transitively). Impl order does not matter.
+
+trait Named:
+    def name(self) -> i32
+
+trait Greeter(Named):
+    def greet(self) -> i32
+
+@derive(Copy, Clone)
+struct Person:
+    id: i32
+
+impl Greeter for Person:
+    def greet(self) -> i32:
+        return self.id + 100
+
+impl Named for Person:
+    def name(self) -> i32:
+        return self.id
+
+# A bounded type parameter can call its bound's methods and the methods it
+# inherits from supertraits; dispatch is resolved at monomorphization.
+def total[T: Greeter](t: T) -> i32:
+    return t.name() + t.greet()
+
+def main() -> i32:
+    let p: Person = Person { id: 7 }
+    let n: i32 = p.name()
+    let g: i32 = p.greet()
+    println!("name={n} greet={g}")
+    assert!(g == 107, "greet should be 107")
+    let t: i32 = total(p)
+    println!("total={t}")
+    assert!(t == 114, "total should be 114")
+    return 0

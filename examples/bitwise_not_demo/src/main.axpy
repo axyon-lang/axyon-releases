@@ -1,0 +1,30 @@
+# Bitwise Not Demo (issue #2551)
+# `~x` complements every bit of an integer: `x ^ -1` (all ones) in the type of `x`.
+# Floats and `bool` are rejected (use `not` for `bool`).
+
+def clear_low(x: u64, low: u64) -> u64:
+    return x & ~low
+
+def main() -> i32:
+    let a: u8 = 0
+    let b: u16 = 0
+    let c: u32 = 0
+    let d: u64 = 0
+    let e: i8 = 0
+    let f: i16 = 0
+    let g: i32 = 0
+    let h: i64 = 0
+    assert!(~a == 255_u8, "~0_u8")
+    assert!(~b == 65535_u16, "~0_u16")
+    assert!(~c == 4294967295_u32, "~0_u32")
+    assert!(~d == 18446744073709551615_u64, "~0_u64")
+    assert!(~e == -1_i8, "~0_i8")
+    assert!(~f == -1_i16, "~0_i16")
+    assert!(~g == -1_i32, "~0_i32")
+    assert!(~h == -1_i64, "~0_i64")
+    let m: i64 = 5
+    assert!(~m == -6_i64, "~5_i64")
+    assert!(~~m == m, "~~x")
+    assert!(clear_low(0b1111, 0b0101) == 0b1010, "x & ~low")
+    println!("bitwise not demo ok")
+    return 0

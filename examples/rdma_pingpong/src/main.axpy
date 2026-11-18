@@ -1,0 +1,234 @@
+# Two-process RDMA ping-pong over std.rdma: tagged latency (`wait` vs `test`
+# polling), one-sided put latency, and 4 MiB put bandwidth.
+#
+# Each rank writes its UCX address to a file and reads its peer's:
+#   RDMA_RANK=0 RDMA_SELF=/shared/a RDMA_PEER=/shared/b ./rdma_pingpong
+#   RDMA_RANK=1 RDMA_SELF=/shared/b RDMA_PEER=/shared/a ./rdma_pingpong
+# RDMA_ITERS scales the number of iterations (default 1000); RDMA_TIMEOUT_MS
+# bounds every operation (default 30000), including the `test` polling loops.
+# Rank 0 prints `RESULT <name> <value>` lines.
+#
+# On one host, select a transport with e.g. UCX_TLS=self,tcp or self,posix,tcp.
+# Without UCX (e.g. macOS) the native TCP fallback runs instead (#2818); see
+# scripts/ci/rdma-native-local.sh and docs/src/reference/runtime-rdma.md.
+
+from std.rdma import (
+    RdmaContext, Endpoint, Address, RegBuf, Pending, Window, RemoteKey, Comm,
+    RdmaError, RdmaErrorKind, CloseError,
+    register, recv_key, put, send, recv,
+)
+from std.alloc import Vec, String
+from std.core import usize, u8, u32, u64, i32, i64, f32, f64, bool, unit, Result, Ok, Err
+from std.env import var, VarStatus
+from std.fs import read, write
+from std.time import Instant
+
+const DEFAULT_TIMEOUT_MS: i64 = 30000
+const BW_BYTES: usize = 4194304
+
+def env_string(name: Slice[u8]) -> String:
+    let mut out: Vec[u8] = Vec.new()
+    let status: VarStatus = var(name, &mut out)
+    let mut text: String = String.new()
+    if status == VarStatus.Ok:
+        let mut i: usize = 0
+        while i < out.len():
+            text.push(out.get(i))
+            i = i + 1
+    return text
+
+def env_i64(name: Slice[u8], default: i64) -> i64:
+    let text: String = env_string(name)
+    if text.len() == 0:
+        return default
+    let mut value: i64 = 0
+    let bytes: Slice[u8] = text.as_bytes()
+    let mut i: usize = 0
+    while i < bytes.len():
+        value = value * 10 + ((bytes[i] as i64) - 48)
+        i = i + 1
+    return value
+
+def hex_digit(n: u8) -> u8:
+    if n < 10:
+        return 48 + n
+    return 87 + n
+
+def hex_value(c: u8) -> u8:
+    if c >= 97:
+        return c - 87
+    return c - 48
+
+# UCX addresses are binary; the shared file holds hex text.
+def write_address(path: String, addr: ref[Address]) -> bool:
+    let mut text: String = String.new()
+    let bytes: Vec[u8] = addr.to_bytes()
+    let mut i: usize = 0
+    while i < bytes.len():
+        let b: u8 = bytes.get(i)
+        text.push(hex_digit(b / 16))
+        text.push(hex_digit(b % 16))
+        i = i + 1
+    return write(path.as_bytes(), text.as_bytes()).is_ok()
+
+def sleep_ms(ms: i64) -> unit:
+    let start: Instant = Instant.now()
+    while start.elapsed().as_nanos() < ms * 1000000:
+        pass
+
+# Poll for the peer's address file (the peer writes complete hex text).
+def read_address(path: String, tries: i64) -> Address:
+    if tries > 30000:
+        panic("rdma_pingpong: timed out waiting for the peer's address file")
+    match read(path.as_bytes()):
+        Ok(bytes) =>
+            if bytes.len() > 0 and bytes.len() % 2 == 0:
+                let mut out: Vec[u8] = Vec.new()
+                let mut i: usize = 0
+                while i < bytes.len():
+                    let hi: u8 = hex_value(bytes.get(i))
+                    let lo: u8 = hex_value(bytes.get(i + 1))
+                    out.push(hi * 16 + lo)
+                    i = i + 2
+                # SAFETY: `out` is the peer's address, written by `write_address`.
+                unsafe:
+                    return Address.from_bytes_unchecked(out)
+        Err(e) =>
+            pass
+    sleep_ms(1)
+    return read_address(path, tries + 1)
+
+def zeroed(ctx: ref[RdmaContext], n: usize) -> Result[RegBuf[u8], RdmaError]:
+    let data: Vec[u8] = Vec.zeroed[u8](n)
+    return register(ctx, data)
+
+# Complete an operation by `wait`, or by polling `test` first. `test` never
+# reports the operation's deadline (an unfinished receive stays pending), so
+# the poll stops once `timeout_ms` has passed since the post, and `wait` then
+# applies the timeout and its retention policy.
+def settle(op: Pending[u8], use_poll: bool, timeout_ms: i64) -> Result[RegBuf[u8], RdmaError]:
+    if use_poll:
+        let start: Instant = Instant.now()
+        let limit: i64 = timeout_ms * 1000000
+        let mut done: bool = false
+        while not done and start.elapsed().as_nanos() < limit:
+            match op.test():
+                Ok(d) => done = d
+                Err(e) => done = true
+    return op.wait()
+
+def ping_iter_rank0(buf: RegBuf[u8], ctx: ref[RdmaContext], ep: ref[Endpoint], use_poll: bool, timeout_ms: i64) -> Result[RegBuf[u8], RdmaError]:
+    let s: Pending[u8] = send(buf, ep, 1, timeout_ms)?
+    let sent: RegBuf[u8] = settle(s, use_poll, timeout_ms)?
+    let r: Pending[u8] = recv(sent, ctx, 2, timeout_ms)?
+    return settle(r, use_poll, timeout_ms)
+
+def ping_iter_rank1(buf: RegBuf[u8], ctx: ref[RdmaContext], ep: ref[Endpoint], use_poll: bool, timeout_ms: i64) -> Result[RegBuf[u8], RdmaError]:
+    let r: Pending[u8] = recv(buf, ctx, 1, timeout_ms)?
+    let got: RegBuf[u8] = settle(r, use_poll, timeout_ms)?
+    let s: Pending[u8] = send(got, ep, 2, timeout_ms)?
+    return settle(s, use_poll, timeout_ms)
+
+def ping_iter(rank: i64, buf: RegBuf[u8], ctx: ref[RdmaContext], ep: ref[Endpoint], use_poll: bool, timeout_ms: i64) -> Result[RegBuf[u8], RdmaError]:
+    if rank == 0:
+        return ping_iter_rank0(buf, ctx, ep, use_poll, timeout_ms)
+    return ping_iter_rank1(buf, ctx, ep, use_poll, timeout_ms)
+
+# Recursion instead of a loop: `?` is not yet supported inside loop bodies.
+def ping_loop(rank: i64, buf: RegBuf[u8], ctx: ref[RdmaContext], ep: ref[Endpoint], n: i64, use_poll: bool, timeout_ms: i64) -> Result[RegBuf[u8], RdmaError]:
+    if n == 0:
+        return Result.Ok(buf)
+    let next: RegBuf[u8] = ping_iter(rank, buf, ctx, ep, use_poll, timeout_ms)?
+    return ping_loop(rank, next, ctx, ep, n - 1, use_poll, timeout_ms)
+
+# Tagged ping-pong; rank 0 measures. `use_poll` waits with a `test` loop.
+def pingpong(ctx: ref[RdmaContext], ep: ref[Endpoint], rank: i64, iters: i64, use_poll: bool, timeout_ms: i64) -> Result[f64, RdmaError]:
+    let buf: RegBuf[u8] = zeroed(ctx, 8)?
+    let start: Instant = Instant.now()
+    let done: RegBuf[u8] = ping_loop(rank, buf, ctx, ep, iters, use_poll, timeout_ms)?
+    let nanos: i64 = start.elapsed().as_nanos()
+    # One-way latency: half the round trip.
+    return Result.Ok((nanos as f64) / (iters as f64) / 2000.0)
+
+def put_loop(src: RegBuf[u8], ep: ref[Endpoint], key: ref[RemoteKey[u8]], n: i64, timeout_ms: i64) -> Result[RegBuf[u8], RdmaError]:
+    if n == 0:
+        return Result.Ok(src)
+    let op: Pending[u8] = put(src, ep, key, timeout_ms)?
+    let next: RegBuf[u8] = op.wait()?
+    return put_loop(next, ep, key, n - 1, timeout_ms)
+
+def run_target(ctx: ref[RdmaContext], ep: ref[Endpoint], comm: ref[Comm], timeout_ms: i64) -> Result[i32, RdmaError]:
+    let storage: RegBuf[u8] = zeroed(ctx, BW_BYTES)?
+    let win: Window[u8] = storage.expose(ctx)?
+    let key: RemoteKey[u8] = win.remote_key_for(ep)?
+    key.send(ep, timeout_ms)?
+    let mut last: u8 = 0
+    let mut closed: bool = false
+    match win.close(comm, timeout_ms * 10):
+        Ok(buf) =>
+            last = buf.at(BW_BYTES - 1)
+            closed = true
+        Err(e) =>
+            closed = false
+    if not closed:
+        panic("rdma_pingpong: window close failed")
+    if last != 9:
+        panic("rdma_pingpong: put data did not arrive")
+    return Result.Ok(0)
+
+def run_initiator(ctx: ref[RdmaContext], ep: ref[Endpoint], comm: ref[Comm], iters: i64, timeout_ms: i64) -> Result[i32, RdmaError]:
+    let r: Result[RemoteKey[u8], RdmaError] = recv_key(ep, timeout_ms)
+    let key: RemoteKey[u8] = r?
+    let mut src: RegBuf[u8] = zeroed(ctx, BW_BYTES)?
+    src.set_at(BW_BYTES - 1, 9)
+    let bw_iters: i64 = if iters > 200 { 200 } else { iters }
+    let s_start: Instant = Instant.now()
+    let after_bw: RegBuf[u8] = put_loop(src, ep, &key, bw_iters, timeout_ms)?
+    ep.flush(timeout_ms)?
+    let nanos: i64 = s_start.elapsed().as_nanos()
+    let mbps: f64 = ((bw_iters as f64) * (BW_BYTES as f64) * 1000.0) / (nanos as f64)
+    println!("RESULT put_bandwidth_mb_s {mbps}")
+    let small: RegBuf[u8] = zeroed(ctx, 8)?
+    let p_start: Instant = Instant.now()
+    let after_small: RegBuf[u8] = put_loop(small, ep, &key, iters, timeout_ms)?
+    let p_nanos: i64 = p_start.elapsed().as_nanos()
+    let p_us: f64 = (p_nanos as f64) / (iters as f64) / 1000.0
+    println!("RESULT put_post_complete_us {p_us}")
+    ep.flush(timeout_ms)?
+    key.release(comm, timeout_ms * 10)?
+    return Result.Ok(0)
+
+def run(rank: i64) -> Result[i32, RdmaError]:
+    let iters: i64 = env_i64("RDMA_ITERS".as_bytes(), 1000)
+    let timeout_ms: i64 = env_i64("RDMA_TIMEOUT_MS".as_bytes(), DEFAULT_TIMEOUT_MS)
+    let ctx: RdmaContext = RdmaContext.new()?
+    let my_addr: Address = ctx.address()?
+    let wrote: bool = write_address(env_string("RDMA_SELF".as_bytes()), &my_addr)
+    let peer: Address = read_address(env_string("RDMA_PEER".as_bytes()), 0)
+    let ep: Endpoint = ctx.connect(&peer)?
+    let peer_rank: u32 = if rank == 0 { 1 as u32 } else { 0 as u32 }
+    let comm: Comm = Comm.new(&ctx, rank as u32, 2 as u32)?
+    comm.set_peer(peer_rank, &ep)?
+
+    let wait_us: f64 = pingpong(&ctx, &ep, rank, iters, false, timeout_ms)?
+    let poll_us: f64 = pingpong(&ctx, &ep, rank, iters, true, timeout_ms)?
+    println!("RESULT rank {rank} wrote_address {wrote}")
+    if rank == 0:
+        println!("RESULT tag_latency_wait_us {wait_us}")
+        println!("RESULT tag_latency_poll_us {poll_us}")
+        return run_initiator(&ctx, &ep, &comm, iters, timeout_ms)
+    return run_target(&ctx, &ep, &comm, timeout_ms)
+
+def main() -> i32:
+    # Without the bootstrap environment there is nothing to run: example
+    # sweeps build and run every example with no arguments.
+    if env_string("RDMA_SELF".as_bytes()).len() == 0:
+        println!("rdma_pingpong: set RDMA_RANK, RDMA_SELF and RDMA_PEER (see the header)")
+        return 0
+    let rank: i64 = env_i64("RDMA_RANK".as_bytes(), 0)
+    match run(rank):
+        Ok(c) => return c
+        Err(e) =>
+            let code: i64 = e.code
+            println!("RESULT error {code}")
+            return 2

@@ -1,0 +1,127 @@
+# Trait Bounds Demo for AXYON
+#
+# Demonstrates trait-bound enforcement on generic type parameters. Bounds can be
+# written inline (`Foo[K: Eq + Hash]`) or in a `where` clause
+# (`... where K: Eq + Hash`), on structs, enums, and functions.
+#
+# At every generic instantiation site the compiler checks that the concrete
+# type arguments satisfy the declared bounds. If they do not, compilation fails
+# with error AX070 naming the offending type and unmet trait. Bound checking is
+# supertrait aware: a type that is `Ord` also satisfies an `Eq` or `PartialOrd`
+# bound.
+
+# ============================================================================
+# Generic types with trait bounds
+# ============================================================================
+
+# A hash-map-like key/value holder. Keys must be `Eq + Hash` so they can be
+# compared and hashed. Integer and string types satisfy this out of the box.
+struct KeyBox[K, V] where K: Eq + Hash:
+    key: K
+    val: V
+
+# Inline-bound form: an ordered key requires `Ord`.
+struct Ordered[K: Ord]:
+    key: K
+
+# A generic enum whose key parameter must be `Eq`.
+enum Tagged[K, V] where K: Eq:
+    Empty
+    Entry(k: K, v: V)
+
+# ============================================================================
+# Generic functions with trait bounds
+# ============================================================================
+
+# `K: Eq + Hash` on a function type parameter. Callers must pass a hashable,
+# equatable type; the bound is checked at each call site.
+def hash_key[K: Eq + Hash](k: K) -> K:
+    return k
+
+# Inline bound on a function type parameter. `Ord` implies `Eq` and `PartialOrd`.
+# (Free functions use the inline `[T: Ord]` form; `where` clauses are supported
+# on struct/enum definitions.)
+def pick_min[T: Ord](a: T, b: T) -> T:
+    return a
+
+# A bound method whose signature names the trait's associated type (#2261):
+# `s.get()` has type `S.Item`, which is `i64` for `Counter`.
+trait Source:
+    type Item
+    def get(self: ref[Self]) -> Self.Item
+
+struct Counter:
+    n: i64
+
+impl Source for Counter:
+    type Item = i64
+    def get(self: ref[Self]) -> i64:
+        return self.n
+
+def first[S: Source](s: ref[S]) -> S.Item:
+    return s.get()
+
+# A `mut self` bound method called on a `let mut` local of the parameter type
+# borrows the local `&mut` (#2787), so both calls mutate the same value.
+trait Bump:
+    def bump(mut self) -> i32
+
+struct Ticker:
+    n: i32
+
+impl Bump for Ticker:
+    def bump(mut self) -> i32:
+        self.n = self.n + 1
+        return self.n
+
+def bump_twice[T: Bump](t: T) -> i32:
+    let mut u: T = t
+    u.bump()
+    return u.bump()
+
+def main() -> i32:
+    println!("Trait Bounds Demo")
+    println!("=================")
+
+    # i32 is Eq + Hash -> KeyBox[i32, i32] is valid.
+    let kb: KeyBox[i32, i32] = KeyBox { key: 7, val: 42 }
+    println!("KeyBox[i32, i32] key = {kb.key}, val = {kb.val}")
+
+    # string is Eq + Hash -> KeyBox[string, i32] is valid.
+    let named: KeyBox[string, i32] = KeyBox { key: "answer", val: 42 }
+    println!("KeyBox[string, i32] val = {named.val}")
+
+    # i64 is Ord -> Ordered[i64] is valid.
+    let ord: Ordered[i64] = Ordered { key: 100 }
+    println!("Ordered[i64] key = {ord.key}")
+
+    # bool is Eq -> Tagged[bool, i32] is valid.
+    let tag: Tagged[bool, i32] = Tagged.Empty
+    println!("Tagged[bool, i32] created")
+
+    # Generic functions: bounds satisfied by the inferred argument types.
+    let hk: i32 = hash_key(9_i32)
+    println!("hash_key(9) = {hk}")
+
+    let m: i64 = pick_min(3, 5)
+    println!("pick_min(3, 5) = {m}")
+
+    let c: Counter = Counter { n: 7 }
+    let item: i64 = first(&c)
+    println!("first(Counter) = {item}")
+
+    let twice: i32 = bump_twice(Ticker { n: 1 })
+    assert!(twice == 3, "two bumps through the bound must accumulate")
+    println!("bump_twice(Ticker) = {twice}")
+
+    # The following lines would FAIL to compile with error AX070, because a
+    # floating-point type is not `Eq + Hash` (NaN breaks total equality):
+    #
+    #     let bad: KeyBox[f64, i32] = KeyBox { key: 1.0, val: 2 }
+    #     # error[AX070]: type `f64` does not satisfy bound `Eq` required by
+    #     #              type parameter `K` of `KeyBox`
+    #
+    #     let worse: i32 = hash_key(1.0)   # same AX070 error on `K`
+
+    println!("All trait bounds satisfied - demo complete!")
+    return 0

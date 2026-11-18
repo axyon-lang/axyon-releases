@@ -1,0 +1,19 @@
+# len(x) is Python-style sugar for x.len() / string_len(x); it returns usize.
+# Fixed-size Array arguments are rejected (the length is in the type).
+
+def main() -> i32:
+    let mut v: Vec[i64] = Vec.new()
+    v.push(10)
+    v.push(20)
+    v.push(30)
+    let n: usize = len(v)
+    let s: string = "hello"
+    let m: usize = len(s)
+    let mut t: usize = 0
+    for i: usize in range(len(v)):
+        t = t + 1
+    assert!(n == 3, "len(v) must be 3")
+    assert!(m == 5, "len(s) must be 5")
+    assert!(t == 3, "range(len(v)) must iterate 3 times")
+    println!("len(v)={n} len(s)={m} iterations={t}")
+    return 0

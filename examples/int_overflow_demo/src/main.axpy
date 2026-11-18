@@ -1,0 +1,51 @@
+# Overflow-controlled integer arithmetic (issue #183).
+#
+# `checked_*` returns an Option-like enum (variants `Some(T)` / `None_`); the
+# result needs an explicit type annotation.
+enum OptI32:
+    Some(value: i32)
+    None_
+
+def main() -> i32:
+    let max: i32 = 2147483647
+    let min: i32 = -2147483648
+
+    # wrapping_*: two's-complement wrap
+    assert!(max.wrapping_add(1) == min, "wrapping_add wraps at i32.MAX")
+
+    # saturating_*: clamp to MIN/MAX
+    assert!(max.saturating_add(1) == max, "saturating_add clamps at i32.MAX")
+    assert!(min.saturating_sub(1) == min, "saturating_sub clamps at i32.MIN")
+
+    # The result keeps the receiver's signedness: 200 must zero-extend.
+    let small: u8 = 200
+    let widened: u64 = (small.wrapping_add(0)) as u64
+    assert!(widened == 200, "u8 result zero-extends")
+
+    # wrapping_neg / overflowing_* / MIN / MAX (issue #188)
+    assert!(min.wrapping_neg() == min, "wrapping_neg(MIN) == MIN")
+    assert!(i32.MAX == max and i32.MIN == min, "bounds")
+    let (wrapped, overflowed): (i32, bool) = max.overflowing_add(1)
+    assert!(wrapped == min and overflowed, "overflowing_add reports overflow")
+
+    # checked_*: None_ on overflow
+    let over: OptI32 = max.checked_add(1)
+    match over:
+        case OptI32.Some(value=v):
+            return 1
+        case OptI32.None_:
+            println!("checked_add overflowed as expected")
+
+    let fine: OptI32 = max.checked_sub(1)
+    match fine:
+        case OptI32.Some(value=v):
+            println!("checked_sub = {v}")
+        case OptI32.None_:
+            return 2
+    let q: OptI32 = max.checked_div(0)
+    match q:
+        case OptI32.Some(value=v):
+            return 3
+        case OptI32.None_:
+            println!("checked_div by zero is None_")
+    return 0

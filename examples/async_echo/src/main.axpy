@@ -1,0 +1,134 @@
+# Async TCP echo on loopback with std.async_io (#214).
+#
+# One `block_on` drives a server (accept, echo two lines through the buffered
+# wrappers) and a client (connect, send, read the echo) concurrently. While a
+# socket operation would block, `block_on` parks in the I/O reactor until the
+# socket is ready instead of spinning.
+#
+# The two futures are joined by the hand-written `Both` future: a generic
+# `join` combinator is not available yet (#3008).
+
+from core.future import Future, Poll
+from core.task import Context
+from std.async_runtime import block_on
+from std.async_io import AsyncTcpStream, AsyncTcpListener, AsyncBufReader, AsyncBufWriter, AsyncWrite
+from std.net import SocketAddr
+from std.alloc import Vec
+
+def bytes_of(text: str) -> Vec[u8]:
+    let mut v: Vec[u8] = Vec.new()
+    let b: Slice[u8] = text.as_bytes()
+    for i: usize in range(b.len()):
+        v.push(b[i])
+    return v
+
+# Reads lines and writes each one back through a buffered writer, flushing
+# once the peer has finished sending.
+struct EchoLines:
+    r: AsyncBufReader[AsyncTcpStream]
+    w: AsyncBufWriter[AsyncTcpStream]
+    lines: i64
+    flushing: bool
+
+impl Future for EchoLines:
+    type Output = i64
+
+    def poll(mut self, cx: ref_mut[Context]) -> Poll[i64]:
+        while not self.flushing:
+            let mut n: usize = 0
+            match self.r.poll_next_line(cx):
+                case Poll.Pending:
+                    return Poll.Pending
+                case Poll.Ready(r):
+                    match r:
+                        case Ok(k):
+                            n = k
+                        case Err(e):
+                            return Poll.Ready(-1)
+            if n == 0:
+                self.flushing = True
+            else:
+                # A short line always fits the 4096-byte buffer: Ready at once.
+                match self.w.poll_write(cx, self.r.line()):
+                    case Poll.Pending:
+                        return Poll.Pending
+                    case Poll.Ready(w):
+                        pass
+                self.lines = self.lines + 1
+                self.r.clear_line()
+        match self.w.poll_flush(cx):
+            case Poll.Pending:
+                return Poll.Pending
+            case Poll.Ready(f):
+                return Poll.Ready(self.lines)
+
+async def server(l: AsyncTcpListener) -> i64:
+    let s: AsyncTcpStream = (await l.accept()).unwrap()
+    # Two copies of one handle: a read half and a write half.
+    let echo: EchoLines = EchoLines { r: AsyncBufReader.new(s), w: AsyncBufWriter.new(s), lines: 0, flushing: False }
+    let n: i64 = await echo
+    let _c = s.close()
+    return n
+
+async def client(port: u16) -> i64:
+    let s: AsyncTcpStream = (await AsyncTcpStream.connect(SocketAddr.new(127, 0, 0, 1, port))).unwrap()
+    let _sent: usize = (await s.write_all(bytes_of("hello\nasync world\n"))).unwrap()
+    # Half-close: the server sees end of stream after the two lines.
+    let _h = s.shutdown(1)
+    let mut total: i64 = 0
+    let mut done: bool = False
+    while not done:
+        let chunk: Vec[u8] = (await s.read(64)).unwrap()
+        if chunk.len() == 0:
+            done = True
+        total = total + (chunk.len() as i64)
+    let _c = s.close()
+    return total
+
+struct Both:
+    a: __Future_server
+    b: __Future_client
+    ra: i64
+    rb: i64
+    da: bool
+    db: bool
+
+impl Future for Both:
+    type Output = i64
+
+    def poll(mut self, cx: ref_mut[Context]) -> Poll[i64]:
+        if not self.da:
+            match self.a.poll(cx):
+                case Poll.Ready(v):
+                    self.ra = v
+                    self.da = True
+                case Poll.Pending:
+                    pass
+        if not self.db:
+            match self.b.poll(cx):
+                case Poll.Ready(v):
+                    self.rb = v
+                    self.db = True
+                case Poll.Pending:
+                    pass
+        if self.da and self.db:
+            return Poll.Ready(self.ra * 1000 + self.rb)
+        return Poll.Pending
+
+async def run(l: AsyncTcpListener, port: u16) -> i64:
+    let both: Both = Both { a: server(l), b: client(port), ra: 0, rb: 0, da: False, db: False }
+    let r: i64 = await both
+    return r
+
+def main() -> i32:
+    let l: AsyncTcpListener = AsyncTcpListener.bind(SocketAddr.new(127, 0, 0, 1, 0)).unwrap()
+    let port: u16 = l.local_addr().unwrap().port
+    let mut f = run(l, port)
+    let r: i64 = block_on(&mut f)
+    let _c = l.close()
+    let lines: i64 = r / 1000
+    let bytes: i64 = r % 1000
+    println!("echoed {lines} lines, {bytes} bytes")
+    if lines != 2 or bytes != 18:
+        return 1
+    return 0

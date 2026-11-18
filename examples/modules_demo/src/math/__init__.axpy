@@ -1,0 +1,12 @@
+# Math Package
+#
+# Contains vector operations and internal helpers.
+
+# Public submodule - can be imported from outside the math package
+@public from . import vector
+
+# Private submodule - only accessible within the math package
+from . import internal
+
+# Public submodule demonstrating `@public` on enums, traits, consts and aliases
+@public from . import kinds

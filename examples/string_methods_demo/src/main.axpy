@@ -1,0 +1,42 @@
+# String API demo (#894): construction, mutation, cloning and byte access.
+import axyon.debug as D
+
+def main() -> i32:
+    let mut out: String = String.new()
+    out.push_str("hi")
+    out.push(33)
+    let copy: string = out.clone()
+    let n: usize = copy.len()
+    let first: u8 = copy.as_bytes()[0]
+    if n != 3 or first != 104 or out.is_empty():
+        return 1
+    # Literal-backed growth (#894): lengths 4 and 5 straddle the first-growth capacity.
+    let mut four: string = "abcd"
+    four.push(33)
+    let mut five: string = "abcde"
+    five.push(33)
+    if four.len() != 5 or five.len() != 6 or four.as_bytes()[4] != 33 or five.as_bytes()[5] != 33:
+        return 2
+    # starts_with / ends_with (#2883): both spellings, empty and longer affixes.
+    let name: string = "bundle.partial"
+    let pre: string = "bundle"
+    let long: string = "bundle.partial.extra"
+    let empty: string = ""
+    if not (name.starts_with(pre) and name.ends_with(".partial")):
+        return 3
+    if not (string_starts_with(name, pre) and string_ends_with(name, "partial")):
+        return 4
+    if not (name.starts_with(empty) and name.ends_with(empty) and string_ends_with(name, name)):
+        return 5
+    if name.starts_with(long) or name.ends_with(long) or name.starts_with("x") or string_ends_with(name, pre):
+        return 6
+    # The named affix is only read: it is still usable and dropped once.
+    if pre.len() != 6 or not name.starts_with(pre):
+        return 7
+    # contains (#3365): both spellings, empty and longer needles.
+    if not (name.contains("dle.p") and string_contains(name, pre) and name.contains(empty)):
+        return 8
+    if name.contains(long) or string_contains(name, "xyz"):
+        return 9
+    D.println("string methods ok")
+    return 0

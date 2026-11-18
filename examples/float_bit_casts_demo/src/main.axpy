@@ -1,0 +1,29 @@
+# Scalar float bit casts demo (issue #2749)
+# `f32.from_bits(u32)` / `x.to_bits()` and the `f64` / `u64` pair reinterpret the
+# IEEE-754 bit pattern exactly (`arith.bitcast`): NaN payloads, signed zero and
+# subnormals survive the round trip.
+
+def main() -> i32:
+    # f32: 1.0 is 0x3f800000
+    let one: f32 = f32.from_bits(0x3f800000)
+    assert!(one == 1.0_f32, "f32.from_bits(1.0)")
+    assert!(one.to_bits() == 1065353216_u32, "f32 to_bits(1.0)")
+
+    # f64: 1.5 is 0x3ff8000000000000
+    let x: f64 = 1.5
+    assert!(x.to_bits() == 0x3ff8000000000000, "f64 to_bits(1.5)")
+    assert!(f64.from_bits(0x3ff8000000000000) == x, "f64.from_bits(1.5)")
+
+    # signed zero keeps its sign bit
+    let nz: f64 = f64.from_bits(0x8000000000000000)
+    assert!(nz == 0.0, "-0.0 == 0.0")
+    assert!(nz.to_bits() == 9223372036854775808_u64, "-0.0 bit pattern")
+
+    # a NaN payload round-trips exactly
+    let nan_bits: u32 = 2143289345
+    let nan: f32 = f32.from_bits(nan_bits)
+    assert!(nan != nan, "NaN != NaN")
+    assert!(nan.to_bits() == nan_bits, "NaN payload preserved")
+
+    println!("float bit casts demo ok")
+    return 0

@@ -1,0 +1,28 @@
+AXYON PROPRIETARY SOURCE NOTICE
+
+Copyright (c) 2026 Anyon Systems Inc. All rights reserved.
+
+The original AXYON compiler, tools, runtime, standard library, and other
+first-party materials in this repository are proprietary to Anyon Systems Inc.
+("Anyon"). This repository does not grant a public source-code license.
+Access to this repository does not, by itself, grant permission to use, copy,
+modify, disclose, distribute, sublicense, or create derivative works of those
+materials. Such activities require a separate written agreement with Anyon.
+Authorized employees and contractors act under their applicable agreements.
+
+Official distributions made available by Anyon are licensed, not sold, under
+the AXYON Binary License Agreement in LICENSE-BINARY or a separate written
+agreement with Anyon. The binary license does not grant access to, or rights
+to modify or distribute, the compiler source code. Its limited permissions
+for accompanying materials and application runtime code are stated there.
+
+Third-party materials remain the property of their respective owners and
+remain subject to their own licenses. This notice does not replace or restrict
+those licenses, including the Apache License 2.0 with LLVM Exceptions for
+applicable LLVM/MLIR components, or applicable NVIDIA, AMD, or Apple terms.
+Retain all required third-party copyright notices and license texts.
+
+No trademark rights or other intellectual property rights are granted except
+as expressly provided in an applicable written license. All rights not
+expressly granted are reserved. Nothing in this notice restricts rights that
+applicable law does not permit to be restricted.

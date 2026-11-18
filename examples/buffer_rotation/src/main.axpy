@@ -1,0 +1,61 @@
+# Buffer rotation through `mut self` and `&mut` (issue #2815).
+#
+# A low-storage time integrator keeps the current and next solution in two
+# `Vec[f64]` fields and swaps them every stage. `std.mem.swap` exchanges the
+# owning fields in place; `std.mem.replace` takes one out and leaves a fresh
+# value. Overwriting an owning field through `mut self` or `&mut`
+# (`self.log = Vec.new()`, `b.halo = recv`) drops the old buffer first.
+import std.mem as mem
+
+struct Block:
+    q: Vec[f64]       # current solution
+    qn: Vec[f64]      # next stage
+    halo: Vec[f64]    # last received halo
+    log: Vec[i64]
+
+impl Block:
+    def stage(mut self, dt: f64) -> None:
+        let n: usize = self.q.len()
+        for i: usize in range(n):
+            self.qn[i] = self.q[i] + dt * self.q[i]
+        mem.swap(&mut self.q, &mut self.qn)
+        self.log.push(n as i64)
+
+    def reset_log(mut self) -> None:
+        self.log = Vec.new()
+
+def exchange(b: &mut Block, recv: Vec[f64]) -> Vec[f64]:
+    # Hand back the previous halo buffer for reuse.
+    return mem.replace(&mut b.halo, recv)
+
+def install_halo(b: &mut Block, recv: Vec[f64]) -> None:
+    # The previous halo buffer is dropped before the store.
+    b.halo = recv
+
+def main() -> i32:
+    let mut b: Block = Block { q: Vec.new(), qn: Vec.new(), halo: Vec.new(), log: Vec.new() }
+    for i: usize in range(4):
+        b.q.push(1.0)
+        b.qn.push(0.0)
+    for step: i64 in range(3):
+        b.stage(0.5)
+    let q0: f64 = b.q[0]
+    assert!(q0 == 3.375, "three stages of q *= 1.5")
+    let stages: usize = b.log.len()
+    assert!(stages == 3, "one log entry per stage")
+    b.reset_log()
+    let cleared: usize = b.log.len()
+    assert!(cleared == 0, "the log was replaced")
+
+    let mut recv: Vec[f64] = Vec.new()
+    recv.push(2.0)
+    let old: Vec[f64] = exchange(&mut b, recv)
+    let old_len: usize = old.len()
+    assert!(old_len == 0, "the first halo was empty")
+    let mut next: Vec[f64] = Vec.new()
+    next.push(4.0)
+    install_halo(&mut b, next)
+    let h0: f64 = b.halo[0]
+    assert!(h0 == 4.0, "the new halo is installed")
+    println!("q0 = {q0} halo0 = {h0}")
+    return 0

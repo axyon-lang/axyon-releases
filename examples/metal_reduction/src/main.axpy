@@ -1,0 +1,461 @@
+# Workgroup reductions on an Apple GPU through Metal (issue #2067)
+#
+# Each reduction is two launches of one kernel, both on the GPU: pass 1
+# reduces each threadgroup of `bs` elements into `partials[group]`, pass 2
+# runs one threadgroup over the partials. The partials buffer is explicit
+# and bounded (one slot per threadgroup of pass 1). There is no host
+# reduction: the host only computes the reference it checks the device
+# result against.
+#
+# A collective (`gpu_workgroup_sum`/`_min`/`_max`) is called by every
+# thread of the threadgroup, at the top level of the kernel; tail threads
+# past `n` contribute the operation's identity: 0 for an integer sum, the
+# type's maximum (minimum) for an integer minimum (maximum), `-0.0` for an
+# f32 sum and NaN for an f32 minimum or maximum (a NaN operand yields the
+# other one, so the tail cannot change a minimum of `+inf`, a maximum of
+# `-inf` or an all-NaN result). Which thread order an f32 sum follows is the
+# kernel's `@schedule(reduction=..)` tier:
+#
+# - `strict` (the default): one left-to-right fold in thread order, every
+#   addition rounded to nearest-even with subnormals kept. The result is the
+#   host's sequential fold of the same values in the same order, bit for bit.
+# - `reassociate`: a pairwise tree within each 32-lane subgroup, then a
+#   fold of the subgroup results. The tree is fixed, so the result repeats
+#   from run to run for the same threadgroup size, but it rounds
+#   differently from the strict fold.
+#
+# Integer sums wrap (two's complement); integer and f32 min/max (the host's
+# `minimumNumber`/`maximumNumber`: `-0.0` below `+0.0`, a NaN yields the
+# other operand) do not depend on the order. Metal kernels index with 32-bit
+# integers, so `n` and the index are `u32`. The launches use a power-of-two
+# threadgroup (256) and an irregular one (100), so the last threadgroup of
+# a pass and every pass-2 threadgroup are partial.
+
+const CAP: i64 = 2051
+
+@gpu(entry)
+@schedule(subgroup=32, max_threads=256)
+def sum_i32(n: u32, x: &Buffer[i32, (2051,), device_global], out: &mut Buffer[i32, (2051,), device_global]) -> None:
+    let i: u32 = gpu_block_id(0) as u32 * gpu_block_dim(0) as u32 + gpu_thread_id(0) as u32
+    let mut v: i32 = 0
+    if i < n:
+        v = buffer_get(x, i)
+    let s: i32 = gpu_workgroup_sum(v)
+    if gpu_thread_id(0) as u32 == 0_u32:
+        buffer_set(out, gpu_block_id(0) as u32, s)
+
+@gpu(entry)
+@schedule(subgroup=32, max_threads=256)
+def min_i32(n: u32, x: &Buffer[i32, (2051,), device_global], out: &mut Buffer[i32, (2051,), device_global]) -> None:
+    let i: u32 = gpu_block_id(0) as u32 * gpu_block_dim(0) as u32 + gpu_thread_id(0) as u32
+    let mut v: i32 = 2147483647
+    if i < n:
+        v = buffer_get(x, i)
+    let s: i32 = gpu_workgroup_min(v)
+    if gpu_thread_id(0) as u32 == 0_u32:
+        buffer_set(out, gpu_block_id(0) as u32, s)
+
+@gpu(entry)
+@schedule(subgroup=32, max_threads=256)
+def max_u32(n: u32, x: &Buffer[u32, (2051,), device_global], out: &mut Buffer[u32, (2051,), device_global]) -> None:
+    let i: u32 = gpu_block_id(0) as u32 * gpu_block_dim(0) as u32 + gpu_thread_id(0) as u32
+    let mut v: u32 = 0_u32
+    if i < n:
+        v = buffer_get(x, i)
+    let s: u32 = gpu_workgroup_max(v)
+    if gpu_thread_id(0) as u32 == 0_u32:
+        buffer_set(out, gpu_block_id(0) as u32, s)
+
+@gpu(entry)
+@schedule(subgroup=32, max_threads=256, reduction="strict")
+def sum_f32(n: u32, x: &Buffer[f32, (2051,), device_global], out: &mut Buffer[f32, (2051,), device_global]) -> None:
+    let i: u32 = gpu_block_id(0) as u32 * gpu_block_dim(0) as u32 + gpu_thread_id(0) as u32
+    let mut v: f32 = -0.0
+    if i < n:
+        v = buffer_get(x, i)
+    let s: f32 = gpu_workgroup_sum(v)
+    if gpu_thread_id(0) as u32 == 0_u32:
+        buffer_set(out, gpu_block_id(0) as u32, s)
+
+@gpu(entry)
+@schedule(subgroup=32, max_threads=256, reduction="reassociate")
+def sum_f32_tree(n: u32, x: &Buffer[f32, (2051,), device_global], out: &mut Buffer[f32, (2051,), device_global]) -> None:
+    let i: u32 = gpu_block_id(0) as u32 * gpu_block_dim(0) as u32 + gpu_thread_id(0) as u32
+    let mut v: f32 = -0.0
+    if i < n:
+        v = buffer_get(x, i)
+    let s: f32 = gpu_workgroup_sum(v)
+    if gpu_thread_id(0) as u32 == 0_u32:
+        buffer_set(out, gpu_block_id(0) as u32, s)
+
+@gpu(entry)
+@schedule(subgroup=32, max_threads=256)
+def max_f32(n: u32, pad: f32, x: &Buffer[f32, (2051,), device_global], out: &mut Buffer[f32, (2051,), device_global]) -> None:
+    let i: u32 = gpu_block_id(0) as u32 * gpu_block_dim(0) as u32 + gpu_thread_id(0) as u32
+    let mut v: f32 = pad
+    if i < n:
+        v = buffer_get(x, i)
+    let s: f32 = gpu_workgroup_max(v)
+    if gpu_thread_id(0) as u32 == 0_u32:
+        buffer_set(out, gpu_block_id(0) as u32, s)
+
+@gpu(entry)
+@schedule(subgroup=32, max_threads=256)
+def min_f32(n: u32, pad: f32, x: &Buffer[f32, (2051,), device_global], out: &mut Buffer[f32, (2051,), device_global]) -> None:
+    let i: u32 = gpu_block_id(0) as u32 * gpu_block_dim(0) as u32 + gpu_thread_id(0) as u32
+    let mut v: f32 = pad
+    if i < n:
+        v = buffer_get(x, i)
+    let s: f32 = gpu_workgroup_min(v)
+    if gpu_thread_id(0) as u32 == 0_u32:
+        buffer_set(out, gpu_block_id(0) as u32, s)
+
+def next_seed(s: i64) -> i64:
+    return (s * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+
+def blocks_for(n: i64, bs: i64) -> i64:
+    return (n + bs - 1) / bs
+
+def zeros_i32() -> Buffer[i32, (2051,)]:
+    let mut z: Buffer[i32, (2051,)] = buffer_alloc([2051])
+    for i: i64 in range(CAP):
+        buffer_set(z, i, 0)
+    return z
+
+def zeros_u32() -> Buffer[u32, (2051,)]:
+    let mut z: Buffer[u32, (2051,)] = buffer_alloc([2051])
+    for i: i64 in range(CAP):
+        buffer_set(z, i, 0_u32)
+    return z
+
+def zeros_f32() -> Buffer[f32, (2051,)]:
+    let mut z: Buffer[f32, (2051,)] = buffer_alloc([2051])
+    for i: i64 in range(CAP):
+        buffer_set(z, i, 0.0)
+    return z
+
+# The host reference of the strict f32 sum: per threadgroup of `bs` lanes a
+# left-to-right fold that starts from lane 0 (tail lanes add `-0.0`), then
+# the left-to-right fold of the group results (pass 2 has one group whose
+# tail lanes add `-0.0` as well).
+def strict_sum_f32(x: Buffer[f32, (2051,)], n: i64, bs: i64) -> f32:
+    let nb: i64 = blocks_for(n, bs)
+    let mut total: f32 = -0.0
+    for b: i64 in range(nb):
+        let mut acc: f32 = buffer_get(x, b * bs)
+        for j: i64 in range(1, bs):
+            let k: i64 = b * bs + j
+            let mut v: f32 = -0.0
+            if k < n:
+                v = buffer_get(x, k)
+            acc = acc + v
+        if b == 0:
+            total = acc
+        else:
+            total = total + acc
+    return total
+
+# The documented `reassociate` order for one group of `lanes` slots: a
+# pairwise tree within each 32-lane subgroup (strides 16, 8, 4, 2, 1; a lane
+# combines only a partner the group has), then a left-to-right fold of the
+# subgroup results.
+def tree_block(s: Buffer[f32, (256,)], lanes: i64) -> f32:
+    let mut t: Buffer[f32, (256,)] = s
+    let mut stride: i64 = 16
+    while stride >= 1:
+        for lane: i64 in range(lanes):
+            if lane % 32 < stride and lane + stride < lanes:
+                buffer_set(t, lane, buffer_get(t, lane) + buffer_get(t, lane + stride))
+        stride = stride / 2
+    let mut acc: f32 = buffer_get(t, 0)
+    let mut g: i64 = 32
+    while g < lanes:
+        acc = acc + buffer_get(t, g)
+        g = g + 32
+    return acc
+
+# The host reference of the reassociating f32 sum: the tree per group, then
+# the tree over the group results (one group of `bs` lanes, tail `-0.0`).
+def tree_sum_f32(x: Buffer[f32, (2051,)], n: i64, bs: i64) -> f32:
+    let nb: i64 = blocks_for(n, bs)
+    let mut partial: Buffer[f32, (256,)] = buffer_alloc([256])
+    for b: i64 in range(256):
+        buffer_set(partial, b, -0.0)
+    for b: i64 in range(nb):
+        let mut slots: Buffer[f32, (256,)] = buffer_alloc([256])
+        for j: i64 in range(256):
+            buffer_set(slots, j, -0.0)
+        for j: i64 in range(bs):
+            let k: i64 = b * bs + j
+            if k < n:
+                buffer_set(slots, j, buffer_get(x, k))
+        buffer_set(partial, b, tree_block(slots, bs))
+    return tree_block(partial, bs)
+
+# Integer sum, min and max, two passes each, for length `n` and group size
+# `bs`; returns the mismatches.
+def check_ints(n: i64, bs: i64, seed: i64) -> i64:
+    let mut s: i64 = seed
+    let mut x32: Buffer[i32, (2051,)] = buffer_alloc([2051])
+    let mut xu: Buffer[u32, (2051,)] = buffer_alloc([2051])
+    let mut want_sum: i32 = 0
+    let mut want_min: i32 = 2147483647
+    let mut want_max: u32 = 0_u32
+    for i: i64 in range(CAP):
+        s = next_seed(s)
+        # Large values: the i32 sum wraps many times.
+        buffer_set(x32, i, (s >> 16) as i32)
+        buffer_set(xu, i, (s >> 7) as u32)
+        if i < n:
+            want_sum = want_sum.wrapping_add(buffer_get(x32, i))
+            if buffer_get(x32, i) < want_min:
+                want_min = buffer_get(x32, i)
+            if buffer_get(xu, i) > want_max:
+                want_max = buffer_get(xu, i)
+    let dx32: Buffer[i32, (2051,), device_global] = buffer_to_device(x32)
+    let dxu: Buffer[u32, (2051,), device_global] = buffer_to_device(xu)
+    let mut ps: Buffer[i32, (2051,), device_global] = buffer_to_device(zeros_i32())
+    let mut pm: Buffer[i32, (2051,), device_global] = buffer_to_device(zeros_i32())
+    let mut pu: Buffer[u32, (2051,), device_global] = buffer_to_device(zeros_u32())
+    let mut rs: Buffer[i32, (2051,), device_global] = buffer_to_device(zeros_i32())
+    let mut rm: Buffer[i32, (2051,), device_global] = buffer_to_device(zeros_i32())
+    let mut ru: Buffer[u32, (2051,), device_global] = buffer_to_device(zeros_u32())
+    let nb: i64 = blocks_for(n, bs)
+    gpu_launch(sum_i32, nb, bs, n as u32, &dx32, &mut ps)
+    gpu_launch(sum_i32, 1, bs, nb as u32, &ps, &mut rs)
+    gpu_launch(min_i32, nb, bs, n as u32, &dx32, &mut pm)
+    gpu_launch(min_i32, 1, bs, nb as u32, &pm, &mut rm)
+    gpu_launch(max_u32, nb, bs, n as u32, &dxu, &mut pu)
+    gpu_launch(max_u32, 1, bs, nb as u32, &pu, &mut ru)
+    let hs: Buffer[i32, (2051,)] = buffer_to_host(rs)
+    let hm: Buffer[i32, (2051,)] = buffer_to_host(rm)
+    let hu: Buffer[u32, (2051,)] = buffer_to_host(ru)
+    let mut bad: i64 = 0
+    if buffer_get(hs, 0) != want_sum:
+        println!("n = {n}, bs = {bs}: i32 sum mismatch")
+        bad = bad + 1
+    if buffer_get(hm, 0) != want_min:
+        println!("n = {n}, bs = {bs}: i32 min mismatch")
+        bad = bad + 1
+    if buffer_get(hu, 0) != want_max:
+        println!("n = {n}, bs = {bs}: u32 max mismatch")
+        bad = bad + 1
+    return bad
+
+# One f32 sum of the first `n` values of `x`, both passes on the device:
+# the strict kernel or the reassociating one.
+def device_sum_f32(strict: bool, x: Buffer[f32, (2051,)], n: i64, bs: i64) -> f32:
+    let dx: Buffer[f32, (2051,), device_global] = buffer_to_device(x)
+    let mut p: Buffer[f32, (2051,), device_global] = buffer_to_device(zeros_f32())
+    let mut r: Buffer[f32, (2051,), device_global] = buffer_to_device(zeros_f32())
+    let nb: i64 = blocks_for(n, bs)
+    if strict:
+        gpu_launch(sum_f32, nb, bs, n as u32, &dx, &mut p)
+        gpu_launch(sum_f32, 1, bs, nb as u32, &p, &mut r)
+    else:
+        gpu_launch(sum_f32_tree, nb, bs, n as u32, &dx, &mut p)
+        gpu_launch(sum_f32_tree, 1, bs, nb as u32, &p, &mut r)
+    let h: Buffer[f32, (2051,)] = buffer_to_host(r)
+    return buffer_get(h, 0)
+
+# Tail lanes pass NaN, the identity of the §5.3a minimum and maximum.
+def device_max_f32(x: Buffer[f32, (2051,)], n: i64, bs: i64) -> f32:
+    let pad: f32 = 0.0 / 0.0
+    let dx: Buffer[f32, (2051,), device_global] = buffer_to_device(x)
+    let mut p: Buffer[f32, (2051,), device_global] = buffer_to_device(zeros_f32())
+    let mut r: Buffer[f32, (2051,), device_global] = buffer_to_device(zeros_f32())
+    let nb: i64 = blocks_for(n, bs)
+    gpu_launch(max_f32, nb, bs, n as u32, pad, &dx, &mut p)
+    gpu_launch(max_f32, 1, bs, nb as u32, pad, &p, &mut r)
+    let h: Buffer[f32, (2051,)] = buffer_to_host(r)
+    return buffer_get(h, 0)
+
+def device_min_f32(x: Buffer[f32, (2051,)], n: i64, bs: i64) -> f32:
+    let pad: f32 = 0.0 / 0.0
+    let dx: Buffer[f32, (2051,), device_global] = buffer_to_device(x)
+    let mut p: Buffer[f32, (2051,), device_global] = buffer_to_device(zeros_f32())
+    let mut r: Buffer[f32, (2051,), device_global] = buffer_to_device(zeros_f32())
+    let nb: i64 = blocks_for(n, bs)
+    gpu_launch(min_f32, nb, bs, n as u32, pad, &dx, &mut p)
+    gpu_launch(min_f32, 1, bs, nb as u32, pad, &p, &mut r)
+    let h: Buffer[f32, (2051,)] = buffer_to_host(r)
+    return buffer_get(h, 0)
+
+# Whether `a` and `b` are the same f32 value: both NaN, or equal with the
+# same sign of zero (`1 / -0.0` is `-inf`).
+def same_f32(a: f32, b: f32) -> bool:
+    if a != a:
+        return b != b
+    if a != b:
+        return False
+    if a == 0.0:
+        return (1.0 / a) == (1.0 / b)
+    return True
+
+# Values of mixed magnitude from a fixed seed, so that the summation order
+# changes the rounded result; every 10th value is a large one that a later
+# one cancels.
+def values_f32(seed: i64) -> Buffer[f32, (2051,)]:
+    let mut s: i64 = seed
+    let mut x: Buffer[f32, (2051,)] = buffer_alloc([2051])
+    for i: i64 in range(CAP):
+        s = next_seed(s)
+        let mut v: f32 = (((s >> 20) & 1048575) - 524288) as f32 / 7.0
+        if i % 10 == 3:
+            v = 16777216.0
+        if i % 10 == 8:
+            v = -16777216.0
+        buffer_set(x, i, v)
+    return x
+
+# f32 sums (strict and reassociating), max and min, for length `n`.
+def check_floats(n: i64, bs: i64, seed: i64) -> i64:
+    let ref: Buffer[f32, (2051,)] = values_f32(seed)
+    let mut want_max: f32 = -1.0 / 0.0
+    let mut want_min: f32 = 1.0 / 0.0
+    for i: i64 in range(n):
+        if buffer_get(ref, i) > want_max:
+            want_max = buffer_get(ref, i)
+        if buffer_get(ref, i) < want_min:
+            want_min = buffer_get(ref, i)
+    let want: f32 = strict_sum_f32(ref, n, bs)
+    let mut bad: i64 = 0
+    let got: f32 = device_sum_f32(True, values_f32(seed), n, bs)
+    if not same_f32(got, want):
+        println!("n = {n}, bs = {bs}: strict f32 sum {got}, host fold {want}")
+        bad = bad + 1
+    # The reassociating tree repeats exactly and is the documented tree.
+    let t1: f32 = device_sum_f32(False, values_f32(seed), n, bs)
+    let t2: f32 = device_sum_f32(False, values_f32(seed), n, bs)
+    if not same_f32(t1, t2):
+        println!("n = {n}, bs = {bs}: reassociating f32 sum not repeatable: {t1} then {t2}")
+        bad = bad + 1
+    let tree: f32 = tree_sum_f32(values_f32(seed), n, bs)
+    if not same_f32(t1, tree):
+        println!("n = {n}, bs = {bs}: reassociating f32 sum {t1}, host tree {tree}")
+        bad = bad + 1
+    if n > 0:
+        let m: f32 = device_max_f32(values_f32(seed), n, bs)
+        if not same_f32(m, want_max):
+            println!("n = {n}, bs = {bs}: f32 max {m}, host {want_max}")
+            bad = bad + 1
+        let lo: f32 = device_min_f32(values_f32(seed), n, bs)
+        if not same_f32(lo, want_min):
+            println!("n = {n}, bs = {bs}: f32 min {lo}, host {want_min}")
+            bad = bad + 1
+    return bad
+
+# `-0.0` everywhere, then `v` at `at` and `w` at `at2` (`at < 0`: none).
+def special_f32(at: i64, v: f32, at2: i64, w: f32) -> Buffer[f32, (2051,)]:
+    let mut a: Buffer[f32, (2051,)] = buffer_alloc([2051])
+    for i: i64 in range(CAP):
+        buffer_set(a, i, -0.0)
+    if at >= 0:
+        buffer_set(a, at, v)
+    if at2 >= 0:
+        buffer_set(a, at2, w)
+    return a
+
+# `v` in every element.
+def filled_f32(v: f32) -> Buffer[f32, (2051,)]:
+    let mut a: Buffer[f32, (2051,)] = buffer_alloc([2051])
+    for i: i64 in range(CAP):
+        buffer_set(a, i, v)
+    return a
+
+# Special values. A NaN anywhere makes the sum NaN, but min and max ignore
+# it (an all-NaN min or max is NaN); over a partial group, a min of `+inf`
+# values is `+inf` and a max of `-inf` values is `-inf`; the strict sum of
+# `-0.0` values is `-0.0`; the max of `-0.0` and `+0.0` is `+0.0` and their
+# min `-0.0`; infinities of both signs sum to NaN; subnormals are kept, not
+# flushed; and the strict cancellation case `[1e20, 1, -1e20, 1]` is `1.0`
+# (a pairwise tree gives `0.0`).
+def check_special(bs: i64) -> i64:
+    let nan: f32 = 0.0 / 0.0
+    let inf: f32 = 1.0 / 0.0
+    let neg_zero: f32 = -0.0
+    let pos_zero: f32 = 0.0
+    let mut bad: i64 = 0
+    if not same_f32(device_sum_f32(True, special_f32(-1, 0.0, -1, 0.0), 1000, bs), neg_zero):
+        println!("bs = {bs}: strict sum of -0.0 is not -0.0")
+        bad = bad + 1
+    if not same_f32(device_sum_f32(False, special_f32(-1, 0.0, -1, 0.0), 1000, bs), neg_zero):
+        println!("bs = {bs}: reassociating sum of -0.0 is not -0.0")
+        bad = bad + 1
+    if not same_f32(device_max_f32(special_f32(-1, 0.0, -1, 0.0), 1000, bs), neg_zero):
+        println!("bs = {bs}: max of -0.0 is not -0.0")
+        bad = bad + 1
+    if not same_f32(device_max_f32(special_f32(700, pos_zero, -1, 0.0), 1000, bs), pos_zero):
+        println!("bs = {bs}: max of -0.0 and +0.0 is not +0.0")
+        bad = bad + 1
+    if not same_f32(device_min_f32(filled_f32(pos_zero), 1000, bs), pos_zero):
+        println!("bs = {bs}: min of +0.0 is not +0.0")
+        bad = bad + 1
+    if not same_f32(device_min_f32(special_f32(-1, 0.0, -1, 0.0), 1000, bs), neg_zero):
+        println!("bs = {bs}: min of -0.0 is not -0.0")
+        bad = bad + 1
+    if not same_f32(device_sum_f32(True, special_f32(300, nan, -1, 0.0), 1000, bs), nan):
+        println!("bs = {bs}: sum with a NaN is not NaN")
+        bad = bad + 1
+    if not same_f32(device_max_f32(special_f32(300, nan, 301, 2.5), 1000, bs), 2.5):
+        println!("bs = {bs}: max does not ignore a NaN")
+        bad = bad + 1
+    if not same_f32(device_max_f32(filled_f32(nan), 1000, bs), nan):
+        println!("bs = {bs}: max of NaN values is not NaN")
+        bad = bad + 1
+    if not same_f32(device_min_f32(filled_f32(nan), 1000, bs), nan):
+        println!("bs = {bs}: min of NaN values is not NaN")
+        bad = bad + 1
+    if not same_f32(device_min_f32(special_f32(300, nan, 301, -2.5), 1000, bs), -2.5):
+        println!("bs = {bs}: min does not ignore a NaN")
+        bad = bad + 1
+    if not same_f32(device_min_f32(filled_f32(inf), 1000, bs), inf):
+        println!("bs = {bs}: min of +inf values is not +inf")
+        bad = bad + 1
+    if not same_f32(device_max_f32(filled_f32(-inf), 1000, bs), -inf):
+        println!("bs = {bs}: max of -inf values is not -inf")
+        bad = bad + 1
+    if not same_f32(device_sum_f32(True, special_f32(5, inf, 1500, -inf), 2051, bs), nan):
+        println!("bs = {bs}: inf + -inf is not NaN")
+        bad = bad + 1
+    if not same_f32(device_sum_f32(False, special_f32(5, inf, 1500, -inf), 2051, bs), nan):
+        println!("bs = {bs}: reassociating inf + -inf is not NaN")
+        bad = bad + 1
+    # Subnormals: 1000 copies of the smallest subnormal sum exactly.
+    let tiny: f32 = 1.0e-45
+    let sub: f32 = device_sum_f32(True, filled_f32(tiny), 1000, bs)
+    if not same_f32(sub, strict_sum_f32(filled_f32(tiny), 1000, bs)) or sub == 0.0:
+        println!("bs = {bs}: strict sum of subnormals {sub} was flushed or misrounded")
+        bad = bad + 1
+    # Adversarial cancellation in one group: strict is exactly 1.0.
+    let mut c: Buffer[f32, (2051,)] = filled_f32(-0.0)
+    buffer_set(c, 0, 1.0e20)
+    buffer_set(c, 1, 1.0)
+    buffer_set(c, 2, -1.0e20)
+    buffer_set(c, 3, 1.0)
+    let cs: f32 = device_sum_f32(True, c, 4, bs)
+    if not same_f32(cs, 1.0):
+        println!("bs = {bs}: strict sum of [1e20, 1, -1e20, 1] is {cs}, not 1.0")
+        bad = bad + 1
+    return bad
+
+def main() -> i32:
+    # Empty, one, subgroup boundaries (31, 32, 33), group boundaries (99,
+    # 100, 101, 255, 256, 257), a multi-group tail (1000) and the whole
+    # irregular capacity, under a 256-lane and a 100-lane threadgroup.
+    let lengths: Array[i64; 13] = [0, 1, 31, 32, 33, 99, 100, 101, 255, 256, 257, 1000, 2051]
+    let sizes: Array[i64; 2] = [256, 100]
+    let mut total: i64 = 0
+    for z: i64 in range(2):
+        let bs: i64 = sizes[z]
+        for k: i64 in range(13):
+            let n: i64 = lengths[k]
+            let bad: i64 = check_ints(n, bs, 2067 + k) + check_floats(n, bs, 4134 + k)
+            if bad != 0:
+                println!("n = {n}, bs = {bs}: {bad} mismatches")
+            total = total + bad
+        total = total + check_special(bs)
+    if total != 0:
+        return 1
+    println!("metal workgroup reductions: all lengths, group sizes and special values match the host reference")
+    return 0

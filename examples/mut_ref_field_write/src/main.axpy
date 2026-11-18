@@ -1,0 +1,131 @@
+# Field writes through a `&mut Struct` parameter (issue #640).
+# Run the regression with: axyon test
+
+struct P:
+    x: f64
+    y: f64
+
+struct W:
+    p: P
+    n: i64
+
+def step(s: &mut P) -> None:
+    s.x = s.x + 1.0
+
+def nest(w: &mut W) -> None:
+    w.p.y = 2.0
+    w.n = 7
+
+def bump(w: &mut W) -> None:
+    w.p.y = w.p.y + 1.0
+    w.n = w.n + 1
+
+@test
+def test_direct_write_updates_caller() -> i32:
+    let mut p: P = P { x: 1.0, y: 0.0 }
+    step(&mut p)
+    assert!(p.x == 2.0, "direct field write must reach the caller")
+    return 0
+
+@test
+def test_nested_write_updates_caller() -> i32:
+    let inner: P = P { x: 1.0, y: 0.0 }
+    let mut w: W = W { p: inner, n: 0 }
+    nest(&mut w)
+    assert!(w.p.y == 2.0, "nested field write must reach the caller")
+    assert!(w.p.x == 1.0, "sibling field must be untouched")
+    assert!(w.n == 7, "outer field write must reach the caller")
+    return 0
+
+@test
+def test_nested_read_modify_write() -> i32:
+    let inner: P = P { x: 1.0, y: 2.0 }
+    let mut w: W = W { p: inner, n: 4 }
+    bump(&mut w)
+    assert!(w.p.y == 3.0, "nested read-modify-write must reach the caller")
+    assert!(w.n == 5, "outer read-modify-write must reach the caller")
+    return 0
+
+@test
+def test_borrowed_field_write_updates_caller() -> i32:
+    let inner: P = P { x: 1.0, y: 0.0 }
+    let mut w: W = W { p: inner, n: 0 }
+    step(&mut w.p)
+    assert!(w.p.x == 2.0, "&mut field borrow must alias the caller's field")
+    return 0
+
+struct Pair:
+    a: i32
+    b: i32
+
+def set_a(s: &mut Pair) -> None:
+    let slot: &mut i32 = &mut s.a
+    *slot = 1
+
+@test
+def test_deref_store_preserves_sibling_field() -> i32:
+    let mut pr: Pair = Pair { a: 0, b: 7 }
+    set_a(&mut pr)
+    assert!(pr.a == 1, "store through the field borrow must reach the field")
+    assert!(pr.b == 7, "a 4-byte field store must not clobber its sibling")
+    return 0
+
+struct Counter:
+    counts: Vec[i64]
+    total: i64
+
+# Index write into a `Vec` field through `&mut` (bounds-checked).
+def tally(c: &mut Counter, i: usize) -> None:
+    c.counts[i] = c.counts[i] + 1
+    c.total = c.total + 1
+
+# `push` on a `Vec` field through `&mut`: the grown header reaches the caller.
+def grow(c: &mut Counter) -> None:
+    c.counts.push(0)
+
+# The `&mut` parameter is handed on to further helpers (a reborrow each time).
+def fill(c: &mut Counter) -> None:
+    grow(c)
+    grow(c)
+    tally(c, 1)
+    tally(c, 1)
+
+@test
+def test_index_write_and_push_through_mut_ref() -> i32:
+    let mut c: Counter = Counter { counts: Vec.new(), total: 0 }
+    fill(&mut c)
+    let n: usize = c.counts.len()
+    assert!(n == 2, "push through &mut must reach the caller's Vec")
+    let first: i64 = c.counts[0]
+    let second: i64 = c.counts[1]
+    assert!(first == 0, "untouched element")
+    assert!(second == 2, "index write through &mut must reach the caller's Vec")
+    assert!(c.total == 2, "scalar field write through &mut")
+    return 0
+
+# Reborrows through a `&mut` binding (#1054): `&mut *r` and `&*r` are the
+# Rust spellings of `ref_mut(*r)` and `ref(*r)`.
+def read_total(c: &Counter) -> i64:
+    return c.total
+
+def bump_twice(c: &mut Counter) -> None:
+    tally(&mut *c, 0)
+    let seen: i64 = read_total(&*c)
+    assert!(seen == 1, "shared reborrow sees the write made through the &mut one")
+    tally(&mut *c, 1)
+
+@test
+def test_rust_reborrow_spellings() -> i32:
+    let mut c: Counter = Counter { counts: Vec.new(), total: 0 }
+    c.counts.push(0)
+    c.counts.push(0)
+    bump_twice(&mut c)
+    assert!(c.total == 2, "both &mut *c reborrows must write through to c")
+    assert!(c.counts[0] == 1, "first element written via &mut *c")
+    return 0
+
+def main() -> i32:
+    let mut p: P = P { x: 1.0, y: 0.0 }
+    step(&mut p)
+    println!("x = {p.x}")
+    return 0

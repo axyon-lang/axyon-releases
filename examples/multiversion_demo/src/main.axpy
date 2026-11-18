@@ -1,0 +1,40 @@
+# Per-ISA function multiversioning (issue #1707).
+#
+# `@multiversion(targets=[...])` compiles `saxpy` once per listed x86-64
+# microarchitecture level (plus a baseline fallback) and replaces the function
+# with a dispatcher that picks the best clone the running CPU supports. The
+# binary is built for baseline x86-64 and still uses AVX2/AVX-512 where
+# available. Callers just call `saxpy`.
+#
+# Run with `AXYON_CPU_LEVEL_MAX=1` (or 2, 3) to force a lower clone: every
+# clone must print the same numbers.
+
+@multiversion(targets=["x86-64-v2", "x86-64-v3", "x86-64-v4"])
+def saxpy(a: f32, xs: ref[Vec[f32]], ys: ref_mut[Vec[f32]]) -> None:
+    for i: i64 in range(xs.len() as i64):
+        ys[i as usize] = a * xs[i as usize] + ys[i as usize]
+
+@multiversion(targets=["x86-64-v3"])
+def dot(xs: ref[Vec[f32]], ys: ref[Vec[f32]]) -> f32:
+    let mut acc: f32 = 0.0
+    for i: i64 in range(xs.len() as i64):
+        acc = acc + xs[i as usize] * ys[i as usize]
+    return acc
+
+def main() -> i32:
+    let n: i64 = 37
+    let mut xs: Vec[f32] = Vec.new()
+    let mut ys: Vec[f32] = Vec.new()
+    for i: i64 in range(n):
+        xs.push((i as f32) * 0.37)
+        ys.push(1.0 / ((i as f32) + 1.0))
+    saxpy(2.5, &xs, &mut ys)
+    let d: f32 = dot(&xs, &ys)
+    let mut sum: f32 = 0.0
+    for i: i64 in range(n):
+        sum = sum + ys[i as usize]
+    println!("ys[0] = {ys[0]}")
+    println!("ys[36] = {ys[36]}")
+    println!("sum = {sum}")
+    println!("dot = {d}")
+    return 0

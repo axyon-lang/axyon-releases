@@ -1,0 +1,17 @@
+[package]
+name = "cuda_bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[build]
+opt_level = 0
+debug = true
+
+# The reproducible NVIDIA benchmark suite (#2112). Device tuning is left at
+# its defaults (`gpu-opt-level = 2`, `gpu-math = "strict"`); the driver
+# `benches/cuda_gpu/run_cuda_bench.py` passes `--gpu-opt-level` explicitly
+# so every recorded configuration states its device settings.
+[target]
+gpu = ["nvptx-sm80"]
