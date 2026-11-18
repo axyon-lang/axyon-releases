@@ -1,4 +1,13 @@
-# AXYON releases
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/anyon-logo-white.svg">
+    <img alt="Anyon Systems" src="assets/anyon-logo.svg" width="320">
+  </picture>
+</p>
+
+# ▼ AXYON™ releases
+
+**AXYON™: Built for the Next Era of Computing.**
 
 Binary releases, the installer, user documentation and examples for the
 AXYON programming language: Python-like syntax, Rust-like safety, compiled
@@ -19,6 +28,8 @@ Each archive is self-contained: the compiler, the language server, the
 prebuilt standard library and the LLVM/MLIR tools the compiler drives.
 
 ## Install
+
+> **No release has been published yet.** The first release is in preparation; until then the install command below has nothing to download.
 
 The installer detects your platform, downloads the matching archive,
 verifies the release signature and the checksum, and installs into
@@ -83,3 +94,5 @@ The terms of use for the binaries are in [LICENSE-BINARY](LICENSE-BINARY);
 proprietary and not published. Third-party components and their notices are in
 [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES) and [LICENSES/](LICENSES/), which
 every archive also carries under `share/axyon/licenses/`.
+
+AXYON is a trademark of Anyon Systems Inc.

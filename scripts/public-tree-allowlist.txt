@@ -20,6 +20,9 @@
 
 [tree]
 + README.md
+# Anyon Systems logo (light and dark-theme variants) shown in README.md.
++ assets/anyon-logo.svg
++ assets/anyon-logo-white.svg
 # Terms and notices from copy-licenses.sh.
 + LICENSE
 + LICENSE-BINARY

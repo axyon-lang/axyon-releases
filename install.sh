@@ -301,6 +301,7 @@ gh_release_json() {
 # fetch_asset NAME DEST: one release asset, from the download URLs or the API.
 fetch_asset() {
     if [ "$SOURCE" != github-private ]; then fetch "$url_dir/$1" "$2"; return; fi
+    # shellcheck disable=SC2020 # '\n\n\n' deliberately maps each of '{', '}' and ',' to a newline
     api_url="$(tr '{},' '\n\n\n' <"$TMP/release.json" | awk -v want="$1" '
         /"url" *: *"[^"]*\/releases\/assets\/[0-9]+" *$/ { u = $0; sub(/^.*"url" *: *"/, "", u); sub(/" *$/, "", u); next }
         /^ *"name" *: *"/ { n = $0; sub(/^ *"name" *: *"/, "", n); sub(/" *$/, "", n)
@@ -430,8 +431,10 @@ install_release() {
     rm -rf "$stage"; mkdir "$stage"
     tar -xzf "$TMP/$archive" -C "$stage" || die "extraction failed"
     new="$stage/$top"
-    grep -qx "version=$rel_version" "$new/RELEASE" 2>/dev/null && grep -qx "triple=$TARGET" "$new/RELEASE" \
-        || die "archive RELEASE metadata does not match $rel_version/$TARGET"
+    if ! { grep -qx "version=$rel_version" "$new/RELEASE" 2>/dev/null \
+        && grep -qx "triple=$TARGET" "$new/RELEASE" 2>/dev/null; }; then
+        die "archive RELEASE metadata does not match $rel_version/$TARGET"
+    fi
     [ -x "$new/bin/axyon" ] || die "archive has no bin/axyon"
 
     # Refuse to clobber a file in <prefix>/bin that this installer did not write.
@@ -480,6 +483,7 @@ install_release() {
         *":$PREFIX/bin:"*) say "run: axyon --version" ;;
         *)
             say "add $PREFIX/bin to your PATH, e.g. in ~/.profile, ~/.bashrc or ~/.zshrc:"
+            # shellcheck disable=SC2016 # the literal $PATH is what the user should paste
             printf '    export PATH="%s/bin:$PATH"\n' "$PREFIX"
             say "fish: fish_add_path $PREFIX/bin"
             ;;
