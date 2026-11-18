@@ -95,4 +95,4 @@ proprietary and not published. Third-party components and their notices are in
 [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES) and [LICENSES/](LICENSES/), which
 every archive also carries under `share/axyon/licenses/`.
 
-AXYON is a trademark of Anyon Systems Inc.
+Copyright (c) 2026 by Anyon Systems Inc.
